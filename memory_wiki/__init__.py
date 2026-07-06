@@ -31,6 +31,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._overrides = dict(overrides or {})
         self.cfg = None
         self.index = None
+        self.embed = None
         self.read_only = False
         self.platform = ""
         self.state = hooks.SessionState()
@@ -72,6 +73,12 @@ class MemoryWikiProvider(MemoryProvider):
         self.recompile_prompt_block()
         self._status_callback = kwargs.get("status_callback")
         self._nudge_review()
+        # semantic layer: worker thread owns the model; read-only
+        # contexts (subagent/cron) stay lexical to avoid model spin-up
+        if self.cfg.embeddings and not self.read_only:
+            from .embed import EmbedIndex
+            self.embed = EmbedIndex(self.index, model=self.cfg.embedding_model)
+            self.embed.start()
 
     def get_tool_schemas(self):
         return tools.tool_schemas(read_only=self.read_only)
@@ -139,8 +146,11 @@ class MemoryWikiProvider(MemoryProvider):
             return cached
         try:
             self.index.refresh()
+            if self.embed is not None:
+                self.embed.request_sync()
             from . import search
-            block = search.prefetch_block(self.index, self.cfg, query)
+            block = search.prefetch_block(self.index, self.cfg, query,
+                                          embedder=self.embed)
         except Exception as e:
             logger.warning("memory-wiki: prefetch failed: %s", e)
             return ""
@@ -214,7 +224,8 @@ class MemoryWikiProvider(MemoryProvider):
         return [str(cfg.wiki_root)]
 
     def shutdown(self):
-        pass  # all writes are synchronous at hook time; nothing to flush
+        if self.embed is not None:
+            self.embed.shutdown()
 
 
 def register(ctx):

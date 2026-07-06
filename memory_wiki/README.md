@@ -43,7 +43,8 @@ hermes memory-wiki init          # add --dry-run to preview
 
 ## Tools (model-facing)
 
-- `wiki_search(query, corpus, type, limit)`: cited lexical recall.
+- `wiki_search(query, corpus, type, limit)`: cited hybrid recall
+  (0.7 embedding similarity + 0.3 lexical tf-idf, OpenClaw's split).
 - `wiki_get(ref)`: read a page, a candidate id, or `status` /
   `review-queue` / `decisions`.
 - `wiki_apply(action, ...)`: `write_profile` and `append_journal` write
@@ -72,6 +73,18 @@ Optional: `llm_extraction: true` adds one structured PluginLlm call per
 turn (`purpose: memory-wiki.extract`); failures degrade silently to
 deterministic-only.
 
+## Semantic recall
+
+Embeddings are optional and local: `fastembed` (ONNX,
+`BAAI/bge-small-en-v1.5` by default) must be installed in the Hermes
+venv. The model loads on a background thread and vectors live in a
+throwaway sqlite cache under `~/.cache/memory-wiki/` keyed by content
+hash; the markdown remains the only source of truth, and the cache
+rebuilds itself if deleted or if the model changes. While the model is
+loading, if the import fails, or in read-only contexts
+(subagent/cron), recall degrades to lexical-only. `wiki_get status`
+reports the state as `embedding_state`.
+
 ## CLI
 
 ```
@@ -89,6 +102,8 @@ hermes memory-wiki lint
 | `wiki_root` | `~/wiki` | wiki repository root |
 | `auto_capture` | `true` | deterministic per-turn extraction |
 | `llm_extraction` | `false` | PluginLlm structured extraction |
+| `embeddings` | `true` | hybrid semantic recall (needs fastembed) |
+| `embedding_model` | `BAAI/bge-small-en-v1.5` | fastembed model name |
 | `journal_episodes` | `true` | session episode at session end |
 | `prefetch_limit` | `5` | max recall results per turn |
 | `prefetch_char_budget` | `1200` | recall block cap (chars) |

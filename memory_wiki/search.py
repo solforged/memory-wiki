@@ -20,6 +20,11 @@ _BOOST_HEADING = 0.5
 _JOURNAL_RECENCY_MULT = 1.5
 _JOURNAL_RECENCY_DAYS = 7
 
+# hybrid blend (OpenClaw uses the same 70/30 split for vector/BM25)
+_VECTOR_WEIGHT = 0.7
+_LEXICAL_WEIGHT = 0.3
+_HYBRID_MIN_SCORE = 0.05
+
 SNIPPET_LEN = 160
 
 
@@ -65,6 +70,40 @@ def _recent_cutoff():
     return (date.today() - timedelta(days=_JOURNAL_RECENCY_DAYS)).isoformat()
 
 
+def hybrid_scores(index, embedder, query, corpus="pages", type_filter=None,
+                  include_candidate_statuses=("pending",)):
+    """Lexical tf-idf blended with embedding similarity when available.
+
+    Falls back to pure lexical while the embedder is loading, failed,
+    or absent. Vector-only hits (zero lexical overlap) are included;
+    that is the point of the semantic layer.
+    """
+    lexical = score_records(index, query, corpus, type_filter,
+                            include_candidate_statuses)
+    if embedder is None:
+        return lexical
+    records = [r for r in index.records(corpus, type_filter)
+               if r.ntype != "candidate" or not include_candidate_statuses
+               or r.status in include_candidate_statuses]
+    try:
+        sims = embedder.scores(query, records)
+    except Exception:
+        sims = {}
+    if not sims:
+        return lexical
+    max_lex = max((s for s, _ in lexical), default=0.0)
+    lex_by_rel = {rec.rel: s / max_lex for s, rec in lexical} if max_lex \
+        else {}
+    scored = []
+    for rec in records:
+        s = (_LEXICAL_WEIGHT * lex_by_rel.get(rec.rel, 0.0)
+             + _VECTOR_WEIGHT * sims.get(rec.rel, 0.0))
+        if s >= _HYBRID_MIN_SCORE:
+            scored.append((s, rec))
+    scored.sort(key=lambda x: (-x[0], x[1].rel))
+    return scored
+
+
 def snippet(rec, query):
     """First body fragment containing a query token, else the head."""
     body = rec.body_head
@@ -90,9 +129,9 @@ def result_dict(rec, s, query):
     return out
 
 
-def prefetch_block(index, cfg, query, session_id=""):
+def prefetch_block(index, cfg, query, session_id="", embedder=None):
     """Compact cited recall block for per-turn injection ('' if nothing)."""
-    scored = score_records(index, query, corpus="all")
+    scored = hybrid_scores(index, embedder, query, corpus="all")
     lines = ["## Wiki recall"]
     used = len(lines[0]) + 1
     shown = 0

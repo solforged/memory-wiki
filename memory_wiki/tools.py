@@ -153,7 +153,8 @@ def _search(provider, args):
     corpus = args.get("corpus") or "pages"
     limit = min(int(args.get("limit") or 5), 20)
     provider.index.refresh()
-    scored = search.score_records(provider.index, query, corpus=corpus,
+    scored = search.hybrid_scores(provider.index, provider.embed, query,
+                                  corpus=corpus,
                                   type_filter=args.get("type"))
     results = [search.result_dict(rec, s, query) for s, rec in scored[:limit]]
     return ok(query=query, corpus=corpus, count=len(results), results=results)
@@ -198,9 +199,14 @@ def _get_status(provider):
     by_status = {}
     for rec in provider.index.records("candidates"):
         by_status[rec.status or "?"] = by_status.get(rec.status or "?", 0) + 1
+    embed_state = "off"
+    if provider.embed is not None:
+        embed_state = ("failed" if provider.embed.failed
+                       else "ready" if provider.embed.ready else "loading")
     return ok(ref="status",
               wiki_root=str(provider.cfg.wiki_root),
               read_only=provider.read_only,
+              embedding_state=embed_state,
               pages={k: v for k, v in sorted(counts.items()) if k != "candidate"},
               candidates=by_status,
               prompt_block_chars=len(provider.system_prompt_block()),

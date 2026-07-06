@@ -131,8 +131,9 @@ def _cmd_status(args):
         print("recent decisions:")
         for line in tail:
             print(f"  {line}")
-    for k in ("auto_capture", "llm_extraction", "journal_episodes",
-              "prefetch_limit", "prompt_block_budget", "candidate_stale_days"):
+    for k in ("auto_capture", "llm_extraction", "embeddings",
+              "embedding_model", "journal_episodes", "prefetch_limit",
+              "prompt_block_budget", "candidate_stale_days"):
         print(f"config {k}: {getattr(cfg, k)}")
     return 0
 

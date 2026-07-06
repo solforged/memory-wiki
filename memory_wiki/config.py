@@ -24,6 +24,8 @@ class MemoryWikiConfig:
     wiki_root: Path = field(default_factory=lambda: Path(DEFAULT_WIKI_ROOT).expanduser())
     auto_capture: bool = True
     llm_extraction: bool = False
+    embeddings: bool = True
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
     journal_episodes: bool = True
     prefetch_limit: int = 5
     prefetch_char_budget: int = 1200
@@ -57,6 +59,8 @@ def load_config(hermes_home=None, overrides=None):
                 setattr(cfg, f.name, int(raw))
             except (TypeError, ValueError):
                 logger.debug("memory-wiki: bad int for %s: %r", f.name, raw)
+        else:
+            setattr(cfg, f.name, str(raw))
     return cfg
 
 

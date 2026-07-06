@@ -32,6 +32,7 @@ class MemoryWikiConfig:
     prompt_block_budget: int = 9000
     max_candidates_per_turn: int = 3
     max_candidates_per_session: int = 40
+    candidate_stale_days: int = 30
     backup_include_wiki: bool = True
 
 

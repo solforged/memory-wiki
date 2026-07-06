@@ -8,10 +8,11 @@ from memory_wiki.index import WikiIndex, tokenize
 
 
 def make_candidate(root, cand_id, status="pending", kind="preference",
-                   content="User prefers uv over pip.", slug="prefers-uv"):
+                   content="User prefers uv over pip.", slug="prefers-uv",
+                   created="2026-07-05"):
     fm = {"id": cand_id, "status": status, "kind": kind, "target": "",
           "section": "", "confidence": "plausible", "origin": "sync_turn",
-          "session": "s1", "turn": 1, "created": "2026-07-05",
+          "session": "s1", "turn": 1, "created": created,
           "reviewed": "", "promoted_to": "", "fields": {}, "hash": "h" + cand_id[-2:]}
     body = f"{content}\n\n## Evidence\n\n> [user, turn 1] quote\n"
     path = root / schema.INBOX_DIR / f"{cand_id}-{slug}.md"
@@ -122,6 +123,21 @@ def test_prefetch_excludes_profile_and_nonpending(fixture_wiki, cfg):
     block = search.prefetch_block(idx, cfg, "prefers uv pip")
     assert "profile/user.md" not in block
     assert CID2 not in block
+
+
+def test_prefetch_candidate_age_and_staleness(fixture_wiki, cfg):
+    from datetime import date, timedelta
+    (fixture_wiki / schema.INBOX_DIR).mkdir()
+    fresh = (date.today() - timedelta(days=3)).isoformat()
+    stale = (date.today() - timedelta(days=45)).isoformat()
+    make_candidate(fixture_wiki, CID1, created=fresh)
+    make_candidate(fixture_wiki, CID2, created=stale, slug="stale",
+                   content="User prefers uv over pip always.")
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    block = search.prefetch_block(idx, cfg, "prefers uv pip")
+    assert f"[cand {CID1}]" in block and "staged 3d ago" in block
+    assert CID2 not in block  # older than candidate_stale_days
 
 
 def test_tokenize():

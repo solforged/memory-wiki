@@ -31,13 +31,17 @@ Write policy: when the user states a preference, correction, or durable
 fact, save it with wiki_apply write_profile; log day notes with
 append_journal. Knowledge pages are never written directly: propose with
 wiki_apply stage; staged candidates need human review, so never present
-them as established facts. Search the wiki before answering questions
+them as established facts. When a remembered fact turns out to be
+outdated, wiki_apply supersede replaces it in place (id = the old
+candidate id from the bullet's marker comment; open the page with
+wiki_get to see markers). Search the wiki before answering questions
 about the user's history, projects, or preferences."""
 
 
 # -- prompt block ---------------------------------------------------------
 
-def compile_prompt_block(cfg, pending_count=0, page_count=0):
+def compile_prompt_block(cfg, pending_count=0, page_count=0,
+                         oldest_pending_days=None):
     """Static system-prompt block: instructions + budgeted profile pages."""
     root = Path(cfg.wiki_root)
     parts = [INSTRUCTIONS.format(root=root)]
@@ -47,8 +51,15 @@ def compile_prompt_block(cfg, pending_count=0, page_count=0):
         body = _page_body(root / rel)
         if body:
             parts.append(f"{heading}\n{_truncate(body, budget, rel)}")
-    parts.append(f"Wiki: {page_count} pages, {pending_count} candidates "
-                 "pending review.")
+    status = f"Wiki: {page_count} pages, {pending_count} candidates pending review."
+    if pending_count:
+        oldest = (f", oldest {oldest_pending_days}d"
+                  if oldest_pending_days else "")
+        status += (f"\nReview nudge: {pending_count} candidate(s) waiting"
+                   f"{oldest}. When the moment fits, remind the user to run "
+                   "`hermes memory-wiki review` (or review them yourself with "
+                   "wiki_get review-queue + wiki_apply approve/reject).")
+    parts.append(status)
     block = "\n\n".join(parts)
     if len(block) > cfg.prompt_block_budget:
         block = _truncate(block, cfg.prompt_block_budget, "the wiki")

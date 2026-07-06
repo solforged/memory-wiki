@@ -249,3 +249,12 @@ def utc_iso():
 
 def local_hhmm():
     return datetime.now().strftime("%H:%M")
+
+
+def days_since(date_str):
+    """Whole days since a YYYY-MM-DD date, or None if unparsable."""
+    try:
+        then = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    return (datetime.now().date() - then).days

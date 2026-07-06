@@ -48,10 +48,16 @@ hermes memory-wiki init          # add --dry-run to preview
   `review-queue` / `decisions`.
 - `wiki_apply(action, ...)`: `write_profile` and `append_journal` write
   directly (day-to-day memory); `stage` proposes knowledge; `approve`
-  (promotes by default), `reject`, `promote` manage the queue.
+  (promotes by default), `reject`, `promote` manage the queue;
+  `supersede` replaces an outdated promoted memory in place (id = the
+  old candidate id from the bullet's marker; profile/journal targets
+  replace immediately, knowledge pages stay review-first).
 
 Per-turn recall is injected automatically (prefetch); the profile pages
-ride in the system prompt.
+ride in the system prompt. Pending candidates surface in recall with
+their staged age and drop out after `candidate_stale_days`; when any
+are waiting, the prompt block carries a review nudge and CLI sessions
+get one status line at start.
 
 ## Auto-capture
 
@@ -91,6 +97,7 @@ hermes memory-wiki lint
 | `prompt_block_budget` | `9000` | whole prompt block cap |
 | `max_candidates_per_turn` | `3` | staging cap per turn |
 | `max_candidates_per_session` | `40` | staging cap per session |
+| `candidate_stale_days` | `30` | pending age after which recall stops surfacing a candidate |
 | `backup_include_wiki` | `true` | include wiki_root in `hermes backup` |
 
 ## Concurrency model

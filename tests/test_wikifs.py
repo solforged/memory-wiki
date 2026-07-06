@@ -163,3 +163,12 @@ def test_slugify():
     assert slugify("  --- ") == "note"
     long = slugify("word " * 40)
     assert len(long) <= 60 and not long.endswith("-")
+
+
+def test_days_since():
+    from datetime import date, timedelta
+    assert wikifs.days_since(date.today().isoformat()) == 0
+    old = (date.today() - timedelta(days=5)).isoformat()
+    assert wikifs.days_since(old) == 5
+    assert wikifs.days_since("not-a-date") is None
+    assert wikifs.days_since(None) is None

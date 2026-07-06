@@ -71,15 +71,19 @@ WIKI_APPLY_SCHEMA = {
         "append_journal logs a timestamped note to today's journal. "
         "Review-first writes (knowledge base): stage proposes a candidate; "
         "approve/reject/promote manage the review queue. approve promotes "
-        "immediately unless and_promote=false."),
+        "immediately unless and_promote=false. supersede replaces an "
+        "outdated promoted memory (id = the old candidate) with new "
+        "content, in place."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string",
                        "enum": ["stage", "approve", "reject", "promote",
-                                "write_profile", "append_journal"]},
+                                "supersede", "write_profile",
+                                "append_journal"]},
             "id": {"type": "string",
-                   "description": "Candidate id (approve/reject/promote)."},
+                   "description": "Candidate id (approve/reject/promote/"
+                                  "supersede)."},
             "content": {"type": "string",
                         "description": "Text to stage/write/append."},
             "kind": {"type": "string", "enum": list(schema.CANDIDATE_KINDS),
@@ -202,7 +206,8 @@ def _get_status(provider):
               prompt_block_chars=len(provider.system_prompt_block()),
               config={k: getattr(provider.cfg, k) for k in
                       ("auto_capture", "llm_extraction", "journal_episodes",
-                       "prefetch_limit", "max_candidates_per_session")})
+                       "prefetch_limit", "max_candidates_per_session",
+                       "candidate_stale_days")})
 
 
 def _get_review_queue(provider):
@@ -211,6 +216,7 @@ def _get_review_queue(provider):
     for rec in provider.index.pending_candidates():
         items.append({"id": rec.cand_id, "kind": rec.kind,
                       "confidence": rec.confidence,
+                      "age_days": wikifs.days_since(rec.created),
                       "excerpt": rec.body_head[:120]})
     return ok(ref="review-queue", count=len(items), candidates=items)
 
@@ -266,11 +272,20 @@ def _apply(provider, args):
         return ok(action=action, id=result["id"], ref=result["ref"],
                   note="pending human review")
 
-    if action in ("approve", "reject", "promote"):
+    if action in ("approve", "reject", "promote", "supersede"):
         cand_id = (args.get("id") or "").strip()
         if not cand_id:
             return err(f"{action} needs a candidate id")
-        if action == "approve":
+        if action == "supersede":
+            provider.index.refresh()
+            result = promote.supersede(
+                cfg, provider.index, cand_id, args.get("content"),
+                confidence=args.get("confidence") or "",
+                actor="tool", session_id=session)
+            if result.get("ok") and \
+                    str(result.get("target", "")).startswith("profile/"):
+                provider.recompile_prompt_block()
+        elif action == "approve":
             overrides = {k: args[k] for k in
                          ("content", "target", "section", "confidence",
                           "topics", "fields") if args.get(k) is not None}
@@ -287,6 +302,9 @@ def _apply(provider, args):
                                      actor="tool", session_id=session)
         if not result.get("ok"):
             return err(result.get("error", "failed"), action=action)
+        if action != "supersede" and \
+                str(result.get("target", "")).startswith("profile/"):
+            provider.recompile_prompt_block()
         result.pop("ok", None)
         return ok(action=action, **result)
 

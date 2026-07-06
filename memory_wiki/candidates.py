@@ -45,8 +45,13 @@ def record(cfg, action, cand_id="", target="", session="", actor="",
 
 def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
           turn=0, target="", section="", confidence="plausible",
-          topics=None, fields=None, evidence=None, actor="tool"):
-    """Stage one candidate. Returns {staged, id?, ref?, reason?}."""
+          topics=None, fields=None, evidence=None, actor="tool",
+          supersedes=""):
+    """Stage one candidate. Returns {staged, id?, ref?, reason?}.
+
+    supersedes: id of a promoted candidate this content replaces; skips
+    dedup (overlap with the bullet being replaced is the whole point).
+    """
     content = " ".join((content or "").split())
     if not content:
         return {"staged": False, "reason": "empty content"}
@@ -64,9 +69,10 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
         wikifs.safe_wiki_path(cfg.wiki_root, target)  # raises on escape
 
     chash = content_hash(content)
-    dup = duplicate_reason(index, chash, content)
-    if dup:
-        return {"staged": False, "reason": dup, "hash": chash}
+    if not supersedes:
+        dup = duplicate_reason(index, chash, content)
+        if dup:
+            return {"staged": False, "reason": dup, "hash": chash}
 
     fm = {
         "id": "",  # filled below once the filename seq is known
@@ -77,6 +83,8 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
         "created": wikifs.today(), "reviewed": "", "promoted_to": "",
         "topics": list(topics or []), "fields": fields, "hash": chash,
     }
+    if supersedes:
+        fm["supersedes"] = supersedes
     body_parts = [content, "", schema.EVIDENCE_HEADING, ""]
     for line in (evidence or [f"proposed via {origin}"]):
         body_parts.append(line if line.startswith(("- ", "> ")) else f"> {line}")
@@ -188,6 +196,7 @@ def list_candidates(cfg, statuses=("pending",)):
                     "confidence": fm.get("confidence", ""),
                     "target": fm.get("target", ""),
                     "created": fm.get("created", ""),
+                    "age_days": wikifs.days_since(fm.get("created", "")),
                     "content": head, "ref": f"{schema.INBOX_DIR}/{path.name}"})
     return out
 

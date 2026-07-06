@@ -176,3 +176,23 @@ def test_hooks_never_raise(provider, monkeypatch):
     monkeypatch.setattr(hooks_mod, "on_pre_compress",
                         lambda *a, **k: 1 / 0)
     assert provider.on_pre_compress([]) == ""
+
+
+def test_review_nudge_status_callback(fixture_wiki, tmp_path):
+    from memory_wiki import config as mw_config, scaffold
+    cfg = mw_config.load_config(None, {"wiki_root": str(fixture_wiki)})
+    scaffold.ensure_runtime(cfg)
+    candidates.stage(cfg, None, "User prefers tabs over spaces everywhere.",
+                     kind="preference", origin="tool")
+    lines = []
+    p = memory_wiki.MemoryWikiProvider(overrides={"wiki_root": str(fixture_wiki)})
+    p.initialize("sess", hermes_home=str(tmp_path), platform="cli",
+                 status_callback=lines.append)
+    assert lines and "1 candidate(s) pending review" in lines[0]
+    assert "hermes memory-wiki review" in lines[0]
+    # read-only contexts stay silent
+    quiet = []
+    ro = memory_wiki.MemoryWikiProvider(overrides={"wiki_root": str(fixture_wiki)})
+    ro.initialize("sub", hermes_home=str(tmp_path), platform="cli",
+                  agent_context="subagent", status_callback=quiet.append)
+    assert quiet == []

@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from datetime import date, timedelta
 
+from . import wikifs
 from .index import tokenize
 
 # additive per-token boosts on top of tf*idf
@@ -101,7 +102,11 @@ def prefetch_block(index, cfg, query, session_id=""):
         if rec.ntype == "candidate" and rec.status != "pending":
             continue
         if rec.ntype == "candidate":
-            line = (f"- [cand {rec.cand_id}] (unreviewed {rec.kind}) "
+            age = wikifs.days_since(rec.created)
+            if age is not None and age > cfg.candidate_stale_days:
+                continue          # stale proposal; review queue still lists it
+            staged = f", staged {age}d ago" if age else ""
+            line = (f"- [cand {rec.cand_id}] (unreviewed {rec.kind}{staged}) "
                     f"{snippet(rec, query)}")
         else:
             meta = ""

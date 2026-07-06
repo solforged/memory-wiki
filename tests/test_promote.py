@@ -161,6 +161,75 @@ def test_approve_with_content_override(ready):
     assert "roughly like this" not in read(cfg, "profile/user.md")
 
 
+def test_supersede_profile_bullet(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "Deploys on Thursdays.", kind="preference")
+    promote.approve(cfg, idx, cid)
+    idx.refresh()
+    r = promote.supersede(cfg, idx, cid, "Deploys on Wednesdays now.")
+    assert r["ok"] and r["result"] == "replaced" and r["supersedes"] == cid
+    new_id = r["id"]
+    text = read(cfg, "profile/user.md")
+    assert "Deploys on Wednesdays now." in text
+    assert "Deploys on Thursdays." not in text
+    assert schema.candidate_marker(new_id) in text
+    assert schema.candidate_marker(cid) not in text
+    assert schema.validate_page("profile/user.md", text) == []
+    _, old_fm, _, _ = candidates.load(cfg, cid)
+    assert old_fm["status"] == "superseded" and new_id in old_fm["reviewed"]
+    _, new_fm, _, _ = candidates.load(cfg, new_id)
+    assert new_fm["status"] == "promoted" and new_fm["supersedes"] == cid
+    lines = [json.loads(l) for l in
+             read(cfg, schema.DECISIONS_FILE).strip().splitlines()]
+    assert any(l["action"] == "superseded" and l["id"] == cid for l in lines)
+
+
+def test_supersede_knowledge_page_is_review_first(ready):
+    cfg, idx = ready
+    rel = "claims/small-tools-beat-frameworks.md"
+    cid = stage(cfg, idx, "Evidence supports this.", target=rel,
+                section="## Evidence")
+    promote.approve(cfg, idx, cid)
+    idx.refresh()
+    r = promote.supersede(cfg, idx, cid, "Stronger evidence replaces this.")
+    assert r["ok"] and r["result"] == "pending_review"
+    assert "Stronger evidence" not in read(cfg, rel)  # review-first
+    r2 = promote.promote(cfg, idx, r["id"])
+    assert r2["ok"] and r2["result"] == "replaced"
+    text = read(cfg, rel)
+    assert "Stronger evidence replaces this." in text
+    assert "Evidence supports this." not in text
+    assert schema.validate_page(rel, text) == []
+    _, old_fm, _, _ = candidates.load(cfg, cid)
+    assert old_fm["status"] == "superseded"
+
+
+def test_supersede_guards(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "Still pending proposal.")
+    r = promote.supersede(cfg, idx, cid, "replacement")
+    assert not r["ok"] and "pending" in r["error"]
+    missing = promote.supersede(cfg, idx, "20990101-000000-deadbeef-01", "x")
+    assert not missing["ok"]
+    promote.approve(cfg, idx, cid)
+    assert not promote.supersede(cfg, idx, cid, "   ")["ok"]
+
+
+def test_supersede_appends_when_marker_hand_deleted(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "Original preference.", kind="preference")
+    promote.approve(cfg, idx, cid)
+    path = Path(cfg.wiki_root) / "profile/user.md"
+    fm, body = wikifs.parse_frontmatter(wikifs.read_text(path))
+    body = "\n".join(l for l in body.splitlines()
+                     if schema.candidate_marker(cid) not in l)
+    wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    idx.refresh()
+    r = promote.supersede(cfg, idx, cid, "Replacement preference.")
+    assert r["ok"] and r["result"] == "promoted"  # appended, not replaced
+    assert "Replacement preference." in read(cfg, "profile/user.md")
+
+
 def test_decisions_journal_records_lifecycle(ready):
     cfg, idx = ready
     cid = stage(cfg, idx, "Track everything in the audit log.", kind="note")
@@ -216,3 +285,28 @@ def test_apply_tool_end_to_end(fixture_wiki, tmp_path):
     dec = json.loads(provider.handle_tool_call("wiki_get",
                                                {"ref": "decisions"}))
     assert dec["ok"] and dec["count"] >= 5
+
+
+def test_apply_supersede_tool(fixture_wiki, tmp_path):
+    import memory_wiki
+    provider = memory_wiki.MemoryWikiProvider(
+        overrides={"wiki_root": str(fixture_wiki)})
+    provider.initialize("8f3e9c12-sess", hermes_home=str(tmp_path),
+                        platform="cli")
+
+    def apply(**args):
+        return json.loads(provider.handle_tool_call("wiki_apply", args))
+
+    cid = apply(action="stage", content="Prefers npm for everything.",
+                kind="preference")["id"]
+    out = apply(action="approve", id=cid)
+    assert out["ok"] and out["target"] == "profile/user.md"
+    assert "Prefers npm for everything." in provider.system_prompt_block()
+
+    out = apply(action="supersede", id=cid, content="Now prefers pnpm.")
+    assert out["ok"] and out["result"] == "replaced"
+    assert out["supersedes"] == cid
+    block = provider.system_prompt_block()
+    assert "Now prefers pnpm." in block
+    assert "Prefers npm for everything." not in block
+    assert not apply(action="supersede", id=cid, content="again")["ok"]

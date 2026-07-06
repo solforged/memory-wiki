@@ -37,6 +37,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._session_id = ""
         self._prompt_block = ""
         self._prefetch_cache = {}
+        self._status_callback = None
 
     # -- required contract -------------------------------------------------
 
@@ -69,6 +70,8 @@ class MemoryWikiProvider(MemoryProvider):
         except OSError as e:
             logger.warning("memory-wiki: index refresh failed: %s", e)
         self.recompile_prompt_block()
+        self._status_callback = kwargs.get("status_callback")
+        self._nudge_review()
 
     def get_tool_schemas(self):
         return tools.tool_schemas(read_only=self.read_only)
@@ -90,12 +93,37 @@ class MemoryWikiProvider(MemoryProvider):
             self._prompt_block = ""
             return
         counts = self.index.counts() if self.index else {}
-        pending = sum(1 for r in (self.index.records("candidates")
-                                  if self.index else ())
-                      if r.status == "pending")
+        pending, oldest = self._pending_stats()
         pages = sum(v for k, v in counts.items() if k != "candidate")
         self._prompt_block = layers.compile_prompt_block(
-            self.cfg, pending_count=pending, page_count=pages)
+            self.cfg, pending_count=pending, page_count=pages,
+            oldest_pending_days=oldest)
+
+    def _pending_stats(self):
+        """(pending count, age in days of the oldest pending candidate)."""
+        if self.index is None:
+            return 0, None
+        from . import wikifs
+        ages = [wikifs.days_since(r.created)
+                for r in self.index.records("candidates")
+                if r.status == "pending"]
+        oldest = max((a for a in ages if a is not None), default=None)
+        return len(ages), oldest
+
+    def _nudge_review(self):
+        """One status line at session start when candidates are waiting."""
+        if self.read_only or not self._status_callback:
+            return
+        pending, oldest = self._pending_stats()
+        if not pending:
+            return
+        age = f", oldest {oldest}d" if oldest else ""
+        try:
+            self._status_callback(
+                f"memory-wiki: {pending} candidate(s) pending review{age} "
+                "- hermes memory-wiki review")
+        except Exception as e:
+            logger.debug("memory-wiki: status callback failed: %s", e)
 
     # -- recall ---------------------------------------------------------------
 

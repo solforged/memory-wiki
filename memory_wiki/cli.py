@@ -132,7 +132,7 @@ def _cmd_status(args):
         for line in tail:
             print(f"  {line}")
     for k in ("auto_capture", "llm_extraction", "journal_episodes",
-              "prefetch_limit", "prompt_block_budget"):
+              "prefetch_limit", "prompt_block_budget", "candidate_stale_days"):
         print(f"config {k}: {getattr(cfg, k)}")
     return 0
 
@@ -172,7 +172,8 @@ def _cmd_review(args):
     if args.list_only:
         for c in pending:
             target = c["target"] or f"(route by kind: {c['kind']})"
-            print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11} "
+            age = f"  {c['age_days']}d" if c.get("age_days") else ""
+            print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11}{age} "
                   f"-> {target}")
             print(f"    {c['content'][:120]}")
         return 0
@@ -186,7 +187,8 @@ def _review_interactive(cfg, index, pending):
           "[s]kip / [q]uit")
     for c in pending:
         target = c["target"] or f"route by kind ({c['kind']})"
-        print(f"\n{c['id']}  {c['kind']} ({c['confidence']}) -> {target}")
+        age = f", {c['age_days']}d old" if c.get("age_days") else ""
+        print(f"\n{c['id']}  {c['kind']} ({c['confidence']}{age}) -> {target}")
         print(f"  {c['content']}")
         try:
             choice = input("  [a/t/r/s/q] ").strip().lower()

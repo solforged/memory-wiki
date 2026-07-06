@@ -104,6 +104,15 @@ def test_compile_prompt_block_budgets(ready):
     assert len(layers.compile_prompt_block(ready)) <= 900 + 80
 
 
+def test_prompt_block_review_nudge(ready):
+    calm = layers.compile_prompt_block(ready, pending_count=0, page_count=3)
+    assert "Review nudge" not in calm
+    block = layers.compile_prompt_block(ready, pending_count=4, page_count=3,
+                                        oldest_pending_days=12)
+    assert "Review nudge: 4 candidate(s) waiting, oldest 12d" in block
+    assert "hermes memory-wiki review" in block
+
+
 def test_empty_seed_sections_do_not_bloat_prompt(ready):
     block = layers.compile_prompt_block(ready)
     # seeded-but-empty pages contribute headings only, no filler

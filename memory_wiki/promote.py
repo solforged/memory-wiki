@@ -60,6 +60,50 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
     return promote(cfg, index, cand_id, actor=actor, session_id=session_id)
 
 
+def supersede(cfg, index, old_id, content, confidence="", actor="tool",
+              session_id=""):
+    """Replace an outdated promoted bullet with new content.
+
+    Stages a replacement candidate pointed at the old candidate's target.
+    Profile/journal targets (the direct-write zone) are replaced
+    immediately; knowledge-page targets stay pending for human review,
+    and promotion swaps the marked bullet in place.
+    """
+    content = " ".join((content or "").split())
+    if not content:
+        return {"ok": False, "error": "supersede needs content"}
+    loaded = candidates.load(cfg, old_id)
+    if loaded is None:
+        return {"ok": False, "error": f"no candidate {old_id}"}
+    _path, old_fm, _old_content, _ev = loaded
+    if old_fm.get("status") != "promoted":
+        return {"ok": False, "error":
+                f"{old_id} is {old_fm.get('status')}; supersede only applies "
+                "to promoted candidates (approve pending ones with new "
+                "content instead)"}
+    target = old_fm.get("promoted_to", "")
+    if not target:
+        return {"ok": False, "error": f"{old_id} has no promoted_to target"}
+    staged = candidates.stage(
+        cfg, index, content, kind=old_fm.get("kind", "fact"), origin="tool",
+        session_id=session_id, target=target,
+        section=old_fm.get("section", ""),
+        confidence=confidence or old_fm.get("confidence", "plausible"),
+        evidence=[f"supersedes {old_id}"], actor=actor, supersedes=old_id)
+    if not staged.get("staged"):
+        return {"ok": False, "error": f"not staged: {staged.get('reason')}"}
+    new_id = staged["id"]
+    if target.split("/", 1)[0] not in ("profile", "journal"):
+        return {"ok": True, "result": "pending_review", "id": new_id,
+                "supersedes": old_id, "target": target,
+                "note": "knowledge pages are review-first; promote after review"}
+    result = promote(cfg, index, new_id, actor=actor, session_id=session_id)
+    if not result.get("ok"):
+        return result
+    result["supersedes"] = old_id
+    return result
+
+
 def reject(cfg, cand_id, reason="", actor="tool", session_id=""):
     with wikifs.wiki_lock(cfg.wiki_root):
         loaded = candidates.load(cfg, cand_id)
@@ -93,7 +137,8 @@ def promote(cfg, index, cand_id, actor="tool", session_id=""):
             return {"ok": False, "error": route["error"]}
         try:
             if route["mode"] == "append":
-                result = _promote_append(cfg, cand_id, content, route)
+                result = _promote_append(cfg, cand_id, content, route,
+                                         supersedes=fm.get("supersedes", ""))
             else:
                 result = _promote_new_page(cfg, cand_id, fm, content, route)
         except ValueError as e:
@@ -104,6 +149,8 @@ def promote(cfg, index, cand_id, actor="tool", session_id=""):
             cfg, path, fm, content, evidence, "promoted",
             reviewed_note=fm.get("reviewed") or f"{wikifs.today()} approved",
             promoted_to=result["target"])
+        _retire_superseded(cfg, fm.get("supersedes", ""), cand_id,
+                           actor=actor, session_id=session_id)
     candidates.record(cfg, "promoted", cand_id=cand_id,
                       target=result["target"], session=session_id,
                       actor=actor, chash=fm.get("hash", ""),
@@ -167,12 +214,19 @@ def _title_from(content):
 
 # -- writers (wiki lock already held) ------------------------------------------
 
-def _promote_append(cfg, cand_id, content, route):
+def _promote_append(cfg, cand_id, content, route, supersedes=""):
     rel, section = route["target"], route.get("section") or "## Notes"
     marker = schema.candidate_marker(cand_id)
     existing = wikifs.read_text(Path(cfg.wiki_root) / rel) or ""
     if marker in existing:
         return {"ok": True, "target": rel, "result": "already_promoted"}
+    if supersedes:
+        prefix = f"{wikifs.local_hhmm()} " if rel.startswith("journal/") else ""
+        entry = f"- {prefix}{content} {marker}"
+        if _replace_marker_line(cfg, rel,
+                                schema.candidate_marker(supersedes), entry):
+            return {"ok": True, "target": rel, "result": "replaced"}
+        # old bullet was hand-edited away; fall through and append instead
     if rel.startswith("profile/"):
         page = "user" if rel.endswith("user.md") else "agent"
         layers.write_profile_unlocked(cfg, page, content, section=section,
@@ -182,6 +236,48 @@ def _promote_append(cfg, cand_id, content, route):
     else:
         _append_to_page(cfg, rel, section, f"- {content} {marker}")
     return {"ok": True, "target": rel}
+
+
+def _replace_marker_line(cfg, rel, old_marker, entry):
+    """Swap the bullet carrying old_marker for entry; False if absent.
+    Caller holds the wiki lock."""
+    path = Path(cfg.wiki_root) / rel
+    text = wikifs.read_text(path)
+    if text is None:
+        return False
+    fm, body = wikifs.parse_frontmatter(text)
+    if fm is None or old_marker not in body:
+        return False
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if old_marker in line:
+            lines[i] = entry
+            break
+    if "updated" in fm:
+        fm["updated"] = wikifs.today()
+    new_text = wikifs.render_page(fm, "\n".join(lines) + "\n")
+    errors = schema.validate_page(rel, new_text)
+    if errors:
+        raise ValueError("; ".join(errors))
+    wikifs.atomic_write(path, new_text)
+    return True
+
+
+def _retire_superseded(cfg, old_id, new_id, actor="tool", session_id=""):
+    """Mark the replaced candidate superseded; caller holds the wiki lock."""
+    if not old_id:
+        return
+    loaded = candidates.load(cfg, old_id)
+    if loaded is None:
+        return
+    path, fm, content, evidence = loaded
+    if fm.get("status") == "superseded":
+        return
+    candidates.set_status_unlocked(
+        cfg, path, fm, content, evidence, "superseded",
+        reviewed_note=f"{wikifs.today()} superseded by {new_id}")
+    candidates.record(cfg, "superseded", cand_id=old_id, actor=actor,
+                      session=session_id, detail={"superseded_by": new_id})
 
 
 def _append_to_page(cfg, rel, section, entry):

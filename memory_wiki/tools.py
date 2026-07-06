@@ -222,10 +222,72 @@ def _get_decisions(provider):
     return ok(ref="decisions", count=len(tail), entries=tail)
 
 
-# -- apply (wired up by the write path) ---------------------------------------
+# -- apply ---------------------------------------------------------------------
 
 def _apply(provider, args):
     if provider.read_only:
         return err("this session is read-only (subagent/cron context); "
                    "writes are disabled")
-    return err("wiki_apply is not wired up yet (write path lands in phase 3)")
+    from . import candidates, layers, promote
+
+    action = args.get("action") or ""
+    cfg, session = provider.cfg, provider.session_id
+
+    if action == "write_profile":
+        rel = layers.write_profile(
+            cfg, args.get("page") or "user", args.get("content"),
+            section=args.get("section") or None,
+            mode=args.get("mode") or "append")
+        candidates.record(cfg, "write_profile", target=rel, session=session,
+                          actor="tool",
+                          chash=candidates.content_hash(args.get("content")))
+        provider.recompile_prompt_block()
+        return ok(action=action, ref=rel)
+
+    if action == "append_journal":
+        rel = layers.append_journal_note(cfg, args.get("content"))
+        candidates.record(cfg, "append_journal", target=rel, session=session,
+                          actor="tool")
+        return ok(action=action, ref=rel)
+
+    if action == "stage":
+        provider.index.refresh()
+        result = candidates.stage(
+            cfg, provider.index, args.get("content"),
+            kind=args.get("kind") or "fact", origin="tool",
+            session_id=session, target=args.get("target") or "",
+            section=args.get("section") or "",
+            confidence=args.get("confidence") or "plausible",
+            topics=args.get("topics"), fields=args.get("fields"),
+            evidence=[f"proposed via wiki_apply, session "
+                      f"{candidates.session8(session)}"])
+        if not result.get("staged"):
+            return err(f"not staged: {result.get('reason')}")
+        return ok(action=action, id=result["id"], ref=result["ref"],
+                  note="pending human review")
+
+    if action in ("approve", "reject", "promote"):
+        cand_id = (args.get("id") or "").strip()
+        if not cand_id:
+            return err(f"{action} needs a candidate id")
+        if action == "approve":
+            overrides = {k: args[k] for k in
+                         ("content", "target", "section", "confidence",
+                          "topics", "fields") if args.get(k) is not None}
+            result = promote.approve(
+                cfg, provider.index, cand_id, overrides=overrides,
+                and_promote=args.get("and_promote", True),
+                actor="tool", session_id=session)
+        elif action == "reject":
+            result = promote.reject(cfg, cand_id,
+                                    reason=args.get("reason") or "",
+                                    actor="tool", session_id=session)
+        else:
+            result = promote.promote(cfg, provider.index, cand_id,
+                                     actor="tool", session_id=session)
+        if not result.get("ok"):
+            return err(result.get("error", "failed"), action=action)
+        result.pop("ok", None)
+        return ok(action=action, **result)
+
+    return err(f"unknown action '{action}'")

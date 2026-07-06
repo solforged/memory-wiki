@@ -81,9 +81,16 @@ def _truncate(text, budget, what):
 # -- profile writes ---------------------------------------------------------
 
 def write_profile(cfg, page, content, section=None, mode="append"):
-    """Append to (or replace a section of) a profile page. Returns the
-    repo-relative path written. Caller decides locking policy; this
-    function takes the wiki lock itself."""
+    """Append to (or replace a section of) a profile page under the wiki
+    lock. Returns the repo-relative path written."""
+    with wikifs.wiki_lock(cfg.wiki_root):
+        return write_profile_unlocked(cfg, page, content, section, mode)
+
+
+def write_profile_unlocked(cfg, page, content, section=None, mode="append",
+                           marker=""):
+    """write_profile core; the caller must already hold the wiki lock
+    (flock is not re-entrant in-process)."""
     if page not in ("user", "agent"):
         raise ValueError("page must be 'user' or 'agent'")
     if mode not in ("append", "replace_section"):
@@ -93,22 +100,23 @@ def write_profile(cfg, page, content, section=None, mode="append"):
         raise ValueError("content is empty")
     rel = f"profile/{page}.md"
     path = Path(cfg.wiki_root) / rel
-    with wikifs.wiki_lock(cfg.wiki_root):
-        text = wikifs.read_text(path)
-        if text is None:
-            fm, body = schema.profile_seed(f"{page}.md")
-        else:
-            fm, body = wikifs.parse_frontmatter(text)
-            if fm is None:
-                fm, body = schema.profile_seed(f"{page}.md")[0], text
-        target = section or "## Notes"
-        if mode == "append":
-            entry = content if content.startswith("- ") else f"- {content}"
-            body = _append_under(body, target, entry)
-        else:
-            body = _replace_section(body, target, content)
-        fm["updated"] = wikifs.today()
-        wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    text = wikifs.read_text(path)
+    if text is None:
+        fm, body = schema.profile_seed(f"{page}.md")
+    else:
+        fm, body = wikifs.parse_frontmatter(text)
+        if fm is None:
+            fm, body = schema.profile_seed(f"{page}.md")[0], text
+    target = section or "## Notes"
+    if mode == "append":
+        entry = content if content.startswith("- ") else f"- {content}"
+        if marker:
+            entry = f"{entry} {marker}"
+        body = _append_under(body, target, entry)
+    else:
+        body = _replace_section(body, target, content)
+    fm["updated"] = wikifs.today()
+    wikifs.atomic_write(path, wikifs.render_page(fm, body))
     return rel
 
 
@@ -161,16 +169,23 @@ def journal_rel(date_str=None):
 
 def append_journal_note(cfg, content, date_str=None):
     """Timestamped bullet under ## Notes of today's journal page."""
+    with wikifs.wiki_lock(cfg.wiki_root):
+        return append_journal_note_unlocked(cfg, content, date_str)
+
+
+def append_journal_note_unlocked(cfg, content, date_str=None, marker=""):
+    """append_journal_note core; caller must hold the wiki lock."""
     content = (content or "").strip()
     if not content:
         raise ValueError("content is empty")
     rel = journal_rel(date_str)
     path = Path(cfg.wiki_root) / rel
     entry = f"- {wikifs.local_hhmm()} {content}"
-    with wikifs.wiki_lock(cfg.wiki_root):
-        fm, body = _load_journal(path, rel)
-        body = _append_under(body, schema.JOURNAL_NOTES, entry)
-        wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    if marker:
+        entry = f"{entry} {marker}"
+    fm, body = _load_journal(path, rel)
+    body = _append_under(body, schema.JOURNAL_NOTES, entry)
+    wikifs.atomic_write(path, wikifs.render_page(fm, body))
     return rel
 
 

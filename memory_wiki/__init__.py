@@ -42,6 +42,10 @@ class MemoryWikiProvider(MemoryProvider):
     def name(self):
         return "memory-wiki"
 
+    @property
+    def session_id(self):
+        return self._session_id
+
     def is_available(self):
         return True  # stdlib only; the wiki scaffold is created on init
 

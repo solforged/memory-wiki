@@ -138,13 +138,130 @@ def _cmd_status(args):
 
 
 def _cmd_review(args):
-    print("review is not implemented yet (write path lands in phase 3)")
-    return 1
+    from . import candidates, promote
+    from .index import WikiIndex
+    cfg = _load_cfg()
+    if not Path(cfg.wiki_root).is_dir():
+        print(f"wiki root does not exist: {cfg.wiki_root}")
+        return 1
+    if args.prune:
+        removed = candidates.prune(cfg, days=args.days)
+        print(f"pruned {len(removed)} candidate file(s)")
+        return 0
+    index = WikiIndex(cfg.wiki_root)
+    index.refresh()
+    rc = 0
+    for cand_id in args.approve:
+        result = promote.approve(cfg, index, cand_id, actor="cli")
+        print(f"{cand_id}: " + (result.get("result", "")
+                                if result.get("ok") else
+                                f"ERROR {result.get('error')}"))
+        rc |= 0 if result.get("ok") else 1
+    for cand_id in args.reject:
+        result = promote.reject(cfg, cand_id, reason=args.reason, actor="cli")
+        print(f"{cand_id}: " + (result.get("result", "")
+                                if result.get("ok") else
+                                f"ERROR {result.get('error')}"))
+        rc |= 0 if result.get("ok") else 1
+    if args.approve or args.reject:
+        return rc
+    pending = candidates.list_candidates(cfg, statuses=("pending",))
+    if not pending:
+        print("no pending candidates")
+        return 0
+    if args.list_only:
+        for c in pending:
+            target = c["target"] or f"(route by kind: {c['kind']})"
+            print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11} "
+                  f"-> {target}")
+            print(f"    {c['content'][:120]}")
+        return 0
+    return _review_interactive(cfg, index, pending)
+
+
+def _review_interactive(cfg, index, pending):
+    from . import promote
+    print(f"{len(pending)} pending candidate(s). "
+          "[a]pprove+promote / [t]arget then approve / [r]eject / "
+          "[s]kip / [q]uit")
+    for c in pending:
+        target = c["target"] or f"route by kind ({c['kind']})"
+        print(f"\n{c['id']}  {c['kind']} ({c['confidence']}) -> {target}")
+        print(f"  {c['content']}")
+        try:
+            choice = input("  [a/t/r/s/q] ").strip().lower()
+        except EOFError:
+            break
+        if choice == "q":
+            break
+        if choice == "a":
+            result = promote.approve(cfg, index, c["id"], actor="cli")
+        elif choice == "t":
+            new_target = input("  target path: ").strip()
+            new_section = input("  section (optional): ").strip()
+            overrides = {"target": new_target}
+            if new_section:
+                overrides["section"] = new_section
+            result = promote.approve(cfg, index, c["id"],
+                                     overrides=overrides, actor="cli")
+        elif choice == "r":
+            reason = input("  reason (optional): ").strip()
+            result = promote.reject(cfg, c["id"], reason=reason, actor="cli")
+        else:
+            continue
+        print("  " + (result.get("result", "done") if result.get("ok")
+                      else f"ERROR {result.get('error')}"))
+    return 0
 
 
 def _cmd_lint(args):
-    print("lint is not implemented yet (write path lands in phase 3)")
-    return 1
+    import re
+    from . import candidates, schema, wikifs
+    cfg = _load_cfg()
+    root = Path(cfg.wiki_root)
+    if not root.is_dir():
+        print(f"wiki root does not exist: {root}")
+        return 1
+    errors = []
+    known_ids = set()
+    for d in schema.DIR_TYPE:
+        dpath = root / d
+        if not dpath.is_dir():
+            continue
+        for p in sorted(dpath.glob("*.md")):
+            rel = f"{d}/{p.name}"
+            errors.extend(schema.validate_page(rel, wikifs.read_text(p) or ""))
+    inbox = root / schema.INBOX_DIR
+    if inbox.is_dir():
+        for p in sorted(inbox.glob("*.md")):
+            fm, _ = wikifs.parse_frontmatter(wikifs.read_text(p) or "")
+            if fm is None:
+                errors.append(f"{schema.INBOX_DIR}/{p.name}: missing frontmatter")
+                continue
+            for e in schema.validate_candidate(fm):
+                errors.append(f"{schema.INBOX_DIR}/{p.name}: {e}")
+            if fm.get("id"):
+                known_ids.add(fm["id"])
+    # orphaned candidate markers: promoted content whose candidate file is gone
+    marker_re = re.compile(
+        r"<!-- memory-wiki: (?:promoted )?(\d{8}-\d{6}-\w{8}-\d{2}) -->")
+    for d in schema.DIR_TYPE:
+        dpath = root / d
+        if not dpath.is_dir():
+            continue
+        for p in sorted(dpath.glob("*.md")):
+            for cid in marker_re.findall(wikifs.read_text(p) or ""):
+                if cid not in known_ids:
+                    print(f"  warn  {d}/{p.name}: marker for pruned/missing "
+                          f"candidate {cid}")
+    if errors:
+        print(f"errors ({len(errors)}):")
+        for e in errors:
+            print(f"  {e}")
+    else:
+        print("plugin checks: ok")
+    _run_check_py(root)
+    return 1 if errors else 0
 
 
 def _run_check_py(root):

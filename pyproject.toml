@@ -1,0 +1,16 @@
+[project]
+name = "memory-wiki"
+version = "0.1.0"
+description = "Hermes memory provider: review-first memory over a plaintext wiki"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"

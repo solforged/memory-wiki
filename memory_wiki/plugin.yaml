@@ -1,0 +1,9 @@
+name: memory-wiki
+version: 0.1.0
+description: "Wiki-native memory: review-first capture into a plaintext wiki; profile/ and journal/ living pages replace MEMORY.md/USER.md."
+author: tarmuid
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_session_switch

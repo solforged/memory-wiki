@@ -15,7 +15,7 @@ from pathlib import Path
 from agent.memory_provider import MemoryProvider
 
 from . import config as mw_config
-from . import layers, scaffold, tools
+from . import hooks, layers, scaffold, tools
 from .index import WikiIndex
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,8 @@ class MemoryWikiProvider(MemoryProvider):
         self.cfg = None
         self.index = None
         self.read_only = False
+        self.platform = ""
+        self.state = hooks.SessionState()
         self._session_id = ""
         self._prompt_block = ""
         self._prefetch_cache = {}
@@ -51,6 +53,8 @@ class MemoryWikiProvider(MemoryProvider):
 
     def initialize(self, session_id, **kwargs):
         self._session_id = session_id
+        self.platform = kwargs.get("platform", "")
+        self.state = hooks.SessionState()
         self.read_only = kwargs.get("agent_context", "primary") in READ_ONLY_CONTEXTS
         self.cfg = mw_config.load_config(kwargs.get("hermes_home"), self._overrides)
         if not self.read_only:
@@ -116,6 +120,49 @@ class MemoryWikiProvider(MemoryProvider):
             self._prefetch_cache.pop(next(iter(self._prefetch_cache)))
         self._prefetch_cache[key] = block
         return block
+
+    def set_session_id(self, session_id):
+        self._session_id = session_id
+
+    def clear_prefetch_cache(self):
+        self._prefetch_cache = {}
+
+    # -- lifecycle hooks (delegated; must never raise into the agent loop) ----
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="",
+                  messages=None):
+        try:
+            hooks.sync_turn(self, user_content, assistant_content,
+                            session_id or self._session_id, messages)
+        except Exception as e:
+            logger.warning("memory-wiki: sync_turn failed: %s", e)
+
+    def on_pre_compress(self, messages):
+        try:
+            return hooks.on_pre_compress(self, messages)
+        except Exception as e:
+            logger.warning("memory-wiki: on_pre_compress failed: %s", e)
+            return ""
+
+    def on_session_end(self, messages):
+        try:
+            hooks.on_session_end(self, messages)
+        except Exception as e:
+            logger.warning("memory-wiki: on_session_end failed: %s", e)
+
+    def on_memory_write(self, action, target, content, metadata=None):
+        try:
+            hooks.on_memory_write(self, action, target, content, metadata)
+        except Exception as e:
+            logger.warning("memory-wiki: on_memory_write failed: %s", e)
+
+    def on_session_switch(self, new_session_id, *, parent_session_id="",
+                          reset=False, rewound=False, **kwargs):
+        try:
+            hooks.on_session_switch(self, new_session_id, parent_session_id,
+                                    reset, rewound)
+        except Exception as e:
+            logger.warning("memory-wiki: on_session_switch failed: %s", e)
 
     # -- config -------------------------------------------------------------
 

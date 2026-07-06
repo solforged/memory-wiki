@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,15 +63,24 @@ class PageRecord:
 
 
 class WikiIndex:
+    """Thread-safety: sync_turn runs on the manager's background worker
+    while the turn thread searches, so mutation and iteration are
+    serialized by one lock."""
+
     def __init__(self, wiki_root):
         self.root = Path(wiki_root)
         self.pages = {}             # rel -> PageRecord
         self.candidate_hashes = set()
+        self._lock = threading.Lock()
 
     # -- refresh ----------------------------------------------------------
 
     def refresh(self):
         """Rescan the wiki; parse only files whose (mtime, size) changed."""
+        with self._lock:
+            self._refresh_inner()
+
+    def _refresh_inner(self):
         seen = set()
         for d in list(schema.DIR_TYPE) + [schema.INBOX_DIR]:
             dpath = self.root / d
@@ -143,8 +153,10 @@ class WikiIndex:
 
     def records(self, corpus="pages", type_filter=None):
         """Records for a corpus: pages (knowledge types), profile, journal,
-        candidates, or all."""
-        for rec in self.pages.values():
+        candidates, or all. Iterates a snapshot; safe across threads."""
+        with self._lock:
+            snapshot = list(self.pages.values())
+        for rec in snapshot:
             if corpus == "pages":
                 if rec.ntype not in schema.KNOWLEDGE_TYPES:
                     continue
@@ -164,13 +176,12 @@ class WikiIndex:
             yield rec
 
     def pending_candidates(self):
-        return sorted((r for r in self.pages.values()
-                       if r.ntype == "candidate" and r.status == "pending"),
-                      key=lambda r: r.rel)
+        return sorted((r for r in self.records("candidates")
+                       if r.status == "pending"), key=lambda r: r.rel)
 
     def counts(self):
         by = {}
-        for rec in self.pages.values():
+        for rec in self.records("all"):
             key = rec.ntype or "?"
             by[key] = by.get(key, 0) + 1
         return by

@@ -216,7 +216,7 @@ def _review_interactive(cfg, index, pending):
 
 def _cmd_lint(args):
     import re
-    from . import candidates, schema, wikifs
+    from . import schema, wikifs
     cfg = _load_cfg()
     root = Path(cfg.wiki_root)
     if not root.is_dir():

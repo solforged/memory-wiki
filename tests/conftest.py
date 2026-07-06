@@ -90,6 +90,11 @@ def make_page(root, relpath, ntype, title, topics=("testing",), extras=None,
     return path
 
 
+@pytest.fixture(name="make_page")
+def _make_page_fixture():
+    return make_page
+
+
 @pytest.fixture
 def fixture_wiki(tmp_path):
     """A miniature ~/wiki with every type folder, check.py, style guide."""

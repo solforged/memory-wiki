@@ -1,0 +1,207 @@
+"""Living pages: the profile pair and the daily journal.
+
+profile/user.md and profile/agent.md replace USER.md/MEMORY.md; their
+bodies are compiled (char-budgeted) into the provider's system prompt
+block. journal/YYYY-MM-DD.md holds day notes and session episodes.
+All read-modify-write here happens under the wiki lock.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+
+from . import schema, wikifs
+
+logger = logging.getLogger(__name__)
+
+_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+INSTRUCTIONS = """\
+# Memory wiki
+Your persistent memory is a plaintext wiki at {root}. Day-to-day memory:
+profile/user.md (who the user is) and profile/agent.md (your notes), both
+injected below, plus journal/YYYY-MM-DD.md for episodic notes. Durable
+knowledge lives in typed pages (concepts/ claims/ sources/ atlases/
+syntheses/ refs/).
+Tools: wiki_search (cited recall), wiki_get (read a page, candidate,
+`status`, or `review-queue`), wiki_apply (write).
+Write policy: when the user states a preference, correction, or durable
+fact, save it with wiki_apply write_profile; log day notes with
+append_journal. Knowledge pages are never written directly: propose with
+wiki_apply stage; staged candidates need human review, so never present
+them as established facts. Search the wiki before answering questions
+about the user's history, projects, or preferences."""
+
+
+# -- prompt block ---------------------------------------------------------
+
+def compile_prompt_block(cfg, pending_count=0, page_count=0):
+    """Static system-prompt block: instructions + budgeted profile pages."""
+    root = Path(cfg.wiki_root)
+    parts = [INSTRUCTIONS.format(root=root)]
+    for rel, heading, budget in (
+            ("profile/user.md", "## User profile", cfg.profile_user_budget),
+            ("profile/agent.md", "## Agent notes", cfg.profile_agent_budget)):
+        body = _page_body(root / rel)
+        if body:
+            parts.append(f"{heading}\n{_truncate(body, budget, rel)}")
+    parts.append(f"Wiki: {page_count} pages, {pending_count} candidates "
+                 "pending review.")
+    block = "\n\n".join(parts)
+    if len(block) > cfg.prompt_block_budget:
+        block = _truncate(block, cfg.prompt_block_budget, "the wiki")
+    return block
+
+
+def _page_body(path):
+    text = wikifs.read_text(path)
+    if text is None:
+        return ""
+    _fm, body = wikifs.parse_frontmatter(text)
+    body = _COMMENT.sub("", body)
+    # drop empty seed sections so the prompt only carries real content
+    lines = [l.rstrip() for l in body.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _truncate(text, budget, what):
+    if len(text) <= budget:
+        return text
+    cut = text.rfind("\n## ", 0, budget)
+    if cut <= 0:
+        cut = text.rfind("\n", 0, budget)
+    if cut <= 0:
+        cut = budget
+    return (text[:cut].rstrip()
+            + f"\n[truncated - read the rest of {what} with wiki_get]")
+
+
+# -- profile writes ---------------------------------------------------------
+
+def write_profile(cfg, page, content, section=None, mode="append"):
+    """Append to (or replace a section of) a profile page. Returns the
+    repo-relative path written. Caller decides locking policy; this
+    function takes the wiki lock itself."""
+    if page not in ("user", "agent"):
+        raise ValueError("page must be 'user' or 'agent'")
+    if mode not in ("append", "replace_section"):
+        raise ValueError("mode must be 'append' or 'replace_section'")
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("content is empty")
+    rel = f"profile/{page}.md"
+    path = Path(cfg.wiki_root) / rel
+    with wikifs.wiki_lock(cfg.wiki_root):
+        text = wikifs.read_text(path)
+        if text is None:
+            fm, body = schema.profile_seed(f"{page}.md")
+        else:
+            fm, body = wikifs.parse_frontmatter(text)
+            if fm is None:
+                fm, body = schema.profile_seed(f"{page}.md")[0], text
+        target = section or "## Notes"
+        if mode == "append":
+            entry = content if content.startswith("- ") else f"- {content}"
+            body = _append_under(body, target, entry)
+        else:
+            body = _replace_section(body, target, content)
+        fm["updated"] = wikifs.today()
+        wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    return rel
+
+
+def _append_under(body, heading, entry):
+    """Insert entry at the end of a section, creating it if missing."""
+    lines = body.splitlines()
+    start = _find_heading(lines, heading)
+    if start is None:
+        out = body.rstrip("\n") + f"\n\n{heading}\n\n{entry}\n"
+        return out.lstrip("\n") if not body.strip() else out
+    end = _section_end(lines, start)
+    insert = end
+    while insert > start + 1 and not lines[insert - 1].strip():
+        insert -= 1
+    lines.insert(insert, entry)
+    return "\n".join(lines) + "\n"
+
+
+def _replace_section(body, heading, content):
+    lines = body.splitlines()
+    start = _find_heading(lines, heading)
+    if start is None:
+        return _append_under(body, heading, content)
+    end = _section_end(lines, start)
+    new = lines[:start + 1] + ["", *content.splitlines(), ""] + lines[end:]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(new)).rstrip("\n") + "\n"
+
+
+def _find_heading(lines, heading):
+    for i, line in enumerate(lines):
+        if line.strip() == heading:
+            return i
+    return None
+
+
+def _section_end(lines, start):
+    level = len(lines[start]) - len(lines[start].lstrip("#"))
+    for i in range(start + 1, len(lines)):
+        s = lines[i]
+        if s.startswith("#") and (len(s) - len(s.lstrip("#"))) <= level:
+            return i
+    return len(lines)
+
+
+# -- journal ----------------------------------------------------------------
+
+def journal_rel(date_str=None):
+    return f"journal/{date_str or wikifs.today()}.md"
+
+
+def append_journal_note(cfg, content, date_str=None):
+    """Timestamped bullet under ## Notes of today's journal page."""
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("content is empty")
+    rel = journal_rel(date_str)
+    path = Path(cfg.wiki_root) / rel
+    entry = f"- {wikifs.local_hhmm()} {content}"
+    with wikifs.wiki_lock(cfg.wiki_root):
+        fm, body = _load_journal(path, rel)
+        body = _append_under(body, schema.JOURNAL_NOTES, entry)
+        wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    return rel
+
+
+def append_session_episode(cfg, session_id, episode_lines, date_str=None):
+    """Idempotent session episode under ## Sessions (marker-guarded).
+
+    Returns (rel, 'recorded' | 'already_recorded'). Checks today's and
+    yesterday's page so a midnight-spanning session is not re-recorded.
+    """
+    marker = schema.session_marker(session_id)
+    root = Path(cfg.wiki_root)
+    rel = journal_rel(date_str)
+    with wikifs.wiki_lock(cfg.wiki_root):
+        for existing in sorted((root / "journal").glob("*.md"), reverse=True)[:2]:
+            if marker in (wikifs.read_text(existing) or ""):
+                return f"journal/{existing.name}", "already_recorded"
+        path = root / rel
+        fm, body = _load_journal(path, rel)
+        block = "\n".join([f"### {wikifs.local_hhmm()} {episode_lines[0]}",
+                           marker, *episode_lines[1:]])
+        body = _append_under(body, schema.JOURNAL_SESSIONS, block)
+        wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    return rel, "recorded"
+
+
+def _load_journal(path, rel):
+    date_str = rel.rsplit("/", 1)[1][:-3]
+    text = wikifs.read_text(path)
+    if text is None:
+        return schema.journal_frontmatter(date_str), schema.journal_seed_body()
+    fm, body = wikifs.parse_frontmatter(text)
+    if fm is None:
+        return schema.journal_frontmatter(date_str), text
+    return fm, body

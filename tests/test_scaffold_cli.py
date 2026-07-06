@@ -85,7 +85,8 @@ def test_provider_minimal_lifecycle(cfg, tmp_path):
                         agent_context="primary")
     assert (Path(cfg.wiki_root) / "profile" / "user.md").exists()
     assert provider.system_prompt_block()
-    assert provider.get_tool_schemas() == []
+    assert [s["name"] for s in provider.get_tool_schemas()] == [
+        "wiki_search", "wiki_get", "wiki_apply"]
     assert str(cfg.wiki_root) in provider.backup_paths()
     ro = memory_wiki.MemoryWikiProvider(overrides={"wiki_root": str(tmp_path / "w2")})
     ro.initialize("sess-2", hermes_home=str(tmp_path), platform="cli",

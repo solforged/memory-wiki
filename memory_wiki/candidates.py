@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _HEX = re.compile(r"[^0-9a-f]")
 _DEDUP_OVERLAP = 0.8
+_MAX_CONTENT = 50_000
 
 
 def content_hash(text):
@@ -51,12 +52,18 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
 
     supersedes: id of a promoted candidate this content replaces; skips
     dedup (overlap with the bullet being replaced is the whole point).
+
+    Content keeps its original formatting (multi-line markdown and full
+    pages with frontmatter survive review verbatim); normalization is
+    applied only to the hash, slug, and dedup checks.
     """
-    content = " ".join((content or "").split())
+    content = (content or "").strip()
     if not content:
         return {"staged": False, "reason": "empty content"}
-    if len(content) > 1000:
-        content = content[:1000].rsplit(" ", 1)[0] + "..."
+    if len(content) > _MAX_CONTENT:
+        return {"staged": False, "reason":
+                f"content is {len(content)} chars (max {_MAX_CONTENT}); "
+                "stage a summary and keep the full text elsewhere"}
     if kind not in schema.CANDIDATE_KINDS:
         return {"staged": False, "reason": f"unknown kind '{kind}'"}
     if confidence not in schema.CONFIDENCE:
@@ -66,7 +73,14 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
     fields = {k: v for k, v in (fields or {}).items()
               if k in schema.FIELDS_ALLOWLIST}
     if target:
-        wikifs.safe_wiki_path(cfg.wiki_root, target)  # raises on escape
+        target_path = wikifs.safe_wiki_path(cfg.wiki_root, target)  # raises on escape
+    if page_shaped(content):
+        if target and target_path.exists():
+            return {"staged": False, "reason":
+                    "page-shaped content needs a new-page target"}
+        errors = validate_page_candidate(content, target)
+        if errors:
+            return {"staged": False, "reason": "; ".join(errors)}
 
     chash = content_hash(content)
     if not supersedes:
@@ -86,12 +100,12 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
     if supersedes:
         fm["supersedes"] = supersedes
     body_parts = [content, "", schema.EVIDENCE_HEADING, ""]
-    for line in (evidence or [f"proposed via {origin}"]):
+    for line in _clean_evidence(evidence or [f"proposed via {origin}"]):
         body_parts.append(line if line.startswith(("- ", "> ")) else f"> {line}")
     body = "\n".join(body_parts) + "\n"
 
     stamp, s8 = wikifs.utc_stamp(), session8(session_id)
-    slug = wikifs.slugify(content, max_len=40)
+    slug = wikifs.slugify(_slug_source(content), max_len=40)
     inbox = Path(cfg.wiki_root) / schema.INBOX_DIR
     for seq in range(1, 100):
         cand_id = f"{stamp}-{s8}-{seq:02d}"
@@ -109,6 +123,55 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
             return {"staged": True, "id": cand_id,
                     "ref": f"{schema.INBOX_DIR}/{path.name}"}
     return {"staged": False, "reason": "could not allocate candidate id"}
+
+
+def page_shaped(content):
+    """True if staged content is a full page (leading frontmatter)."""
+    return (content or "").startswith("---\n")
+
+
+def validate_page_candidate(content, target=""):
+    """Schema errors for page-shaped staged content, checked against its
+    eventual rel so staging fails fast; promotion revalidates against
+    the real target."""
+    fm, _ = wikifs.parse_frontmatter(content)
+    if fm is None:
+        return ["page-shaped content has unparsable frontmatter"]
+    ntype = fm.get("type")
+    d = schema.TYPE_DIR.get(ntype)
+    if d is None:
+        return [f"page-shaped content has unknown type '{ntype}'"]
+    rel = target or f"{d}/{wikifs.slugify(str(fm.get('title') or ''))}.md"
+    return schema.validate_page(rel, content)
+
+
+def _slug_source(content):
+    if page_shaped(content):
+        fm, _ = wikifs.parse_frontmatter(content)
+        title = str((fm or {}).get("title") or "")
+        if title:
+            return title
+    return content
+
+
+def _clean_evidence(lines):
+    """One physical line per evidence element; an embedded newline could
+    otherwise plant a bare heading that breaks split_evidence."""
+    return [" ".join(str(l).split()) for l in lines if str(l).strip()]
+
+
+def split_evidence(body):
+    """(content, evidence_lines) split at the LAST line-anchored evidence
+    heading: staged content may contain its own '## Evidence', but the
+    writers always append the real evidence section at the very end."""
+    sep = f"\n{schema.EVIDENCE_HEADING}\n"
+    buf = "\n" + (body or "")
+    i = buf.rfind(sep)
+    if i == -1:
+        return (body or "").strip(), []
+    content = buf[1:i]
+    tail = buf[i + len(sep):]
+    return content.strip(), [l for l in tail.splitlines() if l.strip()]
 
 
 def duplicate_reason(index, chash, content):
@@ -157,9 +220,8 @@ def load(cfg, cand_id):
     fm, body = wikifs.parse_frontmatter(text)
     if fm is None:
         return None
-    head, _, tail = body.partition(schema.EVIDENCE_HEADING)
-    evidence = [l for l in tail.strip().splitlines() if l.strip()]
-    return path, fm, head.strip(), evidence
+    content, evidence = split_evidence(body)
+    return path, fm, content, evidence
 
 
 def set_status_unlocked(cfg, path, fm, body_content, evidence, status,
@@ -172,6 +234,7 @@ def set_status_unlocked(cfg, path, fm, body_content, evidence, status,
         fm["reviewed"] = reviewed_note
     if promoted_to:
         fm["promoted_to"] = promoted_to
+    evidence = _clean_evidence(evidence)
     body = body_content.strip() + "\n\n" + schema.EVIDENCE_HEADING + "\n\n" \
         + "\n".join(evidence) + ("\n" if evidence else "")
     wikifs.atomic_write(path, wikifs.render_page(fm, body))
@@ -190,7 +253,7 @@ def list_candidates(cfg, statuses=("pending",)):
             continue
         if statuses and fm.get("status") not in statuses:
             continue
-        head = body.partition(schema.EVIDENCE_HEADING)[0].strip()
+        head = split_evidence(body)[0]
         out.append({"id": fm.get("id", ""), "status": fm.get("status", ""),
                     "kind": fm.get("kind", ""),
                     "confidence": fm.get("confidence", ""),

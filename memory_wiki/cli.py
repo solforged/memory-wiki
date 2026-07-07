@@ -35,6 +35,20 @@ def register_cli(subparser):
     p_review.add_argument("--reject", metavar="ID", action="append", default=[],
                           help="Reject a candidate by id")
     p_review.add_argument("--reason", default="", help="Reason recorded on --reject")
+    p_review.add_argument("--content", default=None, metavar="TEXT",
+                          help="Replace the candidate content on --approve")
+    p_review.add_argument("--target", default=None, metavar="PATH",
+                          help="Retarget the candidate on --approve")
+    p_review.add_argument("--section", default=None, metavar="'## Heading'",
+                          help="Section to append under on --approve")
+    p_review.add_argument("--confidence", default=None,
+                          help="Override confidence on --approve")
+    p_review.add_argument("--topic", action="append", default=[], metavar="TOPIC",
+                          help="Topic for a new page on --approve (repeatable)")
+    p_review.add_argument("--field", action="append", default=[],
+                          metavar="KEY=VALUE",
+                          help="Extra frontmatter for new-page promotion on "
+                               "--approve (repeatable, e.g. stance=model)")
     p_review.add_argument("--prune", action="store_true",
                           help="Delete promoted/rejected candidate files older than --days")
     p_review.add_argument("--days", type=int, default=30)
@@ -151,9 +165,14 @@ def _cmd_review(args):
         return 0
     index = WikiIndex(cfg.wiki_root)
     index.refresh()
+    overrides = _approve_overrides(args)
+    if overrides and len(args.approve) != 1:
+        print("override flags need exactly one --approve ID")
+        return 1
     rc = 0
     for cand_id in args.approve:
-        result = promote.approve(cfg, index, cand_id, actor="cli")
+        result = promote.approve(cfg, index, cand_id,
+                                 overrides=overrides, actor="cli")
         print(f"{cand_id}: " + (result.get("result", "")
                                 if result.get("ok") else
                                 f"ERROR {result.get('error')}"))
@@ -177,28 +196,78 @@ def _cmd_review(args):
             print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11}{age} "
                   f"-> {target}")
             print(f"    {c['content'][:120]}")
+            hint = _hint_line(index, c, pending)
+            if hint:
+                print(f"    {hint}")
         return 0
     return _review_interactive(cfg, index, pending)
+
+
+def _approve_overrides(args):
+    """promote.approve overrides from the CLI flags; {} when none given."""
+    overrides = {}
+    for key in ("content", "target", "section", "confidence"):
+        val = getattr(args, key, None)
+        if val is not None:
+            overrides[key] = val
+    if getattr(args, "topic", None):
+        overrides["topics"] = list(args.topic)
+    fields = {}
+    for pair in getattr(args, "field", None) or []:
+        key, sep, val = pair.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(f"--field expects KEY=VALUE, got {pair!r}")
+        fields[key.strip()] = val.strip()
+    if fields:
+        overrides["fields"] = fields
+    return overrides
+
+
+def _hint_line(index, cand, pending):
+    """One compact 'hint: ...' line, or '' when nothing stands out."""
+    from . import hints
+    h = hints.candidate_hints(index, cand, pending)
+    parts = []
+    if h.get("warnings"):
+        parts.append(", ".join(h["warnings"]))
+    if h.get("covered_by"):
+        parts.append("covered by " + ", ".join(h["covered_by"]))
+    if h.get("similar_candidates"):
+        parts.append("similar to " + ", ".join(h["similar_candidates"]))
+    if h.get("suggested_target"):
+        parts.append(f"consider target {h['suggested_target']}")
+    return f"hint: {'; '.join(parts)}" if parts else ""
 
 
 def _review_interactive(cfg, index, pending):
     from . import promote
     print(f"{len(pending)} pending candidate(s). "
-          "[a]pprove+promote / [t]arget then approve / [r]eject / "
-          "[s]kip / [q]uit")
+          "[a]pprove+promote / [e]dit then approve / "
+          "[t]arget then approve / [r]eject / [s]kip / [q]uit")
     for c in pending:
         target = c["target"] or f"route by kind ({c['kind']})"
         age = f", {c['age_days']}d old" if c.get("age_days") else ""
         print(f"\n{c['id']}  {c['kind']} ({c['confidence']}{age}) -> {target}")
         print(f"  {c['content']}")
+        hint = _hint_line(index, c, pending)
+        if hint:
+            print(f"  {hint}")
         try:
-            choice = input("  [a/t/r/s/q] ").strip().lower()
+            choice = input("  [a/e/t/r/s/q] ").strip().lower()
         except EOFError:
             break
         if choice == "q":
             break
         if choice == "a":
             result = promote.approve(cfg, index, c["id"], actor="cli")
+        elif choice == "e":
+            edited = _edit_content(c["content"])
+            if edited is None or edited == c["content"]:
+                print("  unchanged, skipped")
+                continue
+            result = promote.approve(cfg, index, c["id"],
+                                     overrides={"content": edited},
+                                     actor="cli")
         elif choice == "t":
             new_target = input("  target path: ").strip()
             new_section = input("  section (optional): ").strip()
@@ -215,6 +284,31 @@ def _review_interactive(cfg, index, pending):
         print("  " + (result.get("result", "done") if result.get("ok")
                       else f"ERROR {result.get('error')}"))
     return 0
+
+
+def _edit_content(content):
+    """Edited candidate content via $EDITOR, or an input() replacement
+    when no editor is configured. None means keep as-is."""
+    import os
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if editor:
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile("w+", suffix=".md",
+                                         delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            if subprocess.run([*editor.split(), tmp_path]).returncode != 0:
+                return None
+            with open(tmp_path, encoding="utf-8") as f:
+                return f.read().strip()
+        finally:
+            os.unlink(tmp_path)
+    try:
+        replacement = input("  new content (empty keeps current): ").strip()
+    except EOFError:
+        return None
+    return replacement or None
 
 
 def _cmd_lint(args):
@@ -263,14 +357,14 @@ def _cmd_lint(args):
             print(f"  {e}")
     else:
         print("plugin checks: ok")
-    _run_check_py(root)
-    return 1 if errors else 0
+    check_rc = _run_check_py(root)
+    return 1 if errors or check_rc else 0
 
 
 def _run_check_py(root):
     check = root / "_scripts" / "check.py"
     if not check.is_file():
-        return
+        return 0
     import subprocess
     print("\nrunning _scripts/check.py:")
     proc = subprocess.run([sys.executable, str(check)],
@@ -278,3 +372,4 @@ def _run_check_py(root):
     print(proc.stdout.strip())
     if proc.returncode != 0:
         print(proc.stderr.strip())
+    return proc.returncode

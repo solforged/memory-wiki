@@ -74,6 +74,35 @@ def test_llm_candidates_carry_origin_llm(provider, monkeypatch):
     assert weird["kind"] == "fact"
 
 
+def test_llm_metadata_attached_and_evidence_has_excerpt(provider, monkeypatch):
+    install_fake_plugin_llm(monkeypatch, parsed={"memories": [
+        {"content": "Keeps dotfiles in a bare git repo.", "kind": "note",
+         "confidence": "likely", "target": "refs/dotfiles.md",
+         "topics": ["tooling"], "fields": {"url": "https://x.test"},
+         "rationale": "stable setup detail"},
+        {"content": "Bad target gets dropped.", "kind": "fact",
+         "target": "../../etc/x.md"},
+    ]})
+    provider.sync_turn("Talking about my dotfiles setup at length.", "ok",
+                       session_id="s")
+    staged = candidates.list_candidates(provider.cfg, statuses=("pending",))
+    by_content = {c["content"]: c for c in staged}
+    ref = by_content["Keeps dotfiles in a bare git repo."]
+    from memory_wiki import wikifs
+    text = (Path(provider.cfg.wiki_root) / ref["ref"]).read_text()
+    fm, body = wikifs.parse_frontmatter(text)
+    assert fm["target"] == "refs/dotfiles.md"
+    assert fm["topics"] == ["tooling"]
+    assert fm["fields"] == {"url": "https://x.test"}
+    assert '"Talking about my dotfiles setup at length."' in body
+    assert "rationale: stable setup detail" in body
+
+    bad = by_content["Bad target gets dropped."]
+    fm2, _ = wikifs.parse_frontmatter(
+        (Path(provider.cfg.wiki_root) / bad["ref"]).read_text())
+    assert fm2["target"] == ""
+
+
 def test_broken_llm_degrades_to_deterministic(provider, monkeypatch):
     install_fake_plugin_llm(monkeypatch, boom=True)
     provider.sync_turn("I prefer uv over pip for python projects.", "ok",

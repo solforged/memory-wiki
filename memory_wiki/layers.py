@@ -24,7 +24,7 @@ Your persistent memory is a plaintext wiki at {root}. Day-to-day memory:
 profile/user.md (who the user is) and profile/agent.md (your notes), both
 injected below, plus journal/YYYY-MM-DD.md for episodic notes. Durable
 knowledge lives in typed pages (concepts/ claims/ sources/ atlases/
-syntheses/ refs/).
+syntheses/ refs/ tastes/).
 Tools: wiki_search (cited recall), wiki_get (read a page, candidate,
 `status`, or `review-queue`), wiki_apply (write).
 Write policy: when the user states a preference, correction, or durable

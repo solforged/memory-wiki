@@ -17,20 +17,23 @@ from . import wikifs
 DIR_TYPE = {
     "claims": "claim", "concepts": "concept", "sources": "source",
     "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",
-    "profile": "profile", "journal": "journal",
+    "profile": "profile", "journal": "journal", "tastes": "taste",
 }
 TYPE_DIR = {v: k for k, v in DIR_TYPE.items()}
-KNOWLEDGE_TYPES = ("concept", "claim", "source", "atlas", "synthesis", "ref")
+KNOWLEDGE_TYPES = ("concept", "claim", "source", "atlas", "synthesis", "ref",
+                   "taste")
 MEMORY_TYPES = ("profile", "journal")
 
 REQUIRED = ["type", "title", "topics", "created"]
 EXTRA_REQUIRED = {
-    "claim": ["confidence", "maturity"],
+    "claim": ["stance", "confidence", "maturity"],
     "source": ["author", "medium"],
     "synthesis": ["status"],
 }
 ENUMS = {
-    "confidence": {"speculative", "plausible", "likely", "confident"},
+    "stance": {"external", "candidate", "model"},
+    "confidence": {"unassessed", "speculative", "plausible", "likely",
+                   "confident"},
     "maturity": {"seedling", "budding", "evergreen"},
     "status": {"draft", "published"},
     "medium": {"book", "textbook", "paper", "course", "video", "post",
@@ -51,7 +54,7 @@ EVIDENCE_HEADING = "## Evidence"
 
 # extra frontmatter keys allowed in candidate `fields` for new-page promotion
 FIELDS_ALLOWLIST = ("author", "medium", "year", "url", "aliases", "ref",
-                    "supports", "contradicts")
+                    "supports", "contradicts", "stance", "maturity", "status")
 
 INBOX_DIR = "_inbox"
 DECISIONS_FILE = "_inbox/decisions.jsonl"
@@ -123,6 +126,7 @@ def page_frontmatter(ntype, title, topics=None, created=None, extras=None):
             fm["ref"] = extras["ref"]
     elif ntype == "claim":
         fm["topics"] = topics
+        fm["stance"] = extras.get("stance", "candidate")
         fm["confidence"] = extras.get("confidence", "plausible")
         fm["maturity"] = extras.get("maturity", "seedling")
         fm["supports"] = extras.get("supports", [])

@@ -20,7 +20,7 @@ CHECK_ANCHOR = (
 )
 CHECK_REPLACEMENT = (
     '    "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",\n'
-    '    "profile": "profile", "journal": "journal",  # memory-wiki\n'
+    '    "profile": "profile", "journal": "journal", "tastes": "taste",  # memory-wiki\n'
     '}'
 )
 CHECK_SENTINEL = '"profile": "profile"'

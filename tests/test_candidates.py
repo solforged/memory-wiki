@@ -83,6 +83,79 @@ def test_stage_filters_fields_allowlist(ready):
     assert fm["fields"] == {"author": "Jane"}
 
 
+def test_multiline_content_survives_staging_and_loading(ready):
+    cfg, idx = ready
+    content = ("Claim body first paragraph.\n\n"
+               "- bullet one\n- bullet two\n\n"
+               "Closing paragraph with **markdown**.")
+    r = candidates.stage(cfg, idx, content, kind="claim")
+    assert r["staged"], r
+    _, _, loaded, evidence = candidates.load(cfg, r["id"])
+    assert loaded == content
+    assert evidence
+    listed = candidates.list_candidates(cfg)
+    assert listed[0]["content"] == content
+
+
+def test_long_content_not_truncated_and_oversize_rejected(ready):
+    cfg, idx = ready
+    long_content = "A sentence about deployment pipelines. " * 60  # ~2.4KB
+    r = candidates.stage(cfg, idx, long_content, kind="note")
+    assert r["staged"]
+    _, _, loaded, _ = candidates.load(cfg, r["id"])
+    assert loaded == long_content.strip()
+    too_big = "x" * 50_001
+    r2 = candidates.stage(cfg, idx, too_big)
+    assert not r2["staged"] and "max 50000" in r2["reason"]
+
+
+def test_split_evidence_last_heading_and_absent(ready):
+    content = "Intro.\n\n## Evidence\n\n- the page's own evidence\n\nMore."
+    body = content + "\n\n## Evidence\n\n> proposed via tool\n"
+    head, evidence = candidates.split_evidence(body)
+    assert head == content
+    assert evidence == ["> proposed via tool"]
+    # no separator: everything is content, no evidence
+    assert candidates.split_evidence("just content\n") == ("just content", [])
+    # mid-line and deeper headings do not split
+    head2, ev2 = candidates.split_evidence(
+        "mentions ## Evidence inline\n\n### Evidence\n\n## Evidence\n\n> e\n")
+    assert head2.startswith("mentions") and "### Evidence" in head2
+    assert ev2 == ["> e"]
+
+
+def test_evidence_lines_sanitized(ready):
+    cfg, idx = ready
+    r = candidates.stage(cfg, idx, "Fact with sneaky evidence.",
+                         evidence=["- ok\n## Evidence\nsneaky"])
+    assert r["staged"]
+    _, _, content, evidence = candidates.load(cfg, r["id"])
+    assert content == "Fact with sneaky evidence."
+    assert all("\n" not in l for l in evidence)
+
+
+def test_page_shaped_stage_validates(ready):
+    cfg, idx = ready
+    good = ("---\ntype: claim\ntitle: staged claims work\n"
+            "topics: [memory]\nstance: model\nconfidence: likely\n"
+            "maturity: seedling\ncreated: 2026-07-06\n---\n"
+            "Body argument.\n\n## Evidence\n\n- some\n")
+    r = candidates.stage(cfg, idx, good, kind="claim")
+    assert r["staged"], r
+    _, _, loaded, _ = candidates.load(cfg, r["id"])
+    assert loaded == good.strip()
+    assert "staged-claims-work" in r["ref"]  # slug from page title
+
+    bad = "---\ntype: claim\ntitle: no stance\ntopics: [x]\ncreated: 2026-07-06\n---\nb\n"
+    r2 = candidates.stage(cfg, idx, bad, kind="claim")
+    assert not r2["staged"] and "stance" in r2["reason"]
+
+    existing = "---\ntype: claim\ntitle: t\ntopics: [x]\ncreated: 2026-07-06\n---\nb\n"
+    r3 = candidates.stage(cfg, idx, existing,
+                          target="claims/small-tools-beat-frameworks.md")
+    assert not r3["staged"] and "new-page target" in r3["reason"]
+
+
 def test_list_load_and_prune(ready):
     cfg, idx = ready
     r = candidates.stage(cfg, idx, "Fact one about the system.")

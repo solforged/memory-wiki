@@ -9,7 +9,10 @@ from memory_wiki.index import WikiIndex, tokenize
 
 def make_candidate(root, cand_id, status="pending", kind="preference",
                    content="User prefers uv over pip.", slug="prefers-uv",
-                   created="2026-07-05"):
+                   created=None):
+    if created is None:
+        from datetime import date
+        created = date.today().isoformat()  # keep age-sensitive asserts stable
     fm = {"id": cand_id, "status": status, "kind": kind, "target": "",
           "section": "", "confidence": "plausible", "origin": "sync_turn",
           "session": "s1", "turn": 1, "created": created,
@@ -55,6 +58,17 @@ def test_index_candidates_and_hashes(fixture_wiki):
     assert len(idx.pending_candidates()) == 1
     assert idx.pending_candidates()[0].cand_id == CID1
     assert idx.candidate_hashes == {"h01", "h02"}
+
+
+def test_taste_page_indexed_and_searchable(fixture_wiki, make_page):
+    make_page(fixture_wiki, "tastes/tastes.md", "taste", "Tastes",
+              topics=("profile", "music"),
+              body="Strong signal for synthwave and dark ambient.\n")
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    assert idx.counts().get("taste") == 1
+    scored = search.score_records(idx, "synthwave dark ambient")
+    assert scored and scored[0][1].rel == "tastes/tastes.md"
 
 
 def test_corpus_and_type_filters(fixture_wiki):

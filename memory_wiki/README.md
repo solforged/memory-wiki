@@ -49,7 +49,8 @@ hermes memory-wiki init          # add --dry-run to preview
   `review-queue` / `decisions`.
 - `wiki_apply(action, ...)`: `write_profile` and `append_journal` write
   directly (day-to-day memory); `stage` proposes knowledge; `approve`
-  (promotes by default), `reject`, `promote` manage the queue;
+  (promotes by default; re-approve to promote later), `reject` manage
+  the queue;
   `supersede` replaces an outdated promoted memory in place (id = the
   old candidate id from the bullet's marker; profile/journal targets
   replace immediately, knowledge pages stay review-first).

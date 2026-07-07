@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import re
 
+from .index import tokenize
+
 _MAX_INPUT = 4000      # longer user turns are pastes, not statements
 _MIN_SENTENCE = 15
 _MAX_SENTENCE = 300
+_MIN_DECISION_TOKENS = 4   # 'Let's start with three.' is not a decision
 
 _FENCE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`]*`")
@@ -29,9 +32,24 @@ PATTERNS = (
         r"\b(?:let'?s|we'?ll|we will|we decided|decided to|going to go with|"
         r"from now on|we're switching to|going forward)\b", re.IGNORECASE)),
     ("fact", re.compile(
-        r"\b(?:my \w+ is|i am a|i'?m a|i work |i live |call me )\b",
+        r"\b(?:my \w+ is|i am a|i'?m a|"
+        r"i work (?:at|for|as|on|in|from|remotely)|i live|call me)\b",
         re.IGNORECASE)),
 )
+
+# task-like, date-bound phrasing: planning, not a durable profile trait
+_DATE_BOUND = re.compile(
+    r"\b(?:today|tomorrow|tonight|right now|this (?:week|month|afternoon|"
+    r"evening)|next (?:week|month)|by (?:monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday))\b", re.IGNORECASE)
+
+
+def _keep(kind, sentence):
+    if kind == "decision":
+        return len(set(tokenize(sentence))) >= _MIN_DECISION_TOKENS
+    if kind in ("preference", "fact"):
+        return not _DATE_BOUND.search(sentence)
+    return True
 
 
 def extract(text):
@@ -57,8 +75,9 @@ def extract(text):
             continue
         for kind, pattern in PATTERNS:
             if pattern.search(sentence):
-                out.append({"content": sentence, "kind": kind})
-                seen.add(key)
+                if _keep(kind, sentence):
+                    out.append({"content": sentence, "kind": kind})
+                    seen.add(key)
                 break
     return out
 

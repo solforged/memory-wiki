@@ -30,7 +30,11 @@ future conversations. Return an empty list when nothing qualifies
 (most turns). Never extract secrets, credentials, or transient detail.
 Each memory: content (one self-contained sentence), kind (one of
 preference|fact|decision|correction|claim|concept|note), confidence
-(speculative|plausible|likely|confident)."""
+(speculative|plausible|likely|confident). Optionally: target (a
+repo-relative wiki page like 'refs/foo.md' when one clearly fits),
+topics (for a new page), fields (extra frontmatter), and rationale
+(one line on why this is durable). These extras are review metadata; a
+human reviewer decides."""
 
 JSON_SCHEMA = {
     "type": "object",
@@ -45,6 +49,10 @@ JSON_SCHEMA = {
                              "enum": list(schema.CANDIDATE_KINDS)},
                     "confidence": {"type": "string",
                                    "enum": list(schema.CONFIDENCE)},
+                    "target": {"type": "string"},
+                    "topics": {"type": "array", "items": {"type": "string"}},
+                    "fields": {"type": "object"},
+                    "rationale": {"type": "string"},
                 },
                 "required": ["content", "kind"],
             },
@@ -92,10 +100,30 @@ def extract_turn(cfg, user_content, assistant_content):
             continue
         kind = item.get("kind")
         confidence = item.get("confidence")
+        topics = item.get("topics")
+        fields = item.get("fields")
         out.append({
             "content": content,
             "kind": kind if kind in schema.CANDIDATE_KINDS else "fact",
             "confidence": (confidence if confidence in schema.CONFIDENCE
                            else "plausible"),
+            # review metadata, not authoritative: a reviewer confirms these
+            "target": _clean_target(item.get("target")),
+            "topics": ([str(t) for t in topics if str(t).strip()][:5]
+                       if isinstance(topics, list) else []),
+            "fields": fields if isinstance(fields, dict) else {},
+            "rationale": " ".join(str(item.get("rationale") or "").split()),
         })
     return out
+
+
+def _clean_target(target):
+    """A proposed target only survives as 'typefolder/name.md'; anything
+    else (escapes, nesting, unknown folders) is dropped, never an error."""
+    target = str(target or "").strip()
+    if not target.endswith(".md"):
+        return ""
+    d, _, rest = target.partition("/")
+    if d not in schema.DIR_TYPE or not rest or "/" in rest:
+        return ""
+    return target

@@ -95,14 +95,18 @@ def _llm_stage(provider, user_content, assistant_content, turn):
     for item in items:
         if state.session_count >= cfg.max_candidates_per_session:
             break
+        evidence = [f'> [user, turn {turn}] "{extract.excerpt(user_content, 160)}"',
+                    f"- proposed by llm extraction, turn {turn}"]
+        if item.get("rationale"):
+            evidence.append(f"- rationale: {item['rationale']}")
         result = candidates.stage(
             cfg, provider.index, item.get("content", ""),
             kind=item.get("kind", "fact"), origin="llm",
             session_id=provider.session_id, turn=turn,
             confidence=item.get("confidence", "plausible"),
             target=item.get("target", ""),
-            evidence=[f"proposed by llm extraction, turn {turn}"],
-            actor="hook")
+            topics=item.get("topics"), fields=item.get("fields"),
+            evidence=evidence, actor="hook")
         if result.get("staged"):
             state.session_count += 1
             state.staged_ids.append(result["id"])

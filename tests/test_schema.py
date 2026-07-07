@@ -18,6 +18,7 @@ def render(ntype, title, relname=None, topics=("t",), extras=None, body="Body.\n
     ("ref", "refs/git-cheatsheet.md", {"url": "https://x.test"}),
     ("profile", "profile/user.md", None),
     ("journal", "journal/2026-07-05.md", None),
+    ("taste", "tastes/tastes.md", None),
 ])
 def test_valid_pages_per_type(ntype, relpath, extras):
     title = relpath.split("/")[1][:-3].replace("-", " ")
@@ -27,6 +28,34 @@ def test_valid_pages_per_type(ntype, relpath, extras):
 
 def test_journal_date_filename_passes_kebab():
     assert schema.KEBAB.match("2026-07-05.md")
+
+
+def test_claim_page_emits_stance():
+    fm = schema.page_frontmatter("claim", "x", created="2026-07-01")
+    assert fm["stance"] == "candidate"
+    keys = list(fm)
+    assert keys.index("topics") < keys.index("stance") < keys.index("confidence")
+    fm2 = schema.page_frontmatter("claim", "x", created="2026-07-01",
+                                  extras={"stance": "external"})
+    assert fm2["stance"] == "external"
+
+
+def test_claim_missing_or_bad_stance_fails():
+    fm = schema.page_frontmatter("claim", "x", created="2026-07-01")
+    del fm["stance"]
+    errs = schema.validate_page("claims/x.md", wikifs.render_page(fm, "b\n"))
+    assert any("'stance'" in e for e in errs)
+    fm["stance"] = "hunch"
+    errs = schema.validate_page("claims/x.md", wikifs.render_page(fm, "b\n"))
+    assert any("stance 'hunch'" in e for e in errs)
+
+
+def test_unassessed_confidence_is_valid_on_pages():
+    fm = schema.page_frontmatter("claim", "x", created="2026-07-01",
+                                 extras={"confidence": "unassessed"})
+    assert schema.validate_page("claims/x.md",
+                                wikifs.render_page(fm, "b\n")) == []
+    assert "unassessed" not in schema.CONFIDENCE  # candidates stay assessed
 
 
 def test_wrong_folder_type_mismatch():

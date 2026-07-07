@@ -41,7 +41,11 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
                     "target": fm.get("promoted_to", "")}
         if fm.get("status") == "rejected":
             return {"ok": False, "error": f"{cand_id} was rejected; re-stage it"}
-        content = " ".join(overrides.pop("content", "").split()) or content
+        if fm.get("status") == "superseded":
+            return {"ok": False, "error":
+                    f"{cand_id} was superseded ({fm.get('reviewed', '')}); "
+                    "approving it would re-append stale content"}
+        content = overrides.pop("content", "").strip() or content
         fm_overrides = {k: v for k, v in overrides.items()
                         if k in ("target", "section", "confidence", "topics")}
         if "fields" in overrides:
@@ -75,7 +79,11 @@ def supersede(cfg, index, old_id, content, confidence="", actor="tool",
     loaded = candidates.load(cfg, old_id)
     if loaded is None:
         return {"ok": False, "error": f"no candidate {old_id}"}
-    _path, old_fm, _old_content, _ev = loaded
+    _path, old_fm, old_content, _ev = loaded
+    if candidates.page_shaped(old_content):
+        return {"ok": False, "error":
+                f"{old_id} was promoted as a full page; edit the page "
+                "directly or stage a replacement page"}
     if old_fm.get("status") != "promoted":
         return {"ok": False, "error":
                 f"{old_id} is {old_fm.get('status')}; supersede only applies "
@@ -96,7 +104,7 @@ def supersede(cfg, index, old_id, content, confidence="", actor="tool",
     if target.split("/", 1)[0] not in ("profile", "journal"):
         return {"ok": True, "result": "pending_review", "id": new_id,
                 "supersedes": old_id, "target": target,
-                "note": "knowledge pages are review-first; promote after review"}
+                "note": "knowledge pages are review-first; approve after review"}
     result = promote(cfg, index, new_id, actor=actor, session_id=session_id)
     if not result.get("ok"):
         return result
@@ -208,6 +216,11 @@ def _resolve(cfg, fm, content):
 
 
 def _title_from(content):
+    if candidates.page_shaped(content):
+        page_fm, _ = wikifs.parse_frontmatter(content)
+        title = str((page_fm or {}).get("title") or "").strip()
+        if title:
+            return title
     first = content.split(". ")[0].strip().rstrip(".")
     return first[:80]
 
@@ -216,6 +229,14 @@ def _title_from(content):
 
 def _promote_append(cfg, cand_id, content, route, supersedes=""):
     rel, section = route["target"], route.get("section") or "## Notes"
+    if candidates.page_shaped(content):
+        raise ValueError(f"page-shaped content needs a new-page target, "
+                         f"not {rel}; approve with a different target")
+    if "\n" in content:
+        raise ValueError(
+            f"multi-line content cannot be appended to {rel} (entries are "
+            "single-line bullets); retarget to a new page or approve with "
+            "a one-line content override")
     marker = schema.candidate_marker(cand_id)
     existing = wikifs.read_text(Path(cfg.wiki_root) / rel) or ""
     if marker in existing:
@@ -309,6 +330,8 @@ def _promote_new_page(cfg, cand_id, fm, content, route):
         return {"ok": False, "error":
                 f"{rel} already exists; approve with a different target "
                 "(never suffix filenames)"}
+    if candidates.page_shaped(content):
+        return _promote_page_shaped(cfg, cand_id, content, rel, path)
     fields = dict(fm.get("fields") or {})
     if ntype == "source":
         missing = [k for k in ("author", "medium") if not fields.get(k)]
@@ -330,13 +353,29 @@ def _promote_new_page(cfg, cand_id, fm, content, route):
     return {"ok": True, "target": rel}
 
 
+def _promote_page_shaped(cfg, cand_id, content, rel, path):
+    """Write a staged full page verbatim (its own frontmatter wins over
+    candidate metadata), plus the promoted marker."""
+    page_fm, page_body = wikifs.parse_frontmatter(content)
+    if page_fm is None:
+        return {"ok": False, "error": "page-shaped content has unparsable "
+                                      "frontmatter"}
+    body = page_body.strip() + "\n\n" + schema.promoted_comment(cand_id) + "\n"
+    text = wikifs.render_page(page_fm, body)
+    errors = schema.validate_page(rel, text)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}
+    wikifs.atomic_write(path, text)
+    return {"ok": True, "target": rel}
+
+
 def _new_page_body(cand_id, fm, content, ntype):
     parts = [content, ""]
     if ntype == "claim":
         created = fm.get("created") or wikifs.today()
         s8 = candidates.session8(fm.get("session", ""))
         parts += ["## Evidence",
-                  f"- [journal](../journal/{created}.md) - captured in "
+                  f"- [[journal/{created}|journal]] - captured in "
                   f"conversation, session {s8}",
                   "", "## Open questions", ""]
     parts.append(schema.promoted_comment(cand_id))

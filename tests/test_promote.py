@@ -74,7 +74,7 @@ def test_claim_new_page(ready):
     assert fm["type"] == "claim" and fm["confidence"] == "likely"
     assert fm["maturity"] == "seedling" and fm["topics"] == ["memory"]
     assert "## Evidence" in body and "## Open questions" in body
-    assert "../journal/" in body and "session 8f3e9c12" in body
+    assert "[[journal/" in body and "session 8f3e9c12" in body
     assert schema.promoted_comment(cid) in body
     assert schema.validate_page(rel, text) == []
 
@@ -96,6 +96,59 @@ def test_concept_new_page_and_existing_refused(ready):
     assert not result2["ok"] and "already exists" in result2["error"]
     _, fm2, _, _ = candidates.load(cfg, cid2)
     assert fm2["status"] == "approved"  # stays approved for retargeting
+
+
+FULL_CLAIM_PAGE = ("---\ntype: claim\ntitle: staged pages promote verbatim\n"
+                   "topics: [memory]\nstance: model\nconfidence: likely\n"
+                   "maturity: budding\ncreated: 2026-07-06\n---\n"
+                   "Argument paragraph.\n\n## Evidence\n\n- staged evidence\n"
+                   "\n## Open questions\n")
+
+
+def test_page_shaped_claim_promotes_verbatim(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, FULL_CLAIM_PAGE, kind="claim")
+    result = promote.approve(cfg, idx, cid)
+    assert result["ok"], result
+    rel = result["target"]
+    assert rel == "claims/staged-pages-promote-verbatim.md"
+    text = read(cfg, rel)
+    fm, body = wikifs.parse_frontmatter(text)
+    assert fm["stance"] == "model" and fm["maturity"] == "budding"
+    assert "Argument paragraph." in body
+    assert "- staged evidence" in body
+    assert "## Open questions" in body
+    assert schema.promoted_comment(cid) in body
+    assert schema.validate_page(rel, text) == []
+    # page-shaped promoted candidates cannot be superseded in place
+    idx.refresh()
+    r = promote.supersede(cfg, idx, cid, "replacement text")
+    assert not r["ok"] and "full page" in r["error"]
+
+
+def test_multiline_append_refused_stays_approved(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "line one\nline two", kind="preference")
+    result = promote.approve(cfg, idx, cid)
+    assert not result["ok"] and "single-line bullets" in result["error"]
+    _, fm, _, _ = candidates.load(cfg, cid)
+    assert fm["status"] == "approved"  # recoverable: retarget or edit
+    fixed = promote.approve(cfg, idx, cid,
+                            overrides={"content": "line one; line two"})
+    assert fixed["ok"] and fixed["target"] == "profile/user.md"
+
+
+def test_page_shaped_append_target_refused(ready):
+    cfg, idx = ready
+    # staging refuses an existing target outright...
+    r = candidates.stage(cfg, idx, FULL_CLAIM_PAGE,
+                         target="claims/small-tools-beat-frameworks.md")
+    assert not r["staged"] and "new-page target" in r["reason"]
+    # ...and retargeting to an existing page at approve time is caught too
+    cid = stage(cfg, idx, FULL_CLAIM_PAGE, kind="claim")
+    result = promote.approve(cfg, idx, cid, overrides={
+        "target": "claims/small-tools-beat-frameworks.md"})
+    assert not result["ok"] and "new-page target" in result["error"]
 
 
 def test_source_requires_author_and_medium(ready):
@@ -215,6 +268,20 @@ def test_supersede_guards(ready):
     assert not promote.supersede(cfg, idx, cid, "   ")["ok"]
 
 
+def test_superseded_candidate_cannot_be_reapproved(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "Deploys on Thursdays.", kind="preference")
+    promote.approve(cfg, idx, cid)
+    idx.refresh()
+    r = promote.supersede(cfg, idx, cid, "Deploys on Wednesdays now.")
+    assert r["ok"]
+    # its marker is gone from the page; re-approving would re-append stale content
+    back = promote.approve(cfg, idx, cid)
+    assert not back["ok"] and "superseded" in back["error"]
+    text = read(cfg, "profile/user.md")
+    assert "Deploys on Thursdays." not in text
+
+
 def test_supersede_appends_when_marker_hand_deleted(ready):
     cfg, idx = ready
     cid = stage(cfg, idx, "Original preference.", kind="preference")
@@ -270,8 +337,11 @@ def test_apply_tool_end_to_end(fixture_wiki, tmp_path):
 
     out = apply(action="approve", id=cid)
     assert out["ok"] and out["target"].startswith("claims/")
-    out = apply(action="promote", id=cid)
+    out = apply(action="approve", id=cid)  # re-approve is the idempotent path
     assert out["ok"] and out["result"] == "already_promoted"
+    # promote is no longer a public action (review cannot be skipped)
+    out = apply(action="promote", id=cid)
+    assert not out["ok"] and "unknown action" in out["error"]
 
     out = apply(action="stage", content="Rejected idea.", kind="note")
     rej = apply(action="reject", id=out["id"], reason="not worth keeping")

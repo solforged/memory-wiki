@@ -61,6 +61,27 @@ def test_patched_fake_check_py_still_runs(cfg):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_lint_exit_codes(cfg, monkeypatch, capsys):
+    from argparse import Namespace
+    from memory_wiki import cli
+    monkeypatch.setattr(cli, "_load_cfg", lambda *a, **k: cfg)
+    root = Path(cfg.wiki_root)
+    assert cli._cmd_lint(Namespace()) == 0
+    assert "plugin checks: ok" in capsys.readouterr().out
+
+    # plugin validation error -> nonzero
+    bad = root / "claims" / "bad-claim.md"
+    bad.write_text("no frontmatter here\n")
+    assert cli._cmd_lint(Namespace()) == 1
+    assert "missing frontmatter" in capsys.readouterr().out
+    bad.unlink()
+
+    # wiki's own checker failing -> nonzero even when plugin checks pass
+    (root / "_scripts" / "check.py").write_text(
+        "import sys\nprint('broken')\nsys.exit(1)\n")
+    assert cli._cmd_lint(Namespace()) == 1
+
+
 def test_config_defaults_and_overrides(tmp_path):
     c = mw_config.load_config(None, None)
     assert c.prefetch_limit == 5 and c.auto_capture is True

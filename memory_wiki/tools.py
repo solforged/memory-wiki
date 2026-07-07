@@ -70,19 +70,18 @@ WIKI_APPLY_SCHEMA = {
         "write_profile saves a durable user fact/preference or agent note; "
         "append_journal logs a timestamped note to today's journal. "
         "Review-first writes (knowledge base): stage proposes a candidate; "
-        "approve/reject/promote manage the review queue. approve promotes "
-        "immediately unless and_promote=false. supersede replaces an "
-        "outdated promoted memory (id = the old candidate) with new "
-        "content, in place."),
+        "approve/reject manage the review queue. approve promotes "
+        "immediately unless and_promote=false (approve again later to "
+        "promote). supersede replaces an outdated promoted memory (id = "
+        "the old candidate) with new content, in place."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string",
-                       "enum": ["stage", "approve", "reject", "promote",
-                                "supersede", "write_profile",
-                                "append_journal"]},
+                       "enum": ["stage", "approve", "reject", "supersede",
+                                "write_profile", "append_journal"]},
             "id": {"type": "string",
-                   "description": "Candidate id (approve/reject/promote/"
+                   "description": "Candidate id (approve/reject/"
                                   "supersede)."},
             "content": {"type": "string",
                         "description": "Text to stage/write/append."},
@@ -217,13 +216,17 @@ def _get_status(provider):
 
 
 def _get_review_queue(provider):
+    from . import candidates, hints
     provider.index.refresh()
+    pending = candidates.list_candidates(provider.cfg, statuses=("pending",))
     items = []
-    for rec in provider.index.pending_candidates():
-        items.append({"id": rec.cand_id, "kind": rec.kind,
-                      "confidence": rec.confidence,
-                      "age_days": wikifs.days_since(rec.created),
-                      "excerpt": rec.body_head[:120]})
+    for c in pending:
+        item = {"id": c["id"], "kind": c["kind"],
+                "confidence": c["confidence"], "target": c["target"],
+                "age_days": c["age_days"],
+                "excerpt": " ".join(c["content"].split())[:120]}
+        item.update(hints.candidate_hints(provider.index, c, pending))
+        items.append(item)
     return ok(ref="review-queue", count=len(items), candidates=items)
 
 
@@ -278,7 +281,7 @@ def _apply(provider, args):
         return ok(action=action, id=result["id"], ref=result["ref"],
                   note="pending human review")
 
-    if action in ("approve", "reject", "promote", "supersede"):
+    if action in ("approve", "reject", "supersede"):
         cand_id = (args.get("id") or "").strip()
         if not cand_id:
             return err(f"{action} needs a candidate id")
@@ -299,13 +302,10 @@ def _apply(provider, args):
                 cfg, provider.index, cand_id, overrides=overrides,
                 and_promote=args.get("and_promote", True),
                 actor="tool", session_id=session)
-        elif action == "reject":
+        else:
             result = promote.reject(cfg, cand_id,
                                     reason=args.get("reason") or "",
                                     actor="tool", session_id=session)
-        else:
-            result = promote.promote(cfg, provider.index, cand_id,
-                                     actor="tool", session_id=session)
         if not result.get("ok"):
             return err(result.get("error", "failed"), action=action)
         if action != "supersede" and \

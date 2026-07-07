@@ -22,6 +22,23 @@ def test_decision_and_fact():
     assert "decision" in got and "fact" in got
 
 
+def test_contextless_decision_skipped():
+    assert kinds("Let's start with three.") == []
+    assert kinds("Let's go with sqlite-free storage for this project.")
+
+
+def test_date_bound_planning_skipped():
+    assert kinds("I need to update the certs tomorrow.") == []
+    assert kinds("I want to land the refactor by friday.") == []
+    assert kinds("I always deploy on Friday evenings.")  # durable habit stays
+
+
+def test_incidental_where_i_work_skipped():
+    assert kinds("That is the big building where I work every day.") == []
+    out = kinds("I work at Anthropic on the memory team.")
+    assert out and out[0][0] == "fact"
+
+
 def test_questions_and_short_lines_skipped():
     assert kinds("Do I prefer uv or pip?") == []
     assert kinds("I like it.") == []          # under min length

@@ -35,6 +35,7 @@ class MemoryWikiConfig:
     max_candidates_per_turn: int = 3
     max_candidates_per_session: int = 40
     candidate_stale_days: int = 30
+    dream_limit: int = 50
     backup_include_wiki: bool = True
 
 

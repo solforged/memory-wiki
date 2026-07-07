@@ -259,6 +259,7 @@ def list_candidates(cfg, statuses=("pending",)):
                     "confidence": fm.get("confidence", ""),
                     "target": fm.get("target", ""),
                     "created": fm.get("created", ""),
+                    "supersedes": fm.get("supersedes", ""),
                     "age_days": wikifs.days_since(fm.get("created", "")),
                     "content": head, "ref": f"{schema.INBOX_DIR}/{path.name}"})
     return out

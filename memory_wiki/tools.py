@@ -50,7 +50,8 @@ WIKI_GET_SCHEMA = {
         "Read from the memory wiki: a repo-relative page path "
         "('claims/foo.md', 'journal/2026-07-05.md', '_inbox/<file>.md'), a "
         "candidate id, or the specials 'status' (provider health + counts), "
-        "'review-queue' (pending candidates), 'decisions' (audit tail)."),
+        "'review-queue' (pending candidates), 'dream' (curation plan), "
+        "'decisions' (audit tail)."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -73,13 +74,14 @@ WIKI_APPLY_SCHEMA = {
         "approve/reject manage the review queue. approve promotes "
         "immediately unless and_promote=false (approve again later to "
         "promote). supersede replaces an outdated promoted memory (id = "
-        "the old candidate) with new content, in place."),
+        "the old candidate) with new content, in place. dream returns a "
+        "curation plan and can apply conservative profile/agent promotions."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string",
                        "enum": ["stage", "approve", "reject", "supersede",
-                                "write_profile", "append_journal"]},
+                                "dream", "write_profile", "append_journal"]},
             "id": {"type": "string",
                    "description": "Candidate id (approve/reject/"
                                   "supersede)."},
@@ -104,6 +106,10 @@ WIKI_APPLY_SCHEMA = {
             "reason": {"type": "string", "description": "reject: why."},
             "and_promote": {"type": "boolean",
                             "description": "approve: promote now (default true)."},
+            "limit": {"type": "integer", "minimum": 1,
+                      "description": "dream: max pending candidates to inspect."},
+            "apply_safe": {"type": "boolean",
+                           "description": "dream: promote only conservative profile/agent suggestions."},
         },
         "required": ["action"],
     },
@@ -169,6 +175,8 @@ def _get(provider, args):
         return _get_status(provider)
     if ref == "review-queue":
         return _get_review_queue(provider)
+    if ref == "dream":
+        return _get_dream(provider)
     if ref == "decisions":
         return _get_decisions(provider)
     root = provider.cfg.wiki_root
@@ -179,7 +187,7 @@ def _get(provider, args):
         ref = f"{schema.INBOX_DIR}/{matches[0].name}"
     if not ref.endswith(".md"):
         return err("ref must be a .md path, a candidate id, or one of "
-                   "status | review-queue | decisions")
+                   "status | review-queue | dream | decisions")
     path = wikifs.safe_wiki_path(root, ref)
     text = wikifs.read_text(path)
     if text is None:
@@ -212,7 +220,7 @@ def _get_status(provider):
               config={k: getattr(provider.cfg, k) for k in
                       ("auto_capture", "llm_extraction", "journal_episodes",
                        "prefetch_limit", "max_candidates_per_session",
-                       "candidate_stale_days")})
+                       "candidate_stale_days", "dream_limit")})
 
 
 def _get_review_queue(provider):
@@ -228,6 +236,14 @@ def _get_review_queue(provider):
         item.update(hints.candidate_hints(provider.index, c, pending))
         items.append(item)
     return ok(ref="review-queue", count=len(items), candidates=items)
+
+
+def _get_dream(provider):
+    from . import dream
+    provider.index.refresh()
+    result = dream.run(provider.cfg, provider.index, apply_safe=False,
+                       actor="tool", session_id=provider.session_id)
+    return ok(ref="dream", **result)
 
 
 def _get_decisions(provider):
@@ -280,6 +296,17 @@ def _apply(provider, args):
             return err(f"not staged: {result.get('reason')}")
         return ok(action=action, id=result["id"], ref=result["ref"],
                   note="pending human review")
+
+    if action == "dream":
+        from . import dream
+        provider.index.refresh()
+        result = dream.run(cfg, provider.index, limit=args.get("limit"),
+                           apply_safe=bool(args.get("apply_safe")),
+                           actor="tool", session_id=session)
+        if any(a.get("ok") and str(a.get("target", "")).startswith("profile/")
+               for a in result.get("applied", [])):
+            provider.recompile_prompt_block()
+        return ok(action=action, **result)
 
     if action in ("approve", "reject", "supersede"):
         cand_id = (args.get("id") or "").strip()

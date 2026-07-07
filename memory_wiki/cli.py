@@ -13,7 +13,7 @@ from pathlib import Path
 
 def register_cli(subparser):
     """Build the ``hermes memory-wiki`` argparse subcommand tree."""
-    subparser.description = "Wiki-native memory: status, init, review, lint"
+    subparser.description = "Wiki-native memory: status, init, review, dream, lint"
     subs = subparser.add_subparsers(dest="mw_command")
 
     p_init = subs.add_parser(
@@ -53,6 +53,13 @@ def register_cli(subparser):
                           help="Delete promoted/rejected candidate files older than --days")
     p_review.add_argument("--days", type=int, default=30)
 
+    p_dream = subs.add_parser(
+        "dream", help="Plan a conservative curation pass over pending candidates")
+    p_dream.add_argument("--limit", type=int, default=None,
+                         help="Max pending candidates to inspect (default: config dream_limit)")
+    p_dream.add_argument("--apply-safe", action="store_true",
+                         help="Promote only high-confidence profile/agent suggestions")
+
     subs.add_parser("lint", help="Validate pages and candidates, then run the "
                                  "wiki's own _scripts/check.py")
 
@@ -78,9 +85,11 @@ def memory_wiki_command(args):
         return _cmd_status(args)
     if cmd == "review":
         return _cmd_review(args)
+    if cmd == "dream":
+        return _cmd_dream(args)
     if cmd == "lint":
         return _cmd_lint(args)
-    print("usage: hermes memory-wiki {init|status|review|lint}")
+    print("usage: hermes memory-wiki {init|status|review|dream|lint}")
     return 1
 
 
@@ -147,9 +156,69 @@ def _cmd_status(args):
             print(f"  {line}")
     for k in ("auto_capture", "llm_extraction", "embeddings",
               "embedding_model", "journal_episodes", "prefetch_limit",
-              "prompt_block_budget", "candidate_stale_days"):
+              "prompt_block_budget", "candidate_stale_days", "dream_limit"):
         print(f"config {k}: {getattr(cfg, k)}")
     return 0
+
+
+def _cmd_dream(args):
+    from . import dream
+    from .index import WikiIndex
+    cfg = _load_cfg()
+    if not Path(cfg.wiki_root).is_dir():
+        print(f"wiki root does not exist: {cfg.wiki_root}")
+        return 1
+    index = WikiIndex(cfg.wiki_root)
+    index.refresh()
+    result = dream.run(cfg, index, limit=args.limit,
+                       apply_safe=args.apply_safe, actor="cli")
+    print(f"dream: considered {result['considered']} of {result['pending']} "
+          f"pending candidate(s)")
+    if result["summary"]:
+        summary = ", ".join(f"{k} {v}" for k, v in sorted(result["summary"].items()))
+        print(f"summary: {summary}")
+    else:
+        print("summary: no suggestions")
+    for suggestion in result["suggestions"]:
+        _print_dream_suggestion(suggestion)
+    if args.apply_safe:
+        applied = result.get("applied", [])
+        failed = [a for a in applied if not a.get("ok")]
+        print(f"applied safe promotions: {len(applied) - len(failed)}/"
+              f"{len(applied)}")
+        for item in applied:
+            status = item.get("result") if item.get("ok") else f"ERROR {item.get('error')}"
+            print(f"  {item['id']}: {status} -> {item.get('target', '')}")
+        return 1 if failed else 0
+    return 0
+
+
+def _print_dream_suggestion(suggestion):
+    if suggestion.get("ids"):
+        ids = ", ".join(suggestion["ids"])
+        print(f"\n{suggestion['action']}  {ids}")
+        print(f"  {suggestion['reason']}")
+        for item in suggestion.get("excerpts", []):
+            flags = ""
+            if item.get("covered_by"):
+                flags += " [covered]"
+            if item.get("warnings"):
+                flags += " [" + ",".join(item["warnings"]) + "]"
+            if item.get("suggested_target"):
+                flags += f" [-> {item['suggested_target']}]"
+            print(f"  - {item['id']}: {item['excerpt']}{flags}")
+    else:
+        safe = " [safe]" if suggestion.get("safe_apply") else ""
+        print(f"\n{suggestion['id']}  {suggestion['action']}{safe} -> "
+              f"{suggestion.get('target', '')}")
+        print(f"  {suggestion['reason']}")
+        print(f"  {suggestion.get('excerpt', '')}")
+    if suggestion.get("covered_by"):
+        print("  covered by: " + ", ".join(suggestion["covered_by"]))
+    if suggestion.get("suggested_target"):
+        print(f"  suggested target: {suggestion['suggested_target']}")
+    if suggestion.get("command"):
+        print(f"  next: {suggestion['command']}")
 
 
 def _cmd_review(args):

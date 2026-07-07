@@ -46,14 +46,16 @@ hermes memory-wiki init          # add --dry-run to preview
 - `wiki_search(query, corpus, type, limit)`: cited hybrid recall
   (0.7 embedding similarity + 0.3 lexical tf-idf, OpenClaw's split).
 - `wiki_get(ref)`: read a page, a candidate id, or `status` /
-  `review-queue` / `decisions`.
+  `review-queue` / `dream` / `decisions`.
 - `wiki_apply(action, ...)`: `write_profile` and `append_journal` write
   directly (day-to-day memory); `stage` proposes knowledge; `approve`
   (promotes by default; re-approve to promote later), `reject` manage
   the queue;
   `supersede` replaces an outdated promoted memory in place (id = the
   old candidate id from the bullet's marker; profile/journal targets
-  replace immediately, knowledge pages stay review-first).
+  replace immediately, knowledge pages stay review-first). `dream`
+  returns a curation plan and, only with `apply_safe=true`, promotes
+  conservative high-confidence profile/agent bullets.
 
 Per-turn recall is injected automatically (prefetch); the profile pages
 ride in the system prompt. Pending candidates surface in recall with
@@ -93,6 +95,7 @@ hermes memory-wiki init [--wiki-root PATH] [--dry-run]
 hermes memory-wiki status
 hermes memory-wiki review [--list | --approve ID | --reject ID --reason R |
                            --prune --days N]
+hermes memory-wiki dream [--limit N] [--apply-safe]
 hermes memory-wiki lint
 ```
 
@@ -114,7 +117,27 @@ hermes memory-wiki lint
 | `max_candidates_per_turn` | `3` | staging cap per turn |
 | `max_candidates_per_session` | `40` | staging cap per session |
 | `candidate_stale_days` | `30` | pending age after which recall stops surfacing a candidate |
+| `dream_limit` | `50` | max pending candidates inspected by a dream pass |
 | `backup_include_wiki` | `true` | include wiki_root in `hermes backup` |
+
+## Dreaming / curation
+
+`hermes memory-wiki dream` is the conservative consolidation pass. It
+does not write by default. It groups similar pending candidates, flags
+items already covered by existing pages (`reject_covered`) and
+candidates pending longer than `candidate_stale_days` (`reject_stale`),
+suggests better targets, and separates knowledge-page candidates from
+direct profile/agent memories. Corrections that overlap an existing
+memory get `supersede_existing`, never a reject suggestion: token
+overlap cannot tell confirmation from contradiction. The output is a
+review plan with exact follow-up commands where useful.
+
+`--apply-safe` is deliberately narrow: it only promotes pending
+high-confidence `preference` or `note` candidates whose default target
+is `profile/user.md` or `profile/agent.md`, with no
+duplicate/similarity/quality warnings. Corrections, claims, concepts,
+refs, tastes, sources, journal decisions, lower-confidence facts,
+retargets, and consolidation groups remain review-first.
 
 ## Concurrency model
 

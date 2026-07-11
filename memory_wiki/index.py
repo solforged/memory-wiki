@@ -52,6 +52,7 @@ class PageRecord:
     cand_id: str = ""           # candidates only
     content_hash: str = ""      # candidates only (dedup key)
     headings: list = field(default_factory=list)
+    body: str = ""              # full canonical, comment-stripped body
     body_head: str = ""         # first lines, comments stripped
     tokens: Counter = field(default_factory=Counter)
     title_tokens: frozenset = frozenset()
@@ -116,7 +117,9 @@ class WikiIndex:
             return None
         fm, body = wikifs.parse_frontmatter(text)
         fm = fm or {}
-        body = _COMMENT.sub("", body)[:_BODY_CAP]
+        body = _COMMENT.sub("", body)
+        indexed_body = body[:_BODY_CAP]
+        canonical_body = " ".join(body.split())
         is_candidate = rel.startswith(schema.INBOX_DIR + "/")
         ntype = "candidate" if is_candidate else str(fm.get("type") or "")
         title = str(fm.get("title") or path.stem)
@@ -125,7 +128,8 @@ class WikiIndex:
         aliases = [str(a) for a in fm.get("aliases", []) if a] \
             if isinstance(fm.get("aliases"), list) else []
         headings = [h.strip("# ").strip()
-                    for h in re.findall(r"^#{2,4} .+$", body, re.MULTILINE)]
+                    for h in re.findall(
+                        r"^#{2,4} .+$", indexed_body, re.MULTILINE)]
         rec = PageRecord(
             rel=rel, ntype=ntype, title=title, topics=topics, aliases=aliases,
             created=str(fm.get("created") or ""),
@@ -135,12 +139,13 @@ class WikiIndex:
             kind=str(fm.get("kind") or ""),
             cand_id=str(fm.get("id") or "") if is_candidate else "",
             headings=headings,
-            body_head=" ".join(body.split())[:400],
+            body=canonical_body,
+            body_head=" ".join(indexed_body.split())[:400],
             mtime_ns=st.st_mtime_ns, size=st.st_size,
         )
         rec.tokens = Counter(
             tokenize(title) + tokenize(" ".join(topics + aliases + headings))
-            + tokenize(body))
+            + tokenize(indexed_body))
         rec.title_tokens = frozenset(tokenize(title))
         rec.topic_tokens = frozenset(tokenize(" ".join(topics)))
         rec.alias_tokens = frozenset(tokenize(" ".join(aliases)))

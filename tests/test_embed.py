@@ -57,7 +57,7 @@ def wait_synced(ei, idx):
     def done():
         recs = [r for r in idx.records("all") if record_text(r)]
         with ei._lock:
-            return all(record_key(record_text(r)) in ei._vecs for r in recs)
+            return all(record_key(r) in ei._vecs for r in recs)
     wait_for(lambda: ei.ready or ei.failed, what="worker start")
     assert not ei.failed
     wait_for(done, what="vector sync")
@@ -124,6 +124,63 @@ def test_cache_survives_restart_and_model_change(fake_fastembed, car_wiki,
     wait_synced(ei3, idx)
     assert sum(len(b) for b in EMBED_BATCHES) == first_run  # full re-embed
     ei3.shutdown()
+
+
+def test_deep_body_edit_reembeds_full_content(fake_fastembed, fixture_wiki,
+                                               make_page, tmp_path):
+    rel = "concepts/deep-content.md"
+    filler = " ".join(f"padding{i}" for i in range(80))
+    make_page(fixture_wiki, rel, "concept", "Deep content",
+              body=f"{filler}\n" + "automobile " * 30)
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    before = idx.pages[rel]
+    assert "automobile" not in before.body_head
+    old_key = record_key(before)
+
+    ei = EmbedIndex(idx, cache_path=tmp_path / "emb.db")
+    ei.start()
+    wait_synced(ei, idx)
+    EMBED_BATCHES.clear()
+
+    make_page(fixture_wiki, rel, "concept", "Deep content",
+              body=f"{filler}\n" + "bicycle " * 30)
+    idx.refresh()
+    after = idx.pages[rel]
+    new_key = record_key(after)
+    assert new_key != old_key
+    assert "bicycle" not in after.body_head
+    ei.request_sync()
+
+    def replaced():
+        with ei._lock:
+            return new_key in ei._vecs and old_key not in ei._vecs
+
+    wait_for(replaced, what="deep-content re-embed")
+    assert any(record_text(after) in batch for batch in EMBED_BATCHES)
+    assert rel in ei.scores("bicycle", [after])
+    ei.shutdown()
+
+
+def test_identical_content_at_different_paths_has_distinct_records(
+        fake_fastembed, fixture_wiki, make_page, tmp_path):
+    rels = ("concepts/shared-a.md", "concepts/shared-b.md")
+    for rel in rels:
+        make_page(fixture_wiki, rel, "concept", "Shared knowledge",
+                  body="car " * 20)
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    records = [idx.pages[rel] for rel in rels]
+    assert record_text(records[0]) == record_text(records[1])
+    assert record_key(records[0]) != record_key(records[1])
+
+    ei = EmbedIndex(idx, cache_path=tmp_path / "emb.db")
+    ei.start()
+    wait_synced(ei, idx)
+    assert set(ei.scores("automobile", records)) == set(rels)
+    with ei._lock:
+        assert all(record_key(rec) in ei._vecs for rec in records)
+    ei.shutdown()
 
 
 def test_provider_respects_embeddings_flag(fixture_wiki, tmp_path):

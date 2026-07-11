@@ -212,6 +212,24 @@ def test_approve_with_content_override(ready):
     assert r["ok"]
     assert "Prefers evening deploys." in read(cfg, "profile/user.md")
     assert "roughly like this" not in read(cfg, "profile/user.md")
+    _, fm, _, _ = candidates.load(cfg, cid)
+    assert fm["hash"] == candidates.content_hash("Prefers evening deploys.")
+    assert candidates.stage(
+        cfg, None, "user said something roughly like this")["staged"]
+
+
+def test_approval_override_cannot_duplicate_an_active_hash(ready):
+    cfg, idx = ready
+    first = stage(cfg, idx, "First distinct pending candidate.")
+    second = stage(cfg, idx, "Second distinct pending candidate.")
+    result = promote.approve(
+        cfg, idx, second, overrides={
+            "content": "First distinct pending candidate."},
+        and_promote=False)
+    assert not result["ok"] and first in result["error"]
+    _, fm, content, _ = candidates.load(cfg, second)
+    assert fm["status"] == "pending"
+    assert content == "Second distinct pending candidate."
 
 
 def test_supersede_profile_bullet(ready):
@@ -229,7 +247,9 @@ def test_supersede_profile_bullet(ready):
     assert schema.candidate_marker(cid) not in text
     assert schema.validate_page("profile/user.md", text) == []
     _, old_fm, _, _ = candidates.load(cfg, cid)
-    assert old_fm["status"] == "superseded" and new_id in old_fm["reviewed"]
+    assert old_fm["status"] == "superseded"
+    assert old_fm["superseded_by"] == new_id
+    assert new_id in old_fm["reviewed"]
     _, new_fm, _, _ = candidates.load(cfg, new_id)
     assert new_fm["status"] == "promoted" and new_fm["supersedes"] == cid
     lines = [json.loads(l) for l in
@@ -280,6 +300,46 @@ def test_superseded_candidate_cannot_be_reapproved(ready):
     assert not back["ok"] and "superseded" in back["error"]
     text = read(cfg, "profile/user.md")
     assert "Deploys on Thursdays." not in text
+    assert not promote.promote(cfg, idx, cid)["ok"]
+    assert not promote.reject(cfg, cid)["ok"]
+
+
+def test_reject_is_terminal_safe_and_idempotent(ready):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "A repeat rejection keeps its first decision.")
+    first = promote.reject(cfg, cid, reason="first reason")
+    second = promote.reject(cfg, cid, reason="different reason")
+    assert first["ok"] and second["ok"]
+    _, fm, _, _ = candidates.load(cfg, cid)
+    assert "first reason" in fm["reviewed"]
+    assert "different reason" not in fm["reviewed"]
+
+    promoted = stage(cfg, idx, "Promoted content cannot be rejected.",
+                     kind="preference")
+    assert promote.approve(cfg, idx, promoted)["ok"]
+    assert not promote.reject(cfg, promoted)["ok"]
+
+
+def test_only_one_replacement_can_claim_a_promoted_candidate(ready):
+    cfg, idx = ready
+    old_id = stage(cfg, idx, "Original claimed preference.",
+                   kind="preference")
+    assert promote.approve(cfg, idx, old_id)["ok"]
+    _, old_fm, _, _ = candidates.load(cfg, old_id)
+    target = old_fm["promoted_to"]
+    first = candidates.stage(
+        cfg, None, "First replacement wins.", kind="preference",
+        target=target, section=old_fm["section"], supersedes=old_id)
+    second = candidates.stage(
+        cfg, None, "Second replacement loses.", kind="preference",
+        target=target, section=old_fm["section"], supersedes=old_id)
+    assert first["staged"] and second["staged"]
+    assert promote.promote(cfg, idx, first["id"])["ok"]
+    loser = promote.promote(cfg, idx, second["id"])
+    assert not loser["ok"] and "already claimed" in loser["error"]
+    page = read(cfg, target)
+    assert "First replacement wins." in page
+    assert "Second replacement loses." not in page
 
 
 def test_supersede_appends_when_marker_hand_deleted(ready):
@@ -295,6 +355,56 @@ def test_supersede_appends_when_marker_hand_deleted(ready):
     r = promote.supersede(cfg, idx, cid, "Replacement preference.")
     assert r["ok"] and r["result"] == "promoted"  # appended, not replaced
     assert "Replacement preference." in read(cfg, "profile/user.md")
+
+
+def test_recovery_uses_page_marker_for_promotion_and_supersession(ready):
+    cfg, idx = ready
+    old_id = stage(cfg, idx, "Deploys on Tuesdays.", kind="preference")
+    assert promote.approve(cfg, idx, old_id)["ok"]
+    idx.refresh()
+    replaced = promote.supersede(
+        cfg, idx, old_id, "Deploys on Mondays now.")
+    assert replaced["ok"]
+    new_id = replaced["id"]
+
+    with wikifs.wiki_lock(cfg.wiki_root):
+        old_path, old_fm, old_content, old_evidence = candidates.load(
+            cfg, old_id)
+        candidates.set_status_unlocked(
+            cfg, old_path, old_fm, old_content, old_evidence, "promoted",
+            reviewed_note=f"{wikifs.today()} approved",
+            promoted_to=old_fm["promoted_to"])
+        new_path, new_fm, new_content, new_evidence = candidates.load(
+            cfg, new_id)
+        candidates.set_status_unlocked(
+            cfg, new_path, new_fm, new_content, new_evidence, "approved",
+            reviewed_note=f"{wikifs.today()} approved",
+            overrides={"promoted_to": ""})
+
+    audit = Path(cfg.wiki_root) / schema.DECISIONS_FILE
+    entries = [json.loads(line) for line in audit.read_text().splitlines()]
+    entries = [
+        entry for entry in entries
+        if not ((entry["action"], entry["id"])
+                in {("promoted", new_id), ("superseded", old_id)})
+    ]
+    audit.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    report = candidates.recover(cfg)
+    assert report["ambiguous"] == []
+    _, repaired_new, _, _ = candidates.load(cfg, new_id)
+    _, repaired_old, _, _ = candidates.load(cfg, old_id)
+    assert repaired_new["status"] == "promoted"
+    assert repaired_new["promoted_to"] == "profile/user.md"
+    assert repaired_old["status"] == "superseded"
+    assert new_id in repaired_old["reviewed"]
+    repaired_entries = [
+        json.loads(line) for line in audit.read_text().splitlines()]
+    assert sum(e["action"] == "promoted" and e["id"] == new_id
+               for e in repaired_entries) == 1
+    assert sum(e["action"] == "superseded" and e["id"] == old_id
+               for e in repaired_entries) == 1
+    assert candidates.recover(cfg) == {"repaired": [], "ambiguous": []}
 
 
 def test_decisions_journal_records_lifecycle(ready):

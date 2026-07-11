@@ -37,6 +37,14 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
             return {"ok": False, "error": f"no candidate {cand_id}"}
         path, fm, content, evidence = loaded
         if fm.get("status") == "promoted":
+            candidates.record_unlocked(
+                cfg, "approved", cand_id=cand_id,
+                target=fm.get("target", ""), session=session_id,
+                actor=actor, chash=fm.get("hash", ""))
+            candidates.record_unlocked(
+                cfg, "promoted", cand_id=cand_id,
+                target=fm.get("promoted_to", ""), session=session_id,
+                actor=actor, chash=fm.get("hash", ""))
             return {"ok": True, "result": "already_promoted",
                     "target": fm.get("promoted_to", "")}
         if fm.get("status") == "rejected":
@@ -45,9 +53,19 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
             return {"ok": False, "error":
                     f"{cand_id} was superseded ({fm.get('reviewed', '')}); "
                     "approving it would re-append stale content"}
-        content = overrides.pop("content", "").strip() or content
+        content_override = str(overrides.pop("content", "") or "").strip()
+        if content_override:
+            content = content_override
         fm_overrides = {k: v for k, v in overrides.items()
                         if k in ("target", "section", "confidence", "topics")}
+        if content_override:
+            fm_overrides["hash"] = candidates.content_hash(content)
+            duplicate_id = candidates._active_hash_duplicate_unlocked(
+                Path(cfg.wiki_root) / schema.INBOX_DIR,
+                fm_overrides["hash"], exclude_id=cand_id)
+            if duplicate_id:
+                return {"ok": False, "error":
+                        f"content duplicates active candidate {duplicate_id}"}
         if "fields" in overrides:
             fm_overrides["fields"] = {
                 k: v for k, v in (overrides["fields"] or {}).items()
@@ -56,9 +74,10 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
             cfg, path, fm, content, evidence, "approved",
             reviewed_note=f"{wikifs.today()} approved",
             overrides=fm_overrides)
-    candidates.record(cfg, "approved", cand_id=cand_id,
-                      target=fm.get("target", ""), session=session_id,
-                      actor=actor, chash=fm.get("hash", ""))
+        candidates.record_unlocked(
+            cfg, "approved", cand_id=cand_id,
+            target=fm.get("target", ""), session=session_id,
+            actor=actor, chash=fm.get("hash", ""))
     if not and_promote:
         return {"ok": True, "result": "approved", "id": cand_id}
     return promote(cfg, index, cand_id, actor=actor, session_id=session_id)
@@ -118,11 +137,24 @@ def reject(cfg, cand_id, reason="", actor="tool", session_id=""):
         if loaded is None:
             return {"ok": False, "error": f"no candidate {cand_id}"}
         path, fm, content, evidence = loaded
+        status = str(fm.get("status") or "")
+        if status == "rejected":
+            candidates.record_unlocked(
+                cfg, "rejected", cand_id=cand_id, actor=actor,
+                session=session_id, chash=fm.get("hash", ""),
+                detail={"reason": reason})
+            return {"ok": True, "result": "rejected", "id": cand_id}
+        if status in ("promoted", "superseded"):
+            return {"ok": False, "error":
+                    f"{cand_id} is {status} and cannot be rejected"}
         note = f"{wikifs.today()} rejected" + (f": {reason}" if reason else "")
-        candidates.set_status_unlocked(cfg, path, fm, content, evidence,
-                                       "rejected", reviewed_note=note)
-    candidates.record(cfg, "rejected", cand_id=cand_id, actor=actor,
-                      session=session_id, detail={"reason": reason})
+        fm = candidates.set_status_unlocked(
+            cfg, path, fm, content, evidence, "rejected",
+            reviewed_note=note)
+        candidates.record_unlocked(
+            cfg, "rejected", cand_id=cand_id, actor=actor,
+            session=session_id, chash=fm.get("hash", ""),
+            detail={"reason": reason})
     return {"ok": True, "result": "rejected", "id": cand_id}
 
 
@@ -136,10 +168,24 @@ def promote(cfg, index, cand_id, actor="tool", session_id=""):
         path, fm, content, evidence = loaded
         status = fm.get("status", "")
         if status == "promoted":
+            candidates.record_unlocked(
+                cfg, "promoted", cand_id=cand_id,
+                target=fm.get("promoted_to", ""), session=session_id,
+                actor=actor, chash=fm.get("hash", ""))
             return {"ok": True, "result": "already_promoted",
                     "target": fm.get("promoted_to", "")}
         if status == "rejected":
             return {"ok": False, "error": f"{cand_id} was rejected"}
+        if status == "superseded":
+            return {"ok": False, "error": f"{cand_id} was superseded"}
+        old_id = str(fm.get("supersedes") or "")
+        if old_id:
+            old = candidates.load(cfg, old_id)
+            old_status = str(old[1].get("status") or "") if old else "missing"
+            if old_status != "promoted":
+                return {"ok": False, "error":
+                        f"{old_id} is {old_status}; replacement already "
+                        "claimed or no longer promotable"}
         route = _resolve(cfg, fm, content)
         if "error" in route:
             return {"ok": False, "error": route["error"]}
@@ -153,17 +199,24 @@ def promote(cfg, index, cand_id, actor="tool", session_id=""):
             return {"ok": False, "error": str(e)}
         if not result.get("ok"):
             return result
-        candidates.set_status_unlocked(
+        fm = candidates.set_status_unlocked(
             cfg, path, fm, content, evidence, "promoted",
             reviewed_note=fm.get("reviewed") or f"{wikifs.today()} approved",
             promoted_to=result["target"])
         _retire_superseded(cfg, fm.get("supersedes", ""), cand_id,
                            actor=actor, session_id=session_id)
-    candidates.record(cfg, "promoted", cand_id=cand_id,
-                      target=result["target"], session=session_id,
-                      actor=actor, chash=fm.get("hash", ""),
-                      detail={"kind": fm.get("kind", ""),
-                              "result": result.get("result", "promoted")})
+        if status == "pending":
+            candidates.record_unlocked(
+                cfg, "approved", cand_id=cand_id,
+                target=fm.get("target", ""), session=session_id,
+                actor=actor, chash=fm.get("hash", ""),
+                detail={"implicit": True})
+        candidates.record_unlocked(
+            cfg, "promoted", cand_id=cand_id,
+            target=result["target"], session=session_id,
+            actor=actor, chash=fm.get("hash", ""),
+            detail={"kind": fm.get("kind", ""),
+                    "result": result.get("result", "promoted")})
     if index is not None:
         try:
             index.refresh()
@@ -293,12 +346,17 @@ def _retire_superseded(cfg, old_id, new_id, actor="tool", session_id=""):
         return
     path, fm, content, evidence = loaded
     if fm.get("status") == "superseded":
-        return
+        if fm.get("superseded_by") == new_id:
+            return
+        raise ValueError(f"{old_id} was superseded by another candidate")
     candidates.set_status_unlocked(
         cfg, path, fm, content, evidence, "superseded",
-        reviewed_note=f"{wikifs.today()} superseded by {new_id}")
-    candidates.record(cfg, "superseded", cand_id=old_id, actor=actor,
-                      session=session_id, detail={"superseded_by": new_id})
+        reviewed_note=f"{wikifs.today()} superseded by {new_id}",
+        overrides={"superseded_by": new_id})
+    candidates.record_unlocked(
+        cfg, "superseded", cand_id=old_id, actor=actor,
+        session=session_id, chash=fm.get("hash", ""),
+        detail={"superseded_by": new_id})
 
 
 def _append_to_page(cfg, rel, section, entry):

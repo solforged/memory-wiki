@@ -61,6 +61,12 @@ def ensure_runtime(cfg, created=None):
             fm, body = schema.profile_seed(fname, created)
             wikifs.atomic_write(p, wikifs.render_page(fm, body))
             made.append(f"profile/{fname}")
+    # Writable initialization is the recovery boundary. Import locally to
+    # keep the scaffold/candidate dependency acyclic at module load time.
+    from . import candidates
+    recovery = candidates.recover(cfg)
+    for issue in recovery["ambiguous"]:
+        logger.warning("memory-wiki recovery: %s", issue)
     if made:
         logger.info("memory-wiki: created %s", ", ".join(made))
     return made

@@ -165,15 +165,29 @@ def create_exclusive(path, text):
 
 
 def append_jsonl(path, obj):
-    """Append one JSON object as a line with a single O_APPEND write."""
+    """Append one JSON object durably before returning."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+    created = not path.exists()
+    data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            + "\n").encode("utf-8")
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
     try:
-        os.write(fd, line.encode("utf-8"))
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write appending JSONL")
+            view = view[written:]
+        os.fsync(fd)
     finally:
         os.close(fd)
+    if created:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 @contextmanager

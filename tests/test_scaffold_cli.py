@@ -43,6 +43,24 @@ def test_init_dry_run_changes_nothing(cfg):
     assert not (root / schema.INBOX_DIR).exists()
 
 
+def test_writable_runtime_recovers_but_dry_run_does_not(cfg):
+    import json
+
+    from memory_wiki import candidates
+
+    scaffold.ensure_runtime(cfg)
+    staged = candidates.stage(
+        cfg, None, "Runtime initialization repairs lifecycle state.")
+    audit = Path(cfg.wiki_root) / schema.DECISIONS_FILE
+    audit.write_text("")
+    scaffold.init_wiki(cfg, dry_run=True)
+    assert audit.read_text() == ""
+    assert scaffold.ensure_runtime(cfg) == []
+    entries = [json.loads(line) for line in audit.read_text().splitlines()]
+    assert [(e["action"], e["id"]) for e in entries] == [
+        ("staged", staged["id"])]
+
+
 def test_init_anchor_missing_leaves_file_alone(cfg):
     root = Path(cfg.wiki_root)
     check = root / "_scripts" / "check.py"

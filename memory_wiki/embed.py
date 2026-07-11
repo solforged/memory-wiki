@@ -41,13 +41,15 @@ def default_cache_path(wiki_root):
 
 
 def record_text(rec):
-    """The text embedded for one index record (title + topics + head)."""
+    """Canonical text embedded for one record, without body truncation."""
     return " | ".join(x for x in (
-        rec.title, " ".join(rec.topics), rec.body_head) if x)
+        rec.title, " ".join(rec.topics), rec.body) if x)
 
 
-def record_key(text):
-    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:20]
+def record_key(rec):
+    """Content-address one record without collapsing distinct paths."""
+    payload = f"{rec.rel}\0{record_text(rec)}"
+    return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:20]
 
 
 def _pack(vec):
@@ -120,7 +122,7 @@ class EmbedIndex:
             vecs = dict(self._vecs)
         out = {}
         for rec in records:
-            v = vecs.get(record_key(record_text(rec)))
+            v = vecs.get(record_key(rec))
             if v is None or len(v) != len(qvec):
                 continue
             sim = sum(a * b for a, b in zip(qvec, v))
@@ -179,7 +181,7 @@ class EmbedIndex:
         for rec in self.wiki_index.records("all"):
             text = record_text(rec)
             if text:
-                wanted[record_key(text)] = (rec.rel, text)
+                wanted[record_key(rec)] = (rec.rel, text)
         with self._lock:
             missing = [k for k in wanted if k not in self._vecs]
             gone = [k for k in self._vecs if k not in wanted]

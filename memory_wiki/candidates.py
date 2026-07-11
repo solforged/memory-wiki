@@ -1,14 +1,11 @@
-"""Candidate lifecycle: one markdown file per staged memory in _inbox/.
-
-Filenames are <UTCstamp>-<session8>-<seq>-<slug>.md, created O_EXCL so
-concurrent sessions never contend. decisions.jsonl is the append-only
-audit trail (O_APPEND single-write; no lock needed).
-"""
+"""Candidate lifecycle over Markdown files and one durable JSONL audit."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -21,6 +18,11 @@ logger = logging.getLogger(__name__)
 _HEX = re.compile(r"[^0-9a-f]")
 _DEDUP_OVERLAP = 0.8
 _MAX_CONTENT = 50_000
+_ACTIVE_HASH_STATUSES = frozenset(("pending", "approved", "promoted"))
+_FINAL_BULLET_MARKER = re.compile(
+    r"<!-- memory-wiki: ([^\s>]+) -->\s*$")
+_PROMOTED_MARKER = re.compile(
+    r"<!-- memory-wiki: promoted ([^\s>]+) -->")
 
 
 def content_hash(text):
@@ -35,11 +37,81 @@ def session8(session_id):
 
 def record(cfg, action, cand_id="", target="", session="", actor="",
            chash="", detail=None):
-    """One audit line in _inbox/decisions.jsonl."""
+    """Durably record one event, taking the wiki lock.
+
+    Candidate lifecycle events are once-only by ``(action, id)``. Events
+    without an id are direct-write audit entries and remain repeatable.
+    """
+    with wikifs.wiki_lock(cfg.wiki_root):
+        return record_unlocked(
+            cfg, action, cand_id=cand_id, target=target, session=session,
+            actor=actor, chash=chash, detail=detail)
+
+
+def record_unlocked(cfg, action, cand_id="", target="", session="", actor="",
+                    chash="", detail=None):
+    """Lock-required audit writer; return True only when appended."""
+    entries, _issues = _read_decisions_unlocked(cfg, repair_tail=True)
+    if cand_id and any(
+            e.get("action") == action and e.get("id") == cand_id
+            for e in entries):
+        return False
     wikifs.append_jsonl(Path(cfg.wiki_root) / schema.DECISIONS_FILE, {
         "ts": wikifs.utc_iso(), "action": action, "id": cand_id,
         "target": target, "session": session, "actor": actor,
         "hash": chash, "detail": detail or {}})
+    return True
+
+
+def _read_decisions_unlocked(cfg, repair_tail=False):
+    """Read valid audit objects and optionally repair an unterminated tail."""
+    path = Path(cfg.wiki_root) / schema.DECISIONS_FILE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return [], []
+    entries, issues = [], []
+    lines = raw.splitlines(keepends=True)
+    offset = 0
+    for line_no, line in enumerate(lines, 1):
+        line_start = offset
+        offset += len(line)
+        terminated = line.endswith(b"\n")
+        payload = line.rstrip(b"\r\n")
+        try:
+            entry = json.loads(payload.decode("utf-8"))
+            if not isinstance(entry, dict):
+                raise ValueError("audit entry is not an object")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            if repair_tail and line_no == len(lines) and not terminated:
+                _truncate_fsync(path, line_start)
+                issues.append(f"discarded torn audit tail at line {line_no}")
+                break
+            issues.append(f"invalid audit line {line_no}")
+        else:
+            entries.append(entry)
+            if repair_tail and not terminated:
+                _append_newline_fsync(path)
+    return entries, issues
+
+
+def _truncate_fsync(path, size):
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.ftruncate(fd, size)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_newline_fsync(path):
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        if os.write(fd, b"\n") != 1:
+            raise OSError("short write terminating JSONL")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 # -- staging ------------------------------------------------------------------
@@ -107,22 +179,55 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
     stamp, s8 = wikifs.utc_stamp(), session8(session_id)
     slug = wikifs.slugify(_slug_source(content), max_len=40)
     inbox = Path(cfg.wiki_root) / schema.INBOX_DIR
-    for seq in range(1, 100):
-        cand_id = f"{stamp}-{s8}-{seq:02d}"
-        if any(inbox.glob(f"{cand_id}-*.md")):
-            continue  # id taken by a different-slug candidate this second
-        fm["id"] = cand_id
-        path = inbox / f"{cand_id}-{slug}.md"
-        if wikifs.create_exclusive(path, wikifs.render_page(fm, body)):
-            if index is not None:
-                index.candidate_hashes.add(chash)
-            record(cfg, "staged", cand_id=cand_id, target=target,
-                   session=session_id, actor=actor, chash=chash,
-                   detail={"kind": kind, "origin": origin,
-                           "confidence": confidence})
-            return {"staged": True, "id": cand_id,
-                    "ref": f"{schema.INBOX_DIR}/{path.name}"}
-    return {"staged": False, "reason": "could not allocate candidate id"}
+    result = None
+    with wikifs.wiki_lock(cfg.wiki_root):
+        entries, _issues = _read_decisions_unlocked(
+            cfg, repair_tail=True)
+        allocated_ids = {str(e.get("id") or "") for e in entries
+                         if e.get("id")}
+        duplicate_id = _active_hash_duplicate_unlocked(inbox, chash)
+        if duplicate_id:
+            return {"staged": False,
+                    "reason": "duplicate of an existing candidate",
+                    "hash": chash}
+        for seq in range(1, 100):
+            cand_id = f"{stamp}-{s8}-{seq:02d}"
+            if cand_id in allocated_ids \
+                    or any(inbox.glob(f"{cand_id}-*.md")):
+                continue
+            fm["id"] = cand_id
+            path = inbox / f"{cand_id}-{slug}.md"
+            if not wikifs.create_exclusive(
+                    path, wikifs.render_page(fm, body)):
+                continue
+            record_unlocked(
+                cfg, "staged", cand_id=cand_id, target=target,
+                session=session_id, actor=actor, chash=chash,
+                detail={"kind": kind, "origin": origin,
+                        "confidence": confidence})
+            result = {"staged": True, "id": cand_id,
+                      "ref": f"{schema.INBOX_DIR}/{path.name}"}
+            break
+    if result is None:
+        return {"staged": False, "reason": "could not allocate candidate id"}
+    if index is not None:
+        try:
+            index.refresh()
+        except OSError:
+            pass
+    return result
+
+
+def _active_hash_duplicate_unlocked(inbox, chash, exclude_id=""):
+    """Other active candidate id with this hash; lock required."""
+    for path in sorted(inbox.glob("*.md")):
+        text = wikifs.read_text(path)
+        fm, _body = wikifs.parse_frontmatter(text or "")
+        cand_id = str((fm or {}).get("id") or "")
+        if fm and cand_id != exclude_id and fm.get("hash") == chash \
+                and fm.get("status") in _ACTIVE_HASH_STATUSES:
+            return cand_id or path.name
+    return ""
 
 
 def page_shaped(content):
@@ -175,11 +280,13 @@ def split_evidence(body):
 
 
 def duplicate_reason(index, chash, content):
-    """Non-empty string if this content is already staged or known."""
+    """Advisory semantic/profile duplicate reason.
+
+    Candidate hashes are deliberately excluded: their statuses are checked
+    authoritatively from disk while holding the wiki lock.
+    """
     if index is None:
         return ""
-    if chash in index.candidate_hashes:
-        return "duplicate of an existing candidate"
     ctokens = set(tokenize(content))
     if not ctokens:
         return "no content tokens"
@@ -283,8 +390,255 @@ def prune(cfg, days=30):
             fm, _ = wikifs.parse_frontmatter(wikifs.read_text(path) or "")
             if not fm or fm.get("status") not in ("promoted", "rejected"):
                 continue
+            rel = f"{schema.INBOX_DIR}/{path.name}"
+            record_unlocked(
+                cfg, "pruned", cand_id=fm.get("id", ""), actor="cli",
+                detail={"status": fm.get("status", ""), "ref": rel})
             path.unlink()
-            removed.append(f"{schema.INBOX_DIR}/{path.name}")
-            record(cfg, "pruned", cand_id=fm.get("id", ""), actor="cli",
-                   detail={"status": fm.get("status", "")})
+            removed.append(rel)
     return removed
+
+
+# -- crash recovery -----------------------------------------------------------
+
+def recover(cfg):
+    """Converge candidate files, page markers, and lifecycle audit records.
+
+    Page markers are the commit evidence for promotion. Conflicting or
+    missing evidence is reported in ``ambiguous`` and never guessed.
+    """
+    report = {"repaired": [], "ambiguous": []}
+    with wikifs.wiki_lock(cfg.wiki_root):
+        entries, audit_issues = _read_decisions_unlocked(
+            cfg, repair_tail=True)
+        for issue in audit_issues:
+            bucket = "repaired" if issue.startswith("discarded torn") \
+                else "ambiguous"
+            report[bucket].append(issue)
+        items = _candidate_items_unlocked(cfg, report)
+        _finish_prunes_unlocked(entries, items, report)
+        marker_targets = _marker_targets_unlocked(cfg)
+        proven = _repair_promotions_unlocked(
+            cfg, items, marker_targets, report)
+        superseded_by = _repair_superseded_unlocked(
+            cfg, items, proven, report)
+        _report_unproven_promotions(items, proven, report)
+        if not any(i.startswith("invalid audit line")
+                   for i in audit_issues):
+            _repair_audit_unlocked(cfg, items, superseded_by, report)
+    return report
+
+
+def _candidate_items_unlocked(cfg, report):
+    items, duplicates = {}, set()
+    inbox = Path(cfg.wiki_root) / schema.INBOX_DIR
+    for path in sorted(inbox.glob("*.md")):
+        text = wikifs.read_text(path)
+        fm, body = wikifs.parse_frontmatter(text or "")
+        cand_id = str((fm or {}).get("id") or "")
+        if not fm or not cand_id:
+            report["ambiguous"].append(
+                f"unreadable candidate {schema.INBOX_DIR}/{path.name}")
+            continue
+        if cand_id in duplicates:
+            continue
+        if cand_id in items:
+            report["ambiguous"].append(
+                f"multiple candidate files for {cand_id}")
+            duplicates.add(cand_id)
+            del items[cand_id]
+            continue
+        content, evidence = split_evidence(body)
+        items[cand_id] = [path, fm, content, evidence]
+    return items
+
+
+def _finish_prunes_unlocked(entries, items, report):
+    intents = {str(e.get("id") or ""): e for e in entries
+               if e.get("action") == "pruned" and e.get("id")}
+    for cand_id, event in sorted(intents.items()):
+        item = items.get(cand_id)
+        if item is None:
+            continue
+        path, fm, _content, _evidence = item
+        status = str(fm.get("status") or "")
+        intended = str((event.get("detail") or {}).get("status") or "")
+        if status not in ("promoted", "rejected") \
+                or (intended and intended != status):
+            report["ambiguous"].append(
+                f"prune intent for {cand_id} conflicts with status {status}")
+            continue
+        path.unlink()
+        del items[cand_id]
+        report["repaired"].append(f"completed prune {cand_id}")
+
+
+def _marker_targets_unlocked(cfg):
+    root = Path(cfg.wiki_root)
+    targets = {}
+    for directory in schema.DIR_TYPE:
+        page_dir = root / directory
+        if not page_dir.is_dir():
+            continue
+        for path in sorted(page_dir.glob("*.md")):
+            text = wikifs.read_text(path) or ""
+            rel = f"{directory}/{path.name}"
+            lines = text.splitlines()
+            for line in lines:
+                if not line.startswith("- "):
+                    continue
+                match = _FINAL_BULLET_MARKER.search(line)
+                if match:
+                    targets.setdefault(match.group(1), []).append(rel)
+            promoted = [
+                match for line in lines
+                if (match := _PROMOTED_MARKER.fullmatch(line.strip()))
+            ]
+            if promoted:
+                targets.setdefault(
+                    promoted[-1].group(1), []).append(rel)
+    return targets
+
+
+def _repair_promotions_unlocked(cfg, items, marker_targets, report):
+    proven = {}
+    for cand_id, item in sorted(items.items()):
+        path, fm, content, evidence = item
+        targets = marker_targets.get(cand_id, [])
+        status = str(fm.get("status") or "")
+        if len(targets) > 1:
+            report["ambiguous"].append(
+                f"candidate {cand_id} has {len(targets)} page markers")
+            continue
+        if not targets:
+            continue
+        target = targets[0]
+        if status in ("pending", "approved"):
+            new_fm = set_status_unlocked(
+                cfg, path, fm, content, evidence, "promoted",
+                reviewed_note=fm.get("reviewed")
+                or f"{wikifs.today()} approved",
+                promoted_to=target)
+            item[1] = new_fm
+            proven[cand_id] = target
+            report["repaired"].append(
+                f"marked {cand_id} promoted to {target}")
+        elif status == "promoted":
+            current = str(fm.get("promoted_to") or "")
+            if current and current != target:
+                report["ambiguous"].append(
+                    f"candidate {cand_id} says {current} but marker is {target}")
+                continue
+            if not current:
+                new_fm = set_status_unlocked(
+                    cfg, path, fm, content, evidence, "promoted",
+                    reviewed_note=fm.get("reviewed") or "",
+                    promoted_to=target)
+                item[1] = new_fm
+                report["repaired"].append(
+                    f"restored promoted target for {cand_id}")
+            proven[cand_id] = target
+        else:
+            report["ambiguous"].append(
+                f"page marker for {cand_id} conflicts with status {status}")
+    return proven
+
+
+def _repair_superseded_unlocked(cfg, items, proven, report):
+    relations = {}
+    for new_id, target in proven.items():
+        old_id = str(items[new_id][1].get("supersedes") or "")
+        if old_id:
+            relations.setdefault(old_id, []).append((new_id, target))
+    resolved = {}
+    for old_id, replacements in sorted(relations.items()):
+        if len(replacements) != 1:
+            report["ambiguous"].append(
+                f"candidate {old_id} has multiple promoted replacements")
+            continue
+        item = items.get(old_id)
+        if item is None:
+            report["ambiguous"].append(
+                f"replacement relation references missing {old_id}")
+            continue
+        new_id, _target = replacements[0]
+        path, fm, content, evidence = item
+        status = str(fm.get("status") or "")
+        relation = str(fm.get("superseded_by") or "")
+        if status == "promoted":
+            new_fm = set_status_unlocked(
+                cfg, path, fm, content, evidence, "superseded",
+                reviewed_note=f"{wikifs.today()} superseded by {new_id}",
+                overrides={"superseded_by": new_id})
+            item[1] = new_fm
+            report["repaired"].append(
+                f"marked {old_id} superseded by {new_id}")
+        elif status == "superseded":
+            if relation and relation != new_id:
+                report["ambiguous"].append(
+                    f"candidate {old_id} has a conflicting superseded relation")
+                continue
+            if not relation:
+                new_fm = set_status_unlocked(
+                    cfg, path, fm, content, evidence, "superseded",
+                    reviewed_note=fm.get("reviewed") or
+                    f"{wikifs.today()} superseded by {new_id}",
+                    overrides={"superseded_by": new_id})
+                item[1] = new_fm
+                report["repaired"].append(
+                    f"restored superseded relation for {old_id}")
+        else:
+            report["ambiguous"].append(
+                f"replacement for {old_id} conflicts with status {status}")
+            continue
+        resolved[old_id] = new_id
+    return resolved
+
+
+def _report_unproven_promotions(items, proven, report):
+    for cand_id, (_path, fm, _content, _evidence) in sorted(items.items()):
+        if fm.get("status") == "promoted" and cand_id not in proven:
+            report["ambiguous"].append(
+                f"promoted candidate {cand_id} has no unambiguous page marker")
+
+
+def _repair_audit_unlocked(cfg, items, superseded_by, report):
+    entries, _issues = _read_decisions_unlocked(cfg, repair_tail=True)
+    keys = {(str(e.get("action") or ""), str(e.get("id") or ""))
+            for e in entries if e.get("id")}
+    for cand_id, (_path, fm, _content, _evidence) in sorted(items.items()):
+        for action in _expected_actions(str(fm.get("status") or "")):
+            key = (action, cand_id)
+            if key in keys:
+                continue
+            detail = {"recovered": True}
+            if action == "staged":
+                detail.update({
+                    "kind": fm.get("kind", ""),
+                    "origin": fm.get("origin", ""),
+                    "confidence": fm.get("confidence", "")})
+            elif action == "superseded" and cand_id in superseded_by:
+                detail["superseded_by"] = superseded_by[cand_id]
+            target = fm.get("promoted_to", "") if action == "promoted" \
+                else fm.get("target", "")
+            if record_unlocked(
+                    cfg, action, cand_id=cand_id, target=target,
+                    session=fm.get("session", ""), actor="recovery",
+                    chash=fm.get("hash", ""), detail=detail):
+                keys.add(key)
+                report["repaired"].append(
+                    f"restored {action} audit for {cand_id}")
+
+
+def _expected_actions(status):
+    if status == "pending":
+        return ("staged",)
+    if status == "approved":
+        return ("staged", "approved")
+    if status == "rejected":
+        return ("staged", "rejected")
+    if status == "promoted":
+        return ("staged", "approved", "promoted")
+    if status == "superseded":
+        return ("staged", "approved", "promoted", "superseded")
+    return ()

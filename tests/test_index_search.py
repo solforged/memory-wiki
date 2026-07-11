@@ -47,6 +47,18 @@ def test_index_refresh_add_change_delete(fixture_wiki, make_page):
     assert "concepts/spaced-repetition.md" not in idx.pages
 
 
+def test_index_keeps_full_body_without_expanding_lexical_cap(
+        fixture_wiki, make_page):
+    rel = "concepts/long-body.md"
+    body = ("padding " * 3_000) + "deepuniqueterm\n"
+    make_page(fixture_wiki, rel, "concept", "Long body", body=body)
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    rec = idx.pages[rel]
+    assert rec.body.endswith("deepuniqueterm")
+    assert "deepuniqueterm" not in rec.tokens
+
+
 def test_index_candidates_and_hashes(fixture_wiki):
     (fixture_wiki / schema.INBOX_DIR).mkdir()
     make_candidate(fixture_wiki, CID1)

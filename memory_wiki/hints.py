@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from . import layers, promote, schema, wikifs
+from . import candidates, layers, promote, schema, wikifs
 from .candidates import _overlap
 from .index import tokenize
 
@@ -25,6 +25,140 @@ _REF_TERMS = re.compile(
     r"(?:^|\s)[~/][\w./-]+|\.(?:plist|ya?ml|json|toml|conf|cfg|ini)\b|"
     r"\b(?:localhost|config|hostname|daemon|launchd|systemd|cron)\b|"
     r"\bport \d", re.IGNORECASE)
+
+
+def build_review_queue(cfg, index, filters=None, limit=None):
+    """Build the shared pending-candidate review read model.
+
+    ``filters`` accepts scalar values or sequences for ``kind``,
+    ``confidence``, ``target`` (explicit or effective target),
+    ``explicit_target``, and ``effective_target``. ``stale_only`` and
+    ``min_age`` are scalar predicates. The optional limit is applied after
+    filtering, preserving the inbox's deterministic filename order.
+    """
+    filters = dict(filters or {})
+    _validate_filters(filters)
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError("review queue limit must be an integer")
+        if limit < 1:
+            raise ValueError("review queue limit must be at least 1")
+    pending = candidates.list_candidates(cfg, statuses=("pending",))
+    stale_days = getattr(cfg, "candidate_stale_days", 30)
+    items = [_review_item(cfg, index, cand, pending, stale_days)
+             for cand in pending]
+    items = [item for item in items if _matches_filters(item, filters)]
+    if limit is not None:
+        items = items[:limit]
+    summary = {
+        "total_pending": len(pending),
+        "matched": len(items),
+        "stale_count": sum(1 for item in items if item["stale"]),
+        "by_kind": _counts(items, "kind"),
+        "by_confidence": _counts(items, "confidence"),
+        "by_effective_target": _counts(items, "effective_target"),
+    }
+    return {"summary": summary, "candidates": items}
+
+
+def _review_item(cfg, index, cand, pending, stale_days):
+    content = cand.get("content") or ""
+    preview_source = content
+    if candidates.page_shaped(content):
+        _frontmatter, preview_source = wikifs.parse_frontmatter(content)
+    preview = " ".join(preview_source.split())[:120]
+    title = " ".join(promote._title_from(content).split())
+    hint = candidate_hints(index, cand, pending)
+    route = promote._resolve(cfg, cand, content)
+    effective_target = route.get("target") or hint.get("default_target", "")
+    age = cand.get("age_days")
+    item = {
+        "id": cand.get("id", ""),
+        "title": title or cand.get("id", ""),
+        "content": content,
+        "preview": preview,
+        "excerpt": preview,
+        "status": cand.get("status", ""),
+        "kind": cand.get("kind", ""),
+        "confidence": cand.get("confidence", ""),
+        "origin": cand.get("origin", ""),
+        "session": cand.get("session", ""),
+        "turn": cand.get("turn", 0),
+        "created": cand.get("created", ""),
+        "supersedes": cand.get("supersedes", ""),
+        "age_days": age,
+        "stale": bool(stale_days and age is not None and age > stale_days),
+        "target": cand.get("target", ""),
+        "explicit_target": cand.get("target", ""),
+        "effective_target": effective_target,
+        "section": cand.get("section", ""),
+        "effective_section": route.get("section", ""),
+        "ref": cand.get("ref", ""),
+        "default_target": hint.get("default_target", ""),
+        "warnings": hint.get("warnings", []),
+        "covered_by": hint.get("covered_by", []),
+        "similar_candidates": hint.get("similar_candidates", []),
+        "suggested_target": hint.get("suggested_target", ""),
+    }
+    return item
+
+
+def _validate_filters(filters):
+    for name, allowed in (("kind", schema.CANDIDATE_KINDS),
+                          ("confidence", schema.CONFIDENCE)):
+        invalid = _filter_values(filters.get(name)) - set(allowed)
+        if invalid:
+            values = ", ".join(sorted(invalid))
+            raise ValueError(f"unknown {name} filter: {values}")
+    min_age = filters.get("min_age")
+    if min_age is None:
+        min_age = filters.get("min_age_days")
+    if min_age is None:
+        return
+    try:
+        min_age = int(min_age)
+    except (TypeError, ValueError):
+        raise ValueError("minimum review age must be an integer")
+    if min_age < 0:
+        raise ValueError("minimum review age cannot be negative")
+    filters["min_age"] = min_age
+
+
+def _matches_filters(item, filters):
+    for name in ("kind", "confidence", "explicit_target",
+                 "effective_target"):
+        values = _filter_values(filters.get(name))
+        if values and item.get(name) not in values:
+            return False
+    targets = _filter_values(filters.get("target"))
+    if targets and not ({item.get("explicit_target"),
+                         item.get("effective_target")} & targets):
+        return False
+    if filters.get("stale_only") and not item.get("stale"):
+        return False
+    min_age = filters.get("min_age")
+    if min_age is not None:
+        age = item.get("age_days")
+        if age is None or age < min_age:
+            return False
+    return True
+
+def _filter_values(value):
+    if value is None or value == "":
+        return set()
+    if isinstance(value, str):
+        return {value}
+    return {str(item) for item in value}
+
+
+def _counts(items, key):
+    counts = {}
+    for item in items:
+        value = item.get(key, "")
+        counts[value] = counts.get(value, 0) + 1
+    return {key: counts[key] for key in sorted(counts)}
 
 
 def candidate_hints(index, cand, pending=None):

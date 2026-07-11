@@ -52,6 +52,29 @@ def register_cli(subparser):
     p_review.add_argument("--prune", action="store_true",
                           help="Delete promoted/rejected candidate files older than --days")
     p_review.add_argument("--days", type=int, default=30)
+    p_review.add_argument("--kind", action="append", default=[], metavar="KIND",
+                          help="Filter by candidate kind (repeatable)")
+    p_review.add_argument("--confidence-filter", action="append", default=[],
+                          metavar="LEVEL",
+                          help="Filter by confidence (repeatable)")
+    p_review.add_argument("--target-filter", action="append", default=[],
+                          metavar="PATH",
+                          help="Filter by explicit or effective target (repeatable)")
+    p_review.add_argument("--effective-target", action="append", default=[],
+                          metavar="PATH",
+                          help="Filter by effective target (repeatable)")
+    p_review.add_argument("--stale-only", action="store_true",
+                          help="Show only candidates older than candidate_stale_days")
+    p_review.add_argument("--min-age", type=int, default=None, metavar="DAYS",
+                          help="Filter to candidates at least DAYS old")
+    p_review.add_argument("--limit", type=int, default=None, metavar="N",
+                          help="Maximum candidates after filtering")
+    p_review.add_argument("--approve-filtered", action="store_true",
+                          help="Approve every candidate selected by filters")
+    p_review.add_argument("--reject-filtered", action="store_true",
+                          help="Reject every candidate selected by filters")
+    p_review.add_argument("--yes", action="store_true",
+                          help="Confirm a filtered batch mutation")
 
     p_dream = subs.add_parser(
         "dream", help="Plan a conservative curation pass over pending candidates")
@@ -222,11 +245,20 @@ def _print_dream_suggestion(suggestion):
 
 
 def _cmd_review(args):
-    from . import candidates, promote
+    from . import candidates, hints, promote
     from .index import WikiIndex
     cfg = _load_cfg()
     if not Path(cfg.wiki_root).is_dir():
         print(f"wiki root does not exist: {cfg.wiki_root}")
+        return 1
+    batch_approve = bool(getattr(args, "approve_filtered", False))
+    batch_reject = bool(getattr(args, "reject_filtered", False))
+    batch = batch_approve or batch_reject
+    if batch and args.prune:
+        print("filtered batch mode cannot be combined with --prune")
+        return 1
+    if batch and args.list_only:
+        print("filtered batch mode cannot be combined with --list")
         return 1
     if args.prune:
         removed = candidates.prune(cfg, days=args.days)
@@ -235,6 +267,22 @@ def _cmd_review(args):
     index = WikiIndex(cfg.wiki_root)
     index.refresh()
     overrides = _approve_overrides(args)
+    filters = _review_filters(args)
+    if batch_approve and batch_reject:
+        print("choose only one of --approve-filtered or --reject-filtered")
+        return 1
+    if batch and (args.approve or args.reject):
+        print("filtered batch mode cannot be combined with --approve or --reject")
+        return 1
+    if batch and overrides:
+        print("override flags cannot be used with filtered batch mode")
+        return 1
+    if batch and not filters and getattr(args, "limit", None) is None:
+        print("filtered batch mode requires at least one filter")
+        return 1
+    if batch and not getattr(args, "yes", False):
+        print("filtered batch mode requires --yes; no candidates changed")
+        return 1
     if overrides and len(args.approve) != 1:
         print("override flags need exactly one --approve ID")
         return 1
@@ -254,22 +302,72 @@ def _cmd_review(args):
         rc |= 0 if result.get("ok") else 1
     if args.approve or args.reject:
         return rc
-    pending = candidates.list_candidates(cfg, statuses=("pending",))
+    try:
+        queue = hints.build_review_queue(
+            cfg, index, filters=filters, limit=getattr(args, "limit", None))
+    except ValueError as e:
+        print(f"invalid review filter: {e}")
+        return 1
+    pending = queue["candidates"]
+    if batch:
+        action = "approval" if batch_approve else "rejection"
+        print(f"selected {len(pending)} candidate(s) for filtered {action}")
+        completed = 0
+        for c in pending:
+            if batch_approve:
+                result = promote.promote(cfg, index, c["id"], actor="cli")
+            else:
+                result = promote.reject(
+                    cfg, c["id"], reason=args.reason, actor="cli")
+            print(f"{c['id']}: " + (result.get("result", "")
+                                    if result.get("ok") else
+                                    f"ERROR {result.get('error')}"))
+            if not result.get("ok"):
+                print(f"stopped after {completed} of {len(pending)} "
+                      "candidate(s); remaining candidates unchanged")
+                return 1
+            completed += 1
+        return 0
     if not pending:
-        print("no pending candidates")
+        if queue["summary"]["total_pending"]:
+            print("no pending candidates match the filters")
+        else:
+            print("no pending candidates")
         return 0
     if args.list_only:
+        summary = queue["summary"]
+        print(f"matched {summary['matched']} of {summary['total_pending']} "
+              f"pending candidate(s); {summary['stale_count']} stale")
         for c in pending:
-            target = c["target"] or f"(route by kind: {c['kind']})"
             age = f"  {c['age_days']}d" if c.get("age_days") else ""
             print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11}{age} "
-                  f"-> {target}")
-            print(f"    {c['content'][:120]}")
-            hint = _hint_line(index, c, pending)
+                  f"-> {c['effective_target']}")
+            print(f"    {c['title']}")
+            if c["preview"] != c["title"]:
+                print(f"    {c['preview']}")
+            hint = _hint_line(c)
             if hint:
                 print(f"    {hint}")
         return 0
     return _review_interactive(cfg, index, pending)
+
+
+def _review_filters(args):
+    filters = {}
+    for arg_name, filter_name in (
+            ("kind", "kind"),
+            ("confidence_filter", "confidence"),
+            ("target_filter", "target"),
+            ("effective_target", "effective_target")):
+        value = getattr(args, arg_name, None)
+        if value:
+            filters[filter_name] = value
+    if getattr(args, "stale_only", False):
+        filters["stale_only"] = True
+    min_age = getattr(args, "min_age", None)
+    if min_age is not None:
+        filters["min_age"] = min_age
+    return filters
 
 
 def _approve_overrides(args):
@@ -292,19 +390,17 @@ def _approve_overrides(args):
     return overrides
 
 
-def _hint_line(index, cand, pending):
-    """One compact 'hint: ...' line, or '' when nothing stands out."""
-    from . import hints
-    h = hints.candidate_hints(index, cand, pending)
+def _hint_line(cand):
+    """One compact 'hint: ...' line from a review queue item."""
     parts = []
-    if h.get("warnings"):
-        parts.append(", ".join(h["warnings"]))
-    if h.get("covered_by"):
-        parts.append("covered by " + ", ".join(h["covered_by"]))
-    if h.get("similar_candidates"):
-        parts.append("similar to " + ", ".join(h["similar_candidates"]))
-    if h.get("suggested_target"):
-        parts.append(f"consider target {h['suggested_target']}")
+    if cand.get("warnings"):
+        parts.append(", ".join(cand["warnings"]))
+    if cand.get("covered_by"):
+        parts.append("covered by " + ", ".join(cand["covered_by"]))
+    if cand.get("similar_candidates"):
+        parts.append("similar to " + ", ".join(cand["similar_candidates"]))
+    if cand.get("suggested_target"):
+        parts.append(f"consider target {cand['suggested_target']}")
     return f"hint: {'; '.join(parts)}" if parts else ""
 
 
@@ -314,11 +410,11 @@ def _review_interactive(cfg, index, pending):
           "[a]pprove+promote / [e]dit then approve / "
           "[t]arget then approve / [r]eject / [s]kip / [q]uit")
     for c in pending:
-        target = c["target"] or f"route by kind ({c['kind']})"
+        target = c["effective_target"]
         age = f", {c['age_days']}d old" if c.get("age_days") else ""
         print(f"\n{c['id']}  {c['kind']} ({c['confidence']}{age}) -> {target}")
         print(f"  {c['content']}")
-        hint = _hint_line(index, c, pending)
+        hint = _hint_line(c)
         if hint:
             print(f"  {hint}")
         try:

@@ -7,6 +7,7 @@ pages for the model to open with wiki_get; it is not a search engine.
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, timedelta
 
 from . import wikifs
@@ -17,6 +18,8 @@ _BOOST_TITLE = 2.0
 _BOOST_ALIAS = 2.0
 _BOOST_TOPIC = 1.0
 _BOOST_HEADING = 0.5
+# Coverage bonus is capped below this query's maximum raw lexical score.
+_COVERAGE_BONUS_WEIGHT = 0.95
 _JOURNAL_RECENCY_MULT = 1.5
 _JOURNAL_RECENCY_DAYS = 7
 
@@ -25,6 +28,7 @@ _VECTOR_WEIGHT = 0.7
 _LEXICAL_WEIGHT = 0.3
 _HYBRID_MIN_SCORE = 0.05
 
+_SNIPPET_TOKEN = re.compile(r"[a-z0-9]+")
 SNIPPET_LEN = 160
 
 
@@ -45,7 +49,8 @@ def score_records(index, query, corpus="pages", type_filter=None,
         df = sum(1 for r in records if r.tokens.get(t))
         idf[t] = math.log((n + 1) / (df + 1)) + 1.0
     cutoff = _recent_cutoff()
-    scored = []
+    raw_scored = []
+    query_terms = set(qtokens)
     for rec in records:
         s = 0.0
         for t in qtokens:
@@ -61,9 +66,22 @@ def score_records(index, query, corpus="pages", type_filter=None,
             continue
         if rec.ntype == "journal" and rec.created >= cutoff:
             s *= _JOURNAL_RECENCY_MULT
-        scored.append((s, rec))
+        raw_scored.append((s, rec))
+    max_raw = max((s for s, _ in raw_scored), default=0.0)
+    scored = [
+        (s + _COVERAGE_BONUS_WEIGHT * max_raw
+         * _query_term_coverage(query_terms, rec.tokens) ** 3, rec)
+        for s, rec in raw_scored
+    ]
     scored.sort(key=lambda x: (-x[0], x[1].rel))
     return scored
+
+
+def _query_term_coverage(query_terms, record_terms):
+    """Fraction of distinct query terms present among record terms."""
+    if not query_terms:
+        return 0.0
+    return len(query_terms.intersection(record_terms)) / len(query_terms)
 
 
 def _recent_cutoff():
@@ -105,18 +123,19 @@ def hybrid_scores(index, embedder, query, corpus="pages", type_filter=None,
 
 
 def snippet(rec, query):
-    """First body fragment containing a query token, else the head."""
-    body = rec.body_head
-    qtokens = set(tokenize(query))
+    """Fragment from the canonical body containing the first query match."""
+    body = getattr(rec, "body", "") or rec.body_head
     lowered = body.lower()
+    query_terms = set(tokenize(query))
+    first = next(
+        (match.start() for match in _SNIPPET_TOKEN.finditer(lowered)
+         if match.group() in query_terms),
+        None,
+    )
     best = 0
-    for t in qtokens:
-        i = lowered.find(t)
-        if i > -1:
-            best = max(0, lowered.rfind(" ", 0, max(0, i - 40)))
-            break
-    frag = body[best:best + SNIPPET_LEN].strip()
-    return frag
+    if first is not None:
+        best = max(0, lowered.rfind(" ", 0, max(0, first - 40)))
+    return body[best:best + SNIPPET_LEN].strip()
 
 
 def result_dict(rec, s, query):

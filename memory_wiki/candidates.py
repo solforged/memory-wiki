@@ -361,10 +361,19 @@ def list_candidates(cfg, statuses=("pending",)):
         if statuses and fm.get("status") not in statuses:
             continue
         head = split_evidence(body)[0]
+        turn = fm.get("turn", 0)
+        try:
+            turn = int(turn or 0)
+        except (TypeError, ValueError):
+            turn = 0
         out.append({"id": fm.get("id", ""), "status": fm.get("status", ""),
                     "kind": fm.get("kind", ""),
                     "confidence": fm.get("confidence", ""),
                     "target": fm.get("target", ""),
+                    "section": fm.get("section", ""),
+                    "origin": fm.get("origin", ""),
+                    "session": fm.get("session", ""),
+                    "turn": turn,
                     "created": fm.get("created", ""),
                     "supersedes": fm.get("supersedes", ""),
                     "age_days": wikifs.days_since(fm.get("created", "")),

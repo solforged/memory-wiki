@@ -81,9 +81,9 @@ deterministic-only.
 Embeddings are optional and local: `fastembed` (ONNX,
 `BAAI/bge-small-en-v1.5` by default) must be installed in the Hermes
 venv. The model loads on a background thread and vectors live in a
-throwaway sqlite cache under `~/.cache/memory-wiki/` keyed by content
-hash; the markdown remains the only source of truth, and the cache
-rebuilds itself if deleted or if the model changes. While the model is
+throwaway sqlite cache under `~/.cache/memory-wiki/`, keyed by page path
+and full canonical content. Markdown remains the only source of truth;
+the cache rebuilds itself if deleted or if the model changes. While
 loading, if the import fails, or in read-only contexts
 (subagent/cron), recall degrades to lexical-only. `wiki_get status`
 reports the state as `embedding_state`.
@@ -93,11 +93,20 @@ reports the state as `embedding_state`.
 ```
 hermes memory-wiki init [--wiki-root PATH] [--dry-run]
 hermes memory-wiki status
-hermes memory-wiki review [--list | --approve ID | --reject ID --reason R |
-                           --prune --days N]
+hermes memory-wiki review [--list] [--kind KIND] [--confidence-filter LEVEL]
+                          [--target-filter PATH | --effective-target PATH]
+                          [--stale-only] [--min-age DAYS] [--limit N]
+hermes memory-wiki review [--approve ID | --reject ID --reason R]
+hermes memory-wiki review FILTERS
+                          [--approve-filtered | --reject-filtered] --yes
+hermes memory-wiki review --prune [--days N]
 hermes memory-wiki dream [--limit N] [--apply-safe]
 hermes memory-wiki lint
 ```
+
+The review list, interactive reviewer, and `wiki_get review-queue` share
+the same candidate metadata, routing, staleness, filters, and summary.
+Filtered batch mutations require at least one filter plus `--yes`.
 
 ## Config reference (`plugins.memory-wiki`)
 

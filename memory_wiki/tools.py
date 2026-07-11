@@ -59,6 +59,32 @@ WIKI_GET_SCHEMA = {
             "start_line": {"type": "integer", "minimum": 1},
             "max_lines": {"type": "integer", "minimum": 1,
                           "maximum": _MAX_GET_LINES},
+            "kind": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string",
+                          "enum": list(schema.CANDIDATE_KINDS)},
+                "description": "review-queue only: restrict candidate kinds."},
+            "confidence": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string", "enum": list(schema.CONFIDENCE)},
+                "description": "review-queue only: restrict confidence levels."},
+            "target": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string"},
+                "description": "review-queue only: match explicit or effective targets."},
+            "effective_target": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string"},
+                "description": "review-queue only: match effective targets exactly."},
+            "stale_only": {
+                "type": "boolean",
+                "description": "review-queue only: return stale candidates."},
+            "min_age": {
+                "type": "integer", "minimum": 0,
+                "description": "review-queue only: minimum age in days."},
+            "limit": {
+                "type": "integer", "minimum": 1,
+                "description": "review-queue only: maximum returned candidates."},
         },
         "required": ["ref"],
     },
@@ -174,7 +200,7 @@ def _get(provider, args):
     if ref == "status":
         return _get_status(provider)
     if ref == "review-queue":
-        return _get_review_queue(provider)
+        return _get_review_queue(provider, args)
     if ref == "dream":
         return _get_dream(provider)
     if ref == "decisions":
@@ -223,19 +249,18 @@ def _get_status(provider):
                        "candidate_stale_days", "dream_limit")})
 
 
-def _get_review_queue(provider):
-    from . import candidates, hints
+def _get_review_queue(provider, args=None):
+    from . import hints
     provider.index.refresh()
-    pending = candidates.list_candidates(provider.cfg, statuses=("pending",))
-    items = []
-    for c in pending:
-        item = {"id": c["id"], "kind": c["kind"],
-                "confidence": c["confidence"], "target": c["target"],
-                "age_days": c["age_days"],
-                "excerpt": " ".join(c["content"].split())[:120]}
-        item.update(hints.candidate_hints(provider.index, c, pending))
-        items.append(item)
-    return ok(ref="review-queue", count=len(items), candidates=items)
+    args = args or {}
+    filters = {key: args[key] for key in
+               ("kind", "confidence", "target", "effective_target",
+                "stale_only", "min_age")
+               if key in args}
+    queue = hints.build_review_queue(
+        provider.cfg, provider.index, filters=filters,
+        limit=args.get("limit"))
+    return ok(ref="review-queue", count=len(queue["candidates"]), **queue)
 
 
 def _get_dream(provider):

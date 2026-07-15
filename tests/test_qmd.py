@@ -308,6 +308,34 @@ def test_semantic_mode_maintains_embeddings_and_can_skip_reranking(
     assert marker["embedded_at"] > 0
 
 
+def test_semantic_only_hit_returns_unambiguous_claim_metadata(
+        fixture_wiki, tmp_path, monkeypatch, make_page):
+    make_page(
+        fixture_wiki, "claims/semantic.md", "claim", "Semantic",
+        extras={"claims": [{
+            "id": "claim.semantic.primary",
+            "text": "Rollback precedes another release attempt.",
+            "status": "supported",
+            "evidence": [{"kind": "runbook", "sourceId": "release"}],
+        }]},
+    )
+    index = WikiIndex(fixture_wiki)
+    index.refresh()
+    backend = QmdBackend(make_cfg(
+        fixture_wiki, tmp_path / "qmd", qmd_search_mode="query"), index)
+    initialize_state(backend, updated_at=10**10, embedded_at=10**10)
+
+    def fake_run(argv, **kwargs):
+        payload = [{"score": 0.82, "file": "./claims/semantic.md",
+                    "snippet": "A related operational safeguard."}]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr("memory_wiki.qmd.subprocess.run", fake_run)
+    result = backend.search("recovery safety")[0]
+    assert result["matched_claim"]["id"] == "claim.semantic.primary"
+    assert result["matched_claim"]["evidence_source_ids"] == ["release"]
+
+
 def test_semantic_invalidate_forces_update_and_embed(
         fixture_wiki, tmp_path, monkeypatch):
     index = WikiIndex(fixture_wiki)

@@ -1,6 +1,6 @@
 name: memory-wiki
-version: 0.1.0
-description: "Wiki-native memory: review-first capture into a plaintext wiki; profile/ and journal/ living pages replace MEMORY.md/USER.md."
+version: 0.2.0
+description: "Wiki-native Hermes memory with review-first capture, claim compilation, phased dreaming, and health dashboards."
 author: tarmuid
 hooks:
   - on_session_end

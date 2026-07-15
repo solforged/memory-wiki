@@ -4,6 +4,41 @@ from memory_wiki import scaffold, schema, wikifs
 from memory_wiki import config as mw_config
 
 
+AUTHORITATIVE_DATE_CHECK_PY = r'''#!/usr/bin/env python3
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DIR_TYPE = {
+    "concepts": "concept",
+    "reports": "report",  # memory-wiki
+    "profile": "profile", "journal": "journal", "tastes": "taste",  # memory-wiki
+}
+REQUIRED = {"type", "title", "topics", "createdAt"}
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def main():
+    errors = []
+    for path in sorted((ROOT / "concepts").glob("*.md")):
+        rel = f"concepts/{path.stem}"
+        fm = json.loads(path.read_text(encoding="utf-8"))
+        for field in sorted(REQUIRED):
+            if field not in fm or fm[field] in ("", []):
+                errors.append(f"{rel}: missing or empty {field}")
+        created_at = fm.get("createdAt")
+        if (created_at and
+                (not isinstance(created_at, str) or not DATE.fullmatch(created_at))):
+            errors.append(f"{rel}: invalid createdAt {created_at!r}")
+    print("\n".join(errors))
+    return bool(errors)
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
 def test_ensure_runtime_creates_and_is_idempotent(cfg):
     made = scaffold.ensure_runtime(cfg)
     assert "profile/user.md" in made and "_inbox/" in made
@@ -29,6 +64,65 @@ def test_init_wiki_patches_and_is_idempotent(cfg):
     assert again["check_py"][0] == "already"
     assert again["style_guide"][0] == "already"
     assert (root / "_meta" / "style-guide.md").read_text() == style
+
+
+def test_check_py_patch_accepts_legacy_created_but_emits_created_at(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    root = tmp_path / "wiki"
+    (root / "_scripts").mkdir(parents=True)
+    (root / "concepts").mkdir()
+    check = root / "_scripts" / "check.py"
+    check.write_text(AUTHORITATIVE_DATE_CHECK_PY, encoding="utf-8")
+    legacy = {"type": "concept", "title": "Legacy", "topics": ["testing"],
+              "created": "2026-07-01"}
+    page = root / "concepts" / "legacy.md"
+    page.write_text(json.dumps(legacy), encoding="utf-8")
+
+    before = subprocess.run(
+        [sys.executable, str(check)], capture_output=True, text=True)
+    assert before.returncode == 1
+    assert "missing or empty createdAt" in before.stdout
+
+    status, diff = scaffold._patch_check_py(root, dry_run=False)
+    assert status == "applied" and "legacy-created-compat" in diff
+    after = subprocess.run(
+        [sys.executable, str(check)], capture_output=True, text=True)
+    assert after.returncode == 0, after.stdout
+    assert scaffold._patch_check_py(root, dry_run=False) == ("already", "")
+
+    generated = schema.page_frontmatter(
+        "concept", "New", topics=["testing"], created="2026-07-02")
+    assert generated["createdAt"] == "2026-07-02"
+    assert "created" not in generated
+    page.write_text(json.dumps(generated), encoding="utf-8")
+    current = subprocess.run(
+        [sys.executable, str(check)], capture_output=True, text=True)
+    assert current.returncode == 0, current.stdout
+
+
+def test_init_wiki_migrates_legacy_managed_style_section(cfg):
+    root = Path(cfg.wiki_root)
+    style_path = root / "_meta" / "style-guide.md"
+    style_path.write_text(
+        "# Wiki style guide\n\n"
+        f"{schema.STYLE_GUIDE_BEGIN}\n"
+        "## Agent memory extensions\n\nLegacy text.\n"
+        f"{schema.STYLE_GUIDE_END}\n\n"
+        "## Human notes\n\nKeep me.\n",
+        encoding="utf-8",
+    )
+
+    report = scaffold.init_wiki(cfg)
+
+    assert report["style_guide"][0] == "applied"
+    updated = style_path.read_text(encoding="utf-8")
+    assert "reports/ contains compiler-owned health" in updated
+    assert "Legacy text." not in updated
+    assert "## Human notes\n\nKeep me." in updated
+    assert scaffold.init_wiki(cfg)["style_guide"][0] == "already"
 
 
 def test_init_dry_run_changes_nothing(cfg):

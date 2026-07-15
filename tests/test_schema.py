@@ -67,10 +67,17 @@ def test_wrong_folder_type_mismatch():
 def test_bad_enum_and_date():
     fm = schema.page_frontmatter("claim", "x", created="2026-07-01")
     fm["confidence"] = "very-sure"
-    fm["created"] = "July 1"
+    fm["createdAt"] = "July 1"
     errs = schema.validate_page("claims/x.md", wikifs.render_page(fm, "b\n"))
     assert any("confidence" in e for e in errs)
     assert any("ISO date" in e for e in errs)
+
+
+def test_legacy_created_date_remains_valid():
+    fm = schema.page_frontmatter("concept", "x", created="2026-07-01")
+    fm["created"] = fm.pop("createdAt")
+    assert schema.validate_page(
+        "concepts/x.md", wikifs.render_page(fm, "b\n")) == []
 
 
 def test_missing_required_extra():

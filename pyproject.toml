@@ -1,7 +1,7 @@
 [project]
 name = "memory-wiki"
-version = "0.1.0"
-description = "Hermes memory provider: review-first memory over a plaintext wiki"
+version = "0.2.0"
+description = "Hermes memory provider with review-first wiki capture, claim compilation, and phased dreaming"
 requires-python = ">=3.10"
 dependencies = []
 

@@ -13,7 +13,8 @@ from pathlib import Path
 
 def register_cli(subparser):
     """Build the ``hermes memory-wiki`` argparse subcommand tree."""
-    subparser.description = "Wiki-native memory: status, init, review, dream, lint"
+    subparser.description = (
+        "Wiki-native memory: status, init, review, compile, dream, schedule, lint")
     subs = subparser.add_subparsers(dest="mw_command")
 
     p_init = subs.add_parser(
@@ -86,6 +87,27 @@ def register_cli(subparser):
                          help="Append the plan to DREAMS.md")
     p_dream.add_argument("--explain", metavar="ID", default=None,
                          help="Explain one candidate's score without writing")
+    p_dream.add_argument("--phase", choices=("light", "rem", "deep", "all"),
+                         default="deep",
+                         help="Dream phase to run (default: deep)")
+    p_dream.add_argument("--scheduled", action="store_true",
+                         help="Use the stricter scheduled-promotion policy")
+    p_dream.add_argument("--compile", action="store_true", dest="compile_wiki",
+                         help="Compile claims and reports after the phase")
+    p_dream.add_argument("--quiet", action="store_true",
+                         help="Suppress normal output")
+
+    subs.add_parser("compile", help="Compile claim digests and health reports")
+
+    p_schedule = subs.add_parser(
+        "schedule", help="Manage the opt-in dream sweep schedule")
+    schedule_mode = p_schedule.add_mutually_exclusive_group()
+    schedule_mode.add_argument("--enable", action="store_true",
+                               help="Enable the managed dream sweep")
+    schedule_mode.add_argument("--disable", action="store_true",
+                               help="Disable and remove the managed sweep")
+    p_schedule.add_argument("--cron", metavar="EXPR",
+                            help="Cron expression (default: 0 3 * * *)")
 
     subs.add_parser("lint", help="Validate pages and candidates, then run the "
                                  "wiki's own _scripts/check.py")
@@ -104,6 +126,36 @@ def _load_cfg(wiki_root_override=None):
     return mw_config.load_config(hermes_home, overrides)
 
 
+def _get_hermes_home():
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()).expanduser()
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def _compile(cfg, *, quiet=False):
+    from . import compiler
+    result = compiler.compile_wiki(cfg.wiki_root)
+    if not quiet:
+        updated = result.get("updatedFiles", [])
+        print(f"compiled {len(result.get('pages', []))} page(s), "
+              f"{result.get('claimCount', 0)} claim(s)")
+        print("updated: " + (", ".join(updated) if updated else "none"))
+    return result
+
+
+def _compile_if_enabled(cfg, *, force=False, quiet=True):
+    if not force and not bool(getattr(cfg, "auto_compile", True)):
+        return 0
+    try:
+        _compile(cfg, quiet=quiet)
+    except Exception as exc:
+        print(f"compile failed: {type(exc).__name__}: {exc}")
+        return 1
+    return 0
+
+
 def memory_wiki_command(args):
     cmd = getattr(args, "mw_command", None)
     if cmd == "init":
@@ -112,11 +164,16 @@ def memory_wiki_command(args):
         return _cmd_status(args)
     if cmd == "review":
         return _cmd_review(args)
+    if cmd == "compile":
+        return _cmd_compile(args)
     if cmd == "dream":
         return _cmd_dream(args)
+    if cmd == "schedule":
+        return _cmd_schedule(args)
     if cmd == "lint":
         return _cmd_lint(args)
-    print("usage: hermes memory-wiki {init|status|review|dream|lint}")
+    print("usage: hermes memory-wiki "
+          "{init|status|review|compile|dream|schedule|lint}")
     return 1
 
 
@@ -148,12 +205,14 @@ def _cmd_init(args):
             if diff:
                 print(diff)
     if not args.dry_run:
-        _run_check_py(root)
+        compile_rc = _compile_if_enabled(cfg)
+        check_rc = _run_check_py(root)
+        return 1 if compile_rc or check_rc else 0
     return 0
 
 
 def _cmd_status(args):
-    from . import schema, wikifs
+    from . import compiler, dream_phases, scheduler, schema, wikifs
     cfg = _load_cfg()
     root = Path(cfg.wiki_root)
     print(f"wiki root: {root} ({'ok' if root.is_dir() else 'MISSING'})")
@@ -187,8 +246,26 @@ def _cmd_status(args):
               "journal_episodes",
               "prefetch_limit", "prompt_block_budget",
               "candidate_stale_days", "dream_limit", "dream_min_score",
-              "dream_min_recall_count", "dream_min_unique_queries"):
+              "dream_min_recall_count", "dream_min_unique_queries",
+              "auto_compile", "dream_schedule_enabled", "dream_schedule"):
         print(f"config {k}: {getattr(cfg, k)}")
+    digest = root / compiler.AGENT_DIGEST_PATH
+    claims = root / compiler.CLAIMS_DIGEST_PATH
+    print("compiler: " + ("ready" if digest.is_file() and claims.is_file()
+                          else "not compiled"))
+    phase = dream_phases.status(cfg)
+    sweep = phase["sweep"]
+    print(f"dream state: {phase['candidate_count']} candidate(s), "
+          f"light {phase['light_hits']}, REM {phase['rem_hits']}, "
+          f"sweep {sweep['status']}")
+    schedule = scheduler.status(cfg, hermes_home=_get_hermes_home())
+    job = schedule.get("job") or {}
+    state = "enabled" if schedule["enabled"] else "disabled"
+    if job.get("state"):
+        state += f", job {job['state']}"
+    print(f"dream schedule: {state}, {schedule['schedule']}")
+    if schedule.get("error"):
+        print(f"dream schedule error: {schedule['error']}")
     if cfg.search_backend in ("qmd", "auto"):
         from .index import WikiIndex
         from .qmd import QmdBackend
@@ -201,8 +278,77 @@ def _cmd_status(args):
     return 0
 
 
+def _cmd_compile(args):
+    cfg = _load_cfg()
+    root = Path(cfg.wiki_root)
+    if not root.is_dir():
+        print(f"wiki root does not exist: {root}")
+        return 1
+    return _compile_if_enabled(cfg, force=True, quiet=False)
+
+
+def _cmd_schedule(args):
+    from . import config as mw_config
+    from . import scheduler
+
+    cfg = _load_cfg()
+    enable = bool(getattr(args, "enable", False))
+    disable = bool(getattr(args, "disable", False))
+    cron = str(getattr(args, "cron", None) or "").strip()
+    changes = {}
+    if enable:
+        changes["dream_schedule_enabled"] = True
+    elif disable:
+        changes["dream_schedule_enabled"] = False
+    if cron:
+        changes["dream_schedule"] = cron
+
+    if changes:
+        import copy
+
+        home = _get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        desired = copy.copy(cfg)
+        for key, value in changes.items():
+            setattr(desired, key, value)
+        try:
+            if cron:
+                scheduler.validate_schedule(cron)
+            result = scheduler.reconcile(desired, home)
+        except Exception as exc:
+            print(f"could not reconcile schedule: {type(exc).__name__}: {exc}")
+            return 1
+        if result.get("error") or not result.get("available", True):
+            print(f"schedule error: {result.get('error') or 'cron API unavailable'}")
+            return 1
+        try:
+            mw_config.save_plugin_block(changes, home)
+        except Exception as exc:
+            scheduler.reconcile(cfg, home)
+            print(f"could not save schedule config: {type(exc).__name__}: {exc}")
+            return 1
+    else:
+        result = scheduler.status(cfg, hermes_home=_get_hermes_home())
+
+    state = "enabled" if result["enabled"] else "disabled"
+    print(f"dream schedule: {state}, {result['schedule']}")
+    job = result.get("job") or {}
+    if job:
+        print(f"job: {job.get('name') or 'managed'} "
+              f"({job.get('state') or 'unknown'})")
+    if result.get("created"):
+        print("managed job created")
+    elif result.get("updated"):
+        print("managed job updated")
+    if result.get("removed"):
+        print(f"managed jobs removed: {len(result['removed'])}")
+    if result.get("error"):
+        print(f"schedule error: {result['error']}")
+    return 1 if result.get("error") or not result.get("available", True) else 0
+
+
 def _cmd_dream(args):
-    from . import dream
+    from . import dream, dream_phases
     from .index import WikiIndex
     cfg = _load_cfg()
     if not Path(cfg.wiki_root).is_dir():
@@ -210,36 +356,109 @@ def _cmd_dream(args):
         return 1
     index = WikiIndex(cfg.wiki_root)
     index.refresh()
+    phase = getattr(args, "phase", "deep") or "deep"
     apply_safe = bool(getattr(args, "apply_safe", False))
     write_report = bool(getattr(args, "report", False))
+    scheduled = bool(getattr(args, "scheduled", False))
+    compile_wiki = bool(getattr(args, "compile_wiki", False))
+    quiet = bool(getattr(args, "quiet", False))
     explain_id = getattr(args, "explain", None)
+    if phase in ("light", "rem") and (apply_safe or write_report):
+        print("--apply-safe and --report require --phase deep or all")
+        return 1
+    if phase in ("light", "rem") and scheduled:
+        print("--scheduled requires --phase deep or all")
+        return 1
     if explain_id:
-        if apply_safe or write_report:
-            print("--explain cannot be combined with --apply-safe or --report")
+        if phase != "deep":
+            print("--explain requires --phase deep")
+            return 1
+        if apply_safe or write_report or compile_wiki:
+            print("--explain cannot be combined with --apply-safe, --report, "
+                  "or --compile")
             return 1
         try:
-            result = dream.explain(cfg, index, explain_id)
+            result = dream.explain(
+                cfg, index, explain_id, scheduled=scheduled)
         except ValueError as exc:
             print(exc)
             return 1
         ranking = result["promotion"]
-        print(f"{result['id']}: {result['status']}, score "
-              f"{ranking['score']:.4f}, eligible {ranking['eligible']}")
-        print(f"recalls {ranking['recall_count']}, unique queries "
-              f"{ranking['unique_queries']}")
-        failed = [name for name, passed in ranking["gates"].items()
-                  if not passed]
-        print("failed gates: " + (", ".join(failed) if failed else "none"))
-        if result.get("suggestion"):
-            _print_dream_suggestion(result["suggestion"])
+        if not quiet:
+            print(f"{result['id']}: {result['status']}, score "
+                  f"{ranking['score']:.4f}, eligible {ranking['eligible']}")
+            print(f"recalls {ranking['recall_count']}, unique queries "
+                  f"{ranking['unique_queries']}")
+            failed = [name for name, passed in ranking["gates"].items()
+                      if not passed]
+            print("failed gates: " + (", ".join(failed) if failed else "none"))
+            if result.get("suggestion"):
+                _print_dream_suggestion(result["suggestion"])
         return 0
-    result = dream.run(cfg, index, limit=args.limit,
-                       apply_safe=apply_safe, write_report=write_report,
-                       actor="cli")
+
+    limit = getattr(args, "limit", None)
+    if phase == "light":
+        phases = dream_phases.run_tracked(
+            cfg, ("light",),
+            lambda _phase, _completed: dream_phases.run_light(
+                cfg, index, limit=limit))
+        light = phases["light"]
+        if not quiet:
+            print(f"dream light: staged {light['staged_count']} of "
+                  f"{light['input_count']}, recorded {light['recorded_hits']}")
+        return (_compile_if_enabled(cfg, force=True, quiet=quiet)
+                if compile_wiki else 0)
+    if phase == "rem":
+        def run_phase(name, completed):
+            if name == "light":
+                return dream_phases.run_light(cfg, index, limit=limit)
+            return dream_phases.run_rem(
+                cfg, completed["light"], limit=limit)
+
+        phases = dream_phases.run_tracked(
+            cfg, ("light", "rem"), run_phase)
+        rem = phases["rem"]
+        if not quiet:
+            print(f"dream REM: considered {rem['considered']}, "
+                  f"lasting truths {len(rem['lasting_truths'])}, "
+                  f"recorded {rem['recorded_hits']}")
+        return (_compile_if_enabled(cfg, force=True, quiet=quiet)
+                if compile_wiki else 0)
+    if phase == "all":
+        sweep = dream.run_sweep(
+            cfg, index, limit=limit, apply_safe=apply_safe, actor="cli",
+            write_report=write_report, scheduled=scheduled)
+        result = sweep["deep"]
+        if not quiet:
+            print(f"dream phases: light {sweep['light']['recorded_hits']}, "
+                  f"REM {sweep['rem']['recorded_hits']}, deep complete")
+    else:
+        phases = dream_phases.run_tracked(
+            cfg, ("deep",),
+            lambda _phase, _completed: dream.run(
+                cfg, index, limit=limit, apply_safe=apply_safe,
+                write_report=write_report, actor="cli",
+                scheduled=scheduled))
+        result = phases["deep"]
+
+    if not quiet:
+        _print_dream_plan(result, apply_safe=apply_safe)
+    applied = result.get("applied", [])
+    failed = [item for item in applied if not item.get("ok")]
+    changed = any(item.get("ok") for item in applied)
+    compile_rc = 0
+    if compile_wiki or changed:
+        compile_rc = _compile_if_enabled(
+            cfg, force=compile_wiki, quiet=quiet)
+    return 1 if failed or compile_rc else 0
+
+
+def _print_dream_plan(result, *, apply_safe=False):
     print(f"dream: considered {result['considered']} of {result['pending']} "
           f"pending candidate(s)")
     if result["summary"]:
-        summary = ", ".join(f"{k} {v}" for k, v in sorted(result["summary"].items()))
+        summary = ", ".join(
+            f"{key} {value}" for key, value in sorted(result["summary"].items()))
         print(f"summary: {summary}")
     else:
         print("summary: no suggestions")
@@ -249,14 +468,13 @@ def _cmd_dream(args):
         print(f"report: {result['report']}")
     if apply_safe:
         applied = result.get("applied", [])
-        failed = [a for a in applied if not a.get("ok")]
+        failed = [item for item in applied if not item.get("ok")]
         print(f"applied safe promotions: {len(applied) - len(failed)}/"
               f"{len(applied)}")
         for item in applied:
-            status = item.get("result") if item.get("ok") else f"ERROR {item.get('error')}"
+            status = (item.get("result") if item.get("ok")
+                      else f"ERROR {item.get('error')}")
             print(f"  {item['id']}: {status} -> {item.get('target', '')}")
-        return 1 if failed else 0
-    return 0
 
 
 def _print_dream_suggestion(suggestion):
@@ -311,7 +529,7 @@ def _cmd_review(args):
     if args.prune:
         removed = candidates.prune(cfg, days=args.days)
         print(f"pruned {len(removed)} candidate file(s)")
-        return 0
+        return _compile_if_enabled(cfg) if removed else 0
     index = WikiIndex(cfg.wiki_root)
     index.refresh()
     overrides = _approve_overrides(args)
@@ -352,7 +570,8 @@ def _cmd_review(args):
                                 f"ERROR {result.get('error')}"))
         rc |= 0 if result.get("ok") else 1
     if args.approve or args.reject:
-        return rc
+        compile_rc = _compile_if_enabled(cfg)
+        return 1 if rc or compile_rc else 0
     try:
         queue = hints.build_review_queue(
             cfg, index, filters=filters, limit=getattr(args, "limit", None))
@@ -376,9 +595,11 @@ def _cmd_review(args):
             if not result.get("ok"):
                 print(f"stopped after {completed} of {len(pending)} "
                       "candidate(s); remaining candidates unchanged")
+                if completed:
+                    _compile_if_enabled(cfg)
                 return 1
             completed += 1
-        return 0
+        return _compile_if_enabled(cfg) if completed else 0
     if not pending:
         if queue["summary"]["total_reviewable"]:
             print("no reviewable candidates match the filters")
@@ -401,7 +622,9 @@ def _cmd_review(args):
             if hint:
                 print(f"    {hint}")
         return 0
-    return _review_interactive(cfg, index, pending)
+    rc = _review_interactive(cfg, index, pending)
+    compile_rc = _compile_if_enabled(cfg)
+    return 1 if rc or compile_rc else 0
 
 
 def _review_filters(args):

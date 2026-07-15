@@ -129,6 +129,13 @@ def hybrid_scores(index, embedder, query, corpus="pages", type_filter=None,
 
 def snippet(rec, query):
     """Fragment from the canonical body containing the first query match."""
+    claim = matched_claim(rec, query)
+    body_overlap = len(set(tokenize(query)).intersection(
+        tokenize(getattr(rec, "body", ""))))
+    claim_overlap = len(set(tokenize(query)).intersection(
+        tokenize(_claim_search_text(claim)))) if claim else 0
+    if claim and claim_overlap > body_overlap:
+        return str(claim.get("text") or "")[:SNIPPET_LEN].strip()
     body = getattr(rec, "body", "") or rec.body_head
     lowered = body.lower()
     query_terms = set(tokenize(query))
@@ -151,7 +158,57 @@ def result_dict(rec, s, query):
     if rec.ntype == "candidate":
         out.update(id=rec.cand_id, status=rec.status, kind=rec.kind,
                    created=rec.created, content_hash=rec.content_hash)
+    add_claim_details(out, rec, query)
     return out
+
+
+def matched_claim(rec, query):
+    """Best structured claim match on a page, or None."""
+    query_tokens = set(tokenize(query))
+    if not query_tokens:
+        return None
+    ranked = []
+    for index, claim in enumerate(getattr(rec, "claims", []) or []):
+        claim_tokens = set(tokenize(_claim_search_text(claim)))
+        overlap = len(query_tokens.intersection(claim_tokens))
+        if overlap:
+            ranked.append((overlap / len(query_tokens), overlap, -index, claim))
+    return max(ranked, key=lambda item: item[:3])[3] if ranked else None
+
+
+def add_claim_details(result, rec, query, context="", fallback_single=False):
+    claim = matched_claim(rec, query)
+    if not claim and context:
+        claim = matched_claim(rec, context)
+    page_claims = list(getattr(rec, "claims", []) or [])
+    if not claim and fallback_single and len(page_claims) == 1:
+        claim = page_claims[0]
+    if not claim:
+        return result
+    evidence = claim.get("evidence", [])
+    result["matched_claim"] = {
+        "id": str(claim.get("id") or ""),
+        "text": str(claim.get("text") or ""),
+        "status": str(claim.get("status") or "supported"),
+        "confidence": claim.get("confidence"),
+        "evidence_kinds": sorted({str(item.get("kind")) for item in evidence
+                                   if item.get("kind")}),
+        "evidence_source_ids": sorted({str(item.get("sourceId"))
+                                        for item in evidence
+                                        if item.get("sourceId")}),
+    }
+    return result
+
+
+def _claim_search_text(claim):
+    if not claim:
+        return ""
+    values = [str(claim.get(field) or "")
+              for field in ("id", "text", "status")]
+    for evidence in claim.get("evidence", []):
+        values.extend(str(evidence.get(field) or "") for field in (
+            "kind", "sourceId", "path", "lines", "privacyTier", "note"))
+    return " ".join(values)
 
 
 def prefetch_block(index, cfg, query, session_id="", embedder=None):

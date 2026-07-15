@@ -20,7 +20,7 @@ def roundtrip(fm, body="Body.\n"):
 
 def test_simple_roundtrip():
     fm = {"type": "concept", "title": "Zettelkasten", "topics": ["note-taking"],
-          "created": "2026-07-01"}
+          "createdAt": "2026-07-01"}
     _, fm2, body2 = roundtrip(fm)
     assert fm2 == fm
     assert body2.lstrip("\n") == "Body.\n"
@@ -29,7 +29,7 @@ def test_simple_roundtrip():
 def test_quoted_title_with_colon():
     fm = {"type": "source", "title": "Molecular Notes: Principles",
           "author": "Robert Martin", "medium": "post", "topics": [],
-          "created": "2026-07-01"}
+          "createdAt": "2026-07-01"}
     text, fm2, _ = roundtrip(fm)
     assert 'title: "Molecular Notes: Principles"' in text
     assert fm2["title"] == "Molecular Notes: Principles"
@@ -64,6 +64,13 @@ def test_dash_list_parsing():
     fm, _ = parse_frontmatter(text)
     assert fm["topics"] == ["alpha", "beta"]
     assert fm["title"] == "x"
+
+
+def test_scalar_list_with_commas_roundtrip():
+    fm = {"questions": ["Who, what, and where?", "Why?"]}
+    text, fm2, _ = roundtrip(fm)
+    assert "questions:\n- Who, what, and where?\n- Why?" in text
+    assert fm2 == fm
 
 
 def test_comment_stripping_matches_check_py():

@@ -138,7 +138,7 @@ def test_page_shaped_stage_validates(ready):
     cfg, idx = ready
     good = ("---\ntype: claim\ntitle: staged claims work\n"
             "topics: [memory]\nstance: model\nconfidence: likely\n"
-            "maturity: seedling\ncreated: 2026-07-06\n---\n"
+            "maturity: seedling\ncreatedAt: 2026-07-06\n---\n"
             "Body argument.\n\n## Evidence\n\n- some\n")
     r = candidates.stage(cfg, idx, good, kind="claim")
     assert r["staged"], r
@@ -146,11 +146,11 @@ def test_page_shaped_stage_validates(ready):
     assert loaded == good.strip()
     assert "staged-claims-work" in r["ref"]  # slug from page title
 
-    bad = "---\ntype: claim\ntitle: no stance\ntopics: [x]\ncreated: 2026-07-06\n---\nb\n"
+    bad = "---\ntype: claim\ntitle: no stance\ntopics: [x]\ncreatedAt: 2026-07-06\n---\nb\n"
     r2 = candidates.stage(cfg, idx, bad, kind="claim")
     assert not r2["staged"] and "stance" in r2["reason"]
 
-    existing = "---\ntype: claim\ntitle: t\ntopics: [x]\ncreated: 2026-07-06\n---\nb\n"
+    existing = "---\ntype: claim\ntitle: t\ntopics: [x]\ncreatedAt: 2026-07-06\n---\nb\n"
     r3 = candidates.stage(cfg, idx, existing,
                           target="claims/small-tools-beat-frameworks.md")
     assert not r3["staged"] and "new-page target" in r3["reason"]

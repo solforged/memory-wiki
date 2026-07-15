@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from memory_wiki import candidates, hints, layers, promote, scaffold, schema, wikifs
+from memory_wiki import (candidates, compiler, hints, layers, promote, scaffold,
+                         schema, search, wikifs)
 from memory_wiki.index import WikiIndex
 
 
@@ -118,6 +119,20 @@ def test_claim_new_page(ready):
     fm, body = wikifs.parse_frontmatter(text)
     assert fm["type"] == "claim" and fm["confidence"] == "likely"
     assert fm["maturity"] == "seedling" and fm["topics"] == ["memory"]
+    expected_claim_id = f"claim.{Path(rel).stem}.primary"
+    assert fm["claims"] == [{
+        "id": expected_claim_id,
+        "text": "Review-first staging beats direct writes for agent memory.",
+        "status": "supported",
+        "confidence": 0.75,
+        "evidence": [{
+            "kind": "tool",
+            "sourceId": "session:8f3e9c12",
+            "note": "proposed via tool",
+            "updatedAt": fm["createdAt"],
+        }],
+        "updatedAt": fm["createdAt"],
+    }]
     assert "## Evidence" in body and "## Open questions" in body
     assert "proposed via tool" in body and "session 8f3e9c12" in body
     assert schema.promoted_comment(cid) in body
@@ -149,7 +164,7 @@ def test_concept_new_page_and_existing_refused(ready):
 
 FULL_CLAIM_PAGE = ("---\ntype: claim\ntitle: staged pages promote verbatim\n"
                    "topics: [memory]\nstance: model\nconfidence: likely\n"
-                   "maturity: budding\ncreated: 2026-07-06\n---\n"
+                   "maturity: budding\ncreatedAt: 2026-07-06\n---\n"
                    "Argument paragraph.\n\n## Evidence\n\n- staged evidence\n"
                    "\n## Open questions\n")
 
@@ -227,6 +242,112 @@ def test_explicit_existing_target_appends_section(ready):
     assert "Matuschak notes support this." in evidence
     assert schema.validate_page("claims/small-tools-beat-frameworks.md",
                                 text) == []
+
+
+def test_structured_claim_supersession_updates_canonical_claim(ready):
+    cfg, idx = ready
+    old_id = stage(cfg, idx, "Alpha is true.", kind="claim")
+    created = promote.approve(cfg, idx, old_id)
+    assert created["ok"]
+    rel = created["target"]
+
+    replacement = promote.supersede(cfg, idx, old_id, "Alpha is false.")
+    assert replacement["result"] == "pending_review"
+    result = promote.approve(cfg, idx, replacement["id"])
+    assert result["ok"] and result["result"] == "replaced"
+
+    text = read(cfg, rel)
+    fm, body = wikifs.parse_frontmatter(text)
+    canonical_claim_id = f"claim.{Path(rel).stem}.primary"
+    assert fm["claims"][0]["id"] == canonical_claim_id
+    assert fm["claims"][0]["text"] == "Alpha is false."
+    assert fm["claims"][0]["status"] == "supported"
+    assert fm["updatedAt"] == wikifs.today()
+    assert "Alpha is true." not in body
+    assert schema.promoted_comment(replacement["id"]) in body
+    assert schema.promoted_comment(old_id) not in body
+
+    compiler.compile_wiki(cfg.wiki_root)
+    claims = [json.loads(line) for line in read(
+        cfg, compiler.CLAIMS_DIGEST_PATH).splitlines()]
+    canonical = next(item for item in claims
+                     if item.get("id") == canonical_claim_id)
+    assert canonical["text"] == "Alpha is false."
+
+
+def test_structured_evidence_append_and_supersession_recompile(ready):
+    cfg, idx = ready
+    claim_id = stage(cfg, idx, "A release needs rollback.", kind="claim")
+    created = promote.approve(cfg, idx, claim_id)
+    rel = created["target"]
+    evidence_id = stage(
+        cfg, idx, "Runbook section 18 confirms rollback.", kind="fact",
+        target=rel, section="## Evidence", session_id="evidence-session")
+    assert promote.approve(cfg, idx, evidence_id)["ok"]
+
+    idx.refresh()
+    scored = search.score_records(idx, "runbook section 18")
+    result = search.result_dict(scored[0][1], scored[0][0],
+                                "runbook section 18")
+    canonical_claim_id = f"claim.{Path(rel).stem}.primary"
+    assert result["matched_claim"]["id"] == canonical_claim_id
+    fm, _body = wikifs.parse_frontmatter(read(cfg, rel))
+    assert any(item.get("note") == "Runbook section 18 confirms rollback."
+               for item in fm["claims"][0]["evidence"])
+
+    replacement = promote.supersede(
+        cfg, idx, evidence_id, "Runbook section 22 supersedes that guidance.")
+    assert replacement["result"] == "pending_review"
+    assert promote.approve(cfg, idx, replacement["id"])["ok"]
+    compiler.compile_wiki(cfg.wiki_root)
+    rows = [json.loads(line) for line in read(
+        cfg, compiler.CLAIMS_DIGEST_PATH).splitlines()]
+    canonical = next(item for item in rows
+                     if item.get("id") == canonical_claim_id)
+    notes = [item.get("note") for item in canonical["evidence"]]
+    assert "Runbook section 18 confirms rollback." not in notes
+    assert "Runbook section 22 supersedes that guidance." in notes
+
+
+def test_multi_claim_evidence_requires_claim_id(ready):
+    cfg, idx = ready
+    rel = "claims/multiple.md"
+    page = schema.page_frontmatter("claim", "Multiple", extras={
+        "claims": [
+            {"id": "claim.multiple.one", "text": "One", "evidence": []},
+            {"id": "claim.multiple.two", "text": "Two", "evidence": []},
+        ]})
+    Path(cfg.wiki_root, rel).write_text(
+        wikifs.render_page(page, "## Evidence\n"), encoding="utf-8")
+    idx.refresh()
+    cand_id = stage(cfg, idx, "Evidence for two.", target=rel,
+                    section="## Evidence")
+
+    ambiguous = promote.approve(cfg, idx, cand_id)
+    assert not ambiguous["ok"] and "set field claim_id" in ambiguous["error"]
+    targeted = promote.approve(
+        cfg, idx, cand_id,
+        overrides={"fields": {"claim_id": "claim.multiple.two"}})
+    assert targeted["ok"]
+    fm, _body = wikifs.parse_frontmatter(read(cfg, rel))
+    assert fm["claims"][0]["evidence"] == []
+    assert fm["claims"][1]["evidence"][0]["note"] == "Evidence for two."
+
+
+def test_reports_reject_candidate_promotions(ready):
+    cfg, idx = ready
+    report = Path(cfg.wiki_root) / "reports" / "claim-health.md"
+    fm = schema.page_frontmatter("report", "Claim health")
+    report.write_text(wikifs.render_page(fm, "## Notes\n"), encoding="utf-8")
+    cid = stage(cfg, idx, "Do not mix human promotion writes into reports.",
+                target="reports/claim-health.md")
+
+    result = promote.approve(cfg, idx, cid)
+
+    assert not result["ok"]
+    assert result["error"] == (
+        "reports/ is compiler-owned and cannot receive promotions")
+    assert "Do not mix" not in report.read_text(encoding="utf-8")
 
 
 def test_reject_then_promote_fails(ready):

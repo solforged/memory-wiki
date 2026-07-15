@@ -160,6 +160,10 @@ class QmdBackend:
                 out.update(id=rec.cand_id, status=rec.status, kind=rec.kind,
                            created=rec.created,
                            content_hash=rec.content_hash)
+            from . import search as local_search
+            local_search.add_claim_details(
+                out, rec, query, context=out.get("snippet", ""),
+                fallback_single=True)
             results.append(out)
             seen.add(rel)
             if len(results) >= result_limit:

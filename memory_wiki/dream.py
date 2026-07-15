@@ -35,13 +35,13 @@ _WEIGHTS = {
 
 
 def run(cfg, index, limit=None, apply_safe=False, actor="tool", session_id="",
-        write_report=False):
+        write_report=False, scheduled=False):
     """Return a curation plan, optionally applying conservative promotions.
 
     ``apply_safe`` promotes only suggestions marked ``safe_apply``. It never
     rejects candidates, retargets candidates, or promotes knowledge pages.
     """
-    plan = build_plan(cfg, index, limit=limit)
+    plan = build_plan(cfg, index, limit=limit, scheduled=scheduled)
     applied = []
     if apply_safe:
         for suggestion in plan["suggestions"]:
@@ -77,7 +77,40 @@ def run(cfg, index, limit=None, apply_safe=False, actor="tool", session_id="",
     return plan
 
 
-def build_plan(cfg, index, limit=None):
+def run_sweep(cfg, index, limit=None, apply_safe=False, actor="tool",
+              session_id="", write_report=False, now=None,
+              scheduled=False):
+    """Run one serialized light -> REM -> deep sweep.
+
+    Light and REM only derive and record advisory reinforcement. The existing
+    deep pass remains the sole phase allowed to promote, through ``apply_safe``.
+    """
+    from . import dream_phases
+
+    def run_phase(phase, completed):
+        if phase == "light":
+            return dream_phases.run_light(
+                cfg, index, limit=limit, now=now)
+        if phase == "rem":
+            return dream_phases.run_rem(
+                cfg, completed["light"], limit=limit, now=now)
+        return run(
+                cfg, index, limit=limit, apply_safe=apply_safe, actor=actor,
+                session_id=session_id, write_report=write_report,
+                scheduled=scheduled)
+
+    phases = dream_phases.run_tracked(
+        cfg, ("light", "rem", "deep"), run_phase, now=now)
+    return {
+        "phase_order": ["light", "rem", "deep"],
+        "light": phases["light"],
+        "rem": phases["rem"],
+        "deep": phases["deep"],
+        "status": dream_phases.status(cfg),
+    }
+
+
+def build_plan(cfg, index, limit=None, scheduled=False):
     """Pure-ish planner over the current pending candidate queue."""
     if index is not None:
         index.refresh()
@@ -85,7 +118,9 @@ def build_plan(cfg, index, limit=None):
     max_items = _coerce_limit(limit, getattr(cfg, "dream_limit", 50))
     stale_days = getattr(cfg, "candidate_stale_days", 30)
     from . import recall
+    from . import dream_phases
     signal_by_id = recall.all_metrics(cfg)
+    phase_by_id = dream_phases.all_signals(cfg)
     rank_by_id = {}
     for cand in pending_all:
         loaded = candidates.load(cfg, cand["id"])
@@ -93,7 +128,8 @@ def build_plan(cfg, index, limit=None):
         cand["grounded"] = _grounded_evidence(
             cand.get("origin"), evidence, cand.get("content", ""))
         rank_by_id[cand["id"]] = promotion_score(
-            cfg, cand, signals=signal_by_id.get(cand["id"]))
+            cfg, cand, signals=signal_by_id.get(cand["id"]),
+            phase_signals=phase_by_id.get(cand["id"]), scheduled=scheduled)
     pending = sorted(
         pending_all,
         key=lambda cand: (
@@ -130,13 +166,13 @@ def build_plan(cfg, index, limit=None):
         "pending": len(pending_all),
         "considered": len(pending),
         "limit": max_items,
-        "promotion_policy": _policy(cfg),
+        "promotion_policy": _policy(cfg, scheduled=scheduled),
         "summary": summary,
         "suggestions": suggestions,
     }
 
 
-def explain(cfg, index, cand_id):
+def explain(cfg, index, cand_id, scheduled=False):
     """Explain one candidate's current promotion score and recommendation."""
     if index is not None:
         index.refresh()
@@ -150,7 +186,7 @@ def explain(cfg, index, cand_id):
     evidence = loaded[3] if loaded else []
     cand["grounded"] = _grounded_evidence(
         cand.get("origin"), evidence, cand.get("content", ""))
-    ranking = promotion_score(cfg, cand)
+    ranking = promotion_score(cfg, cand, scheduled=scheduled)
     suggestion = None
     if cand.get("status") == "pending":
         pending = candidates.list_candidates(cfg, statuses=("pending",))
@@ -390,8 +426,18 @@ def _grounded_evidence(origin, evidence, content):
     return len(content_tokens & source_tokens) / len(content_tokens) >= 0.7
 
 
-def _policy(cfg):
+def _policy(cfg, scheduled=False):
+    if scheduled:
+        return {
+            "mode": "scheduled",
+            "min_score": 0.80,
+            "min_recall_count": 3,
+            "min_unique_queries": 3,
+            "recency_half_life_days": max(1, int(
+                getattr(cfg, "dream_recency_half_life_days", 14))),
+        }
     return {
+        "mode": "manual",
         "min_score": max(0.0, min(1.0, float(
             getattr(cfg, "dream_min_score", 0.75)))),
         "min_recall_count": max(0, int(
@@ -403,10 +449,12 @@ def _policy(cfg):
     }
 
 
-def promotion_score(cfg, cand, signals=None):
+def promotion_score(cfg, cand, signals=None, phase_signals=None, now=None,
+                    scheduled=False):
     """OpenClaw-style evidence score and independent threshold gates."""
-    from . import recall
+    from . import dream_phases, recall
 
+    policy = _policy(cfg, scheduled=scheduled)
     signals = (recall.metrics(cfg, cand.get("id", ""))
                if signals is None else signals)
     expected_hash = (candidates.content_hash(cand.get("content", ""))
@@ -427,7 +475,7 @@ def promotion_score(cfg, cand, signals=None):
     diversity = min(1.0, context_diversity / 5.0)
     recency = _recency(
         signals.get("last_recalled_at") or signals.get("last_recalled"),
-        _policy(cfg)["recency_half_life_days"])
+        policy["recency_half_life_days"])
     consolidation = _consolidation(recall_days)
     conceptual = min(1.0, len(set(cand.get("topics") or [])) / 6.0)
     components = {
@@ -438,9 +486,13 @@ def promotion_score(cfg, cand, signals=None):
         "consolidation": consolidation,
         "conceptual": conceptual,
     }
-    score = min(1.0, sum(_WEIGHTS[key] * components[key]
-                         for key in _WEIGHTS))
-    policy = _policy(cfg)
+    base_score = min(1.0, sum(_WEIGHTS[key] * components[key]
+                              for key in _WEIGHTS))
+    if phase_signals is None:
+        phase_signals = dream_phases.all_signals(cfg).get(cand.get("id", ""))
+    reinforcement = dream_phases.score_reinforcement(
+        phase_signals, expected_hash, now=now)
+    score = min(1.0, base_score + reinforcement["total_boost"])
     gates = {
         "score": score >= policy["min_score"],
         "recall_count": recall_count >= policy["min_recall_count"],
@@ -449,6 +501,8 @@ def promotion_score(cfg, cand, signals=None):
     return {
         "eligible": all(gates.values()),
         "score": round(score, 4),
+        "base_score": round(base_score, 4),
+        "phase_reinforcement": reinforcement,
         "recall_count": recall_count,
         "unique_queries": unique_queries,
         "recall_days": recall_days,

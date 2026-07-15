@@ -5,9 +5,10 @@ directory and swallows import failures at debug level, so nothing here
 may depend on third-party packages.
 
 Frontmatter parsing/rendering stays compatible with the wiki's own
-``_scripts/check.py`` YAML-subset parser. One extension beyond it: a
-single level of nested mappings, used only by candidate files in
-``_inbox/`` (which check.py never reads).
+``_scripts/check.py`` YAML-subset parser. Extensions beyond it are a
+single level of nested mappings and inline JSON values. The latter
+allows structured claims while leaving the house-style scalar lists
+unchanged.
 """
 
 from __future__ import annotations
@@ -44,8 +45,9 @@ def parse_frontmatter(text):
 
     Mirrors check.py: ``key: value`` scalars, inline ``[a, b]`` lists,
     unindented ``- item`` continuations, ``  # comment`` stripping, and
-    a bare ``key:`` yielding ``[]``. Extension: 2-space-indented
-    ``sub: val`` lines under a bare key form a one-level dict.
+    a bare ``key:`` yielding ``[]``. Extensions: 2-space-indented
+    ``sub: val`` lines under a bare key form a one-level dict, and valid
+    inline JSON arrays/objects retain nested values and numeric types.
     """
     if not text.startswith("---\n"):
         return None, text
@@ -70,7 +72,7 @@ def parse_frontmatter(text):
                         continue  # malformed: dict line after list items
                     fm[key] = {}
                 k2, _, v2 = stripped.partition(":")
-                fm[key][k2.strip()] = _parse_scalar(v2.strip())
+                fm[key][k2.strip()] = _parse_value(v2.strip())
             continue
         if ":" not in line:
             continue
@@ -83,6 +85,17 @@ def parse_frontmatter(text):
 def _parse_value(val):
     if val == "":
         return []  # may become a dash-list, a dict, or stay empty (check.py compat)
+    if ((val.startswith("[") and val.endswith("]"))
+            or (val.startswith("{") and val.endswith("}"))):
+        try:
+            decoded = json.loads(val)
+            # Scalar lists belong to the original check.py-compatible
+            # syntax. Only nested sequences opt into JSON typing.
+            if isinstance(decoded, dict) or any(
+                    isinstance(item, (dict, list)) for item in decoded):
+                return decoded
+        except (json.JSONDecodeError, TypeError):
+            pass
     if val == "{}":
         return {}
     if val.startswith("[") and val.endswith("]"):
@@ -124,7 +137,7 @@ def render_frontmatter(fm):
     for k, v in fm.items():
         validate_frontmatter_value(k)
         validate_frontmatter_value(v)
-        if isinstance(v, dict):
+        if isinstance(v, dict) and _is_flat_scalar_mapping(v):
             if not v:
                 out.append(f"{k}: {{}}")
             else:
@@ -132,11 +145,28 @@ def render_frontmatter(fm):
                 for k2, v2 in v.items():
                     out.append(f"  {k2}: {_render_scalar(v2)}")
         elif isinstance(v, (list, tuple)):
-            out.append(f"{k}: [" + ", ".join(_render_scalar(i) for i in v) + "]")
+            if any(isinstance(item, (dict, list, tuple)) for item in v):
+                out.append(f"{k}: {_render_json(v)}")
+            elif any("," in str(item) for item in v):
+                out.append(f"{k}:")
+                out.extend(f"- {_render_scalar(item)}" for item in v)
+            else:
+                out.append(f"{k}: [" + ", ".join(_render_scalar(i) for i in v) + "]")
+        elif isinstance(v, dict):
+            out.append(f"{k}: {_render_json(v)}")
         else:
             out.append(f"{k}: {_render_scalar(v)}")
     out.append("---")
     return "\n".join(out) + "\n"
+
+
+def _is_flat_scalar_mapping(value):
+    return all(not isinstance(item, (dict, list, tuple))
+               for item in value.values())
+
+
+def _render_json(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def validate_frontmatter_value(value):
@@ -176,6 +206,46 @@ def atomic_write(path, text):
     finally:
         os.close(fd)
     os.replace(tmp, path)
+
+
+def write_if_changed(path, text):
+    """Atomically write text only when its bytes changed. Returns bool."""
+    path = Path(path)
+    if read_text(path) == text:
+        return False
+    atomic_write(path, text)
+    return True
+
+
+def replace_managed_markdown_block(original, heading, start_marker,
+                                   end_marker, body):
+    """Replace one generated block while preserving all human content.
+
+    A half-present marker pair is rejected because guessing ownership could
+    destroy a hand-edited report. When no markers exist, the block is added
+    beneath an existing heading or appended with a new heading.
+    """
+    original = str(original or "")
+    body = str(body or "").rstrip("\n")
+    if start_marker in body or end_marker in body:
+        raise ValueError("managed block body contains its ownership marker")
+    start = original.find(start_marker)
+    end = original.find(end_marker)
+    if (start < 0) != (end < 0):
+        raise ValueError("managed Markdown block has an incomplete marker pair")
+    block = f"{start_marker}\n{body}\n{end_marker}" if body else \
+        f"{start_marker}\n{end_marker}"
+    if start >= 0:
+        if end < start:
+            raise ValueError("managed Markdown block markers are out of order")
+        end += len(end_marker)
+        rendered = original[:start] + block + original[end:]
+    else:
+        base = original.rstrip("\n")
+        heading_re = re.compile(rf"^{re.escape(heading)}[ \t]*$", re.MULTILINE)
+        addition = block if heading_re.search(base) else f"{heading}\n\n{block}"
+        rendered = f"{base}\n\n{addition}" if base else addition
+    return rendered.rstrip("\n") + "\n"
 
 
 def create_exclusive(path, text):
@@ -280,7 +350,7 @@ def slugify(text, max_len=60):
 
 
 def today():
-    """Local ISO date; wiki `created` dates are user-local."""
+    """Local ISO date; wiki `createdAt` dates are user-local."""
     return datetime.now().strftime("%Y-%m-%d")
 
 

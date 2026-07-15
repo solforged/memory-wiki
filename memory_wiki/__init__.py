@@ -44,6 +44,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._mutation_generation = 0
         self._status_callback = None
+        self._hermes_home = None
 
     # -- required contract -------------------------------------------------
 
@@ -63,13 +64,25 @@ class MemoryWikiProvider(MemoryProvider):
         self.platform = kwargs.get("platform", "")
         self.state = hooks.SessionState()
         self.read_only = kwargs.get("agent_context", "primary") in READ_ONLY_CONTEXTS
-        self.cfg = mw_config.load_config(kwargs.get("hermes_home"), self._overrides)
+        hermes_home = kwargs.get("hermes_home")
+        self._hermes_home = self._resolve_hermes_home(hermes_home)
+        self.cfg = mw_config.load_config(self._hermes_home, self._overrides)
         if not self.read_only:
             try:
                 scaffold.ensure_runtime(self.cfg)
             except OSError as e:
                 logger.warning("memory-wiki: cannot prepare %s: %s",
                                self.cfg.wiki_root, e)
+            if bool(getattr(self.cfg, "auto_compile", True)):
+                try:
+                    self._compile_wiki()
+                except Exception as e:
+                    logger.warning("memory-wiki: initial compile failed: %s", e)
+            try:
+                self._reconcile_schedule()
+            except Exception as e:
+                logger.warning(
+                    "memory-wiki: dream schedule reconcile failed: %s", e)
         self.index = WikiIndex(self.cfg.wiki_root)
         try:
             self.index.refresh()
@@ -246,12 +259,15 @@ class MemoryWikiProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_cache.clear()
 
-    def on_wiki_mutation(self):
+    def on_wiki_mutation(self, *, force_compile=False):
         """Invalidate all derived recall state after a successful write."""
         with self._prefetch_lock:
             self._mutation_generation += 1
             self._prefetch_cache.clear()
+        compile_step = (self._compile_wiki if force_compile or bool(
+            getattr(self.cfg, "auto_compile", True)) else None)
         steps = (
+            ("compile", compile_step),
             ("index refresh", self.index.refresh if self.index is not None
              else None),
             ("embedding sync", self.embed.request_sync
@@ -268,6 +284,27 @@ class MemoryWikiProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("memory-wiki: %s after mutation failed: %s",
                                label, e)
+
+    def _compile_wiki(self):
+        from . import compiler
+        return compiler.compile_wiki(self.cfg.wiki_root)
+
+    def _reconcile_schedule(self):
+        from . import scheduler
+        result = scheduler.reconcile(self.cfg, self._hermes_home)
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+        return result
+
+    @staticmethod
+    def _resolve_hermes_home(value=None):
+        if value:
+            return Path(value).expanduser()
+        try:
+            from hermes_constants import get_hermes_home
+            return Path(get_hermes_home()).expanduser()
+        except Exception:
+            return Path.home() / ".hermes"
 
     # -- lifecycle hooks (delegated; must never raise into the agent loop) ----
 

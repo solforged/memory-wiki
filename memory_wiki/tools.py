@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 CANDIDATE_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8,8}-\d{2}$")
 _MAX_GET_LINES = 400
+_MAX_DIGEST_BYTES = 5_000_000
 
 WIKI_SEARCH_SCHEMA = {
     "name": "wiki_search",
@@ -52,7 +53,8 @@ WIKI_GET_SCHEMA = {
         "('claims/foo.md', 'journal/2026-07-05.md', '_inbox/<file>.md'), a "
         "candidate id, or the specials 'status' (provider health + counts), "
         "'review-queue' (pending and approved candidates), 'dream' "
-        "(scored curation plan), "
+        "(scored deep-curation plan), 'dream-state' (phase reinforcement), "
+        "'compiler' (claim digest health), "
         "'decisions' (audit tail)."),
     "parameters": {
         "type": "object",
@@ -103,7 +105,8 @@ WIKI_APPLY_SCHEMA = {
         "immediately unless and_promote=false (approve again later to "
         "promote). supersede replaces an outdated promoted memory (id = "
         "the old candidate) with new content, in place. dream returns a "
-        "curation plan and can apply conservative profile/agent promotions."),
+        "phase result and only deep/all can apply conservative profile/agent "
+        "promotions."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -138,10 +141,17 @@ WIKI_APPLY_SCHEMA = {
                             "description": "approve: promote now (default true)."},
             "limit": {"type": "integer", "minimum": 1,
                       "description": "dream: max pending candidates to inspect."},
+            "phase": {"type": "string",
+                      "enum": ["light", "rem", "deep", "all"],
+                      "description": "dream: phase to run (default deep)."},
             "apply_safe": {"type": "boolean",
                            "description": "dream: promote only recall-qualified profile/agent suggestions."},
             "write_report": {"type": "boolean",
                              "description": "dream: append the review plan to DREAMS.md."},
+            "scheduled": {"type": "boolean",
+                          "description": "dream: use stricter scheduled thresholds."},
+            "compile": {"type": "boolean",
+                        "description": "dream: compile claim artifacts afterward."},
         },
         "required": ["action"],
     },
@@ -208,17 +218,42 @@ def _get(provider, args):
         return _get_review_queue(provider, args)
     if ref == "dream":
         return _get_dream(provider)
+    if ref == "dream-state":
+        return _get_dream_state(provider)
+    if ref == "compiler":
+        return _get_compiler(provider)
     if ref == "decisions":
         return _get_decisions(provider)
     root = provider.cfg.wiki_root
+    claim_match = None
     if CANDIDATE_ID.match(ref):
         matches = sorted(Path(root, schema.INBOX_DIR).glob(f"{ref}-*.md"))
-        if not matches:
+        if matches:
+            ref = f"{schema.INBOX_DIR}/{matches[0].name}"
+        else:
+            claim_match = _resolve_claim_ref(root, ref)
+        if claim_match and claim_match.get("ambiguous"):
+            return err(f"claim id {claim_match['id']} is ambiguous",
+                       claim_id=claim_match["id"],
+                       owners=claim_match["owners"],
+                       match_count=claim_match.get("match_count", 0))
+        if not matches and not claim_match:
             return err(f"no candidate with id {ref}")
-        ref = f"{schema.INBOX_DIR}/{matches[0].name}"
+        if claim_match:
+            ref = claim_match["pagePath"]
+    elif not ref.endswith(".md"):
+        claim_match = _resolve_claim_ref(root, ref)
+        if claim_match and claim_match.get("ambiguous"):
+            return err(f"claim id {claim_match['id']} is ambiguous",
+                       claim_id=claim_match["id"],
+                       owners=claim_match["owners"],
+                       match_count=claim_match.get("match_count", 0))
+        if claim_match:
+            ref = claim_match["pagePath"]
     if not ref.endswith(".md"):
         return err("ref must be a .md path, a candidate id, or one of "
-                   "status | review-queue | dream | decisions")
+                   "status | review-queue | dream | dream-state | compiler | "
+                   "decisions")
     path = wikifs.safe_wiki_path(root, ref)
     text = wikifs.read_text(path)
     if text is None:
@@ -227,11 +262,52 @@ def _get(provider, args):
     start = max(int(args.get("start_line") or 1), 1)
     count = min(int(args.get("max_lines") or _MAX_GET_LINES), _MAX_GET_LINES)
     window = lines[start - 1:start - 1 + count]
-    return ok(ref=ref, total_lines=len(lines), start_line=start,
-              content="\n".join(window))
+    payload = {
+        "ref": ref,
+        "total_lines": len(lines),
+        "start_line": start,
+        "content": "\n".join(window),
+    }
+    if claim_match:
+        payload["claim_id"] = claim_match.get("id")
+        payload["claim"] = claim_match
+    return ok(**payload)
+
+
+def _resolve_claim_ref(wiki_root, claim_id):
+    """Resolve one structured claim id from the bounded compiler artifact."""
+    from . import compiler
+
+    claim_id = str(claim_id or "").strip()
+    if not claim_id:
+        return None
+    path = Path(wiki_root) / compiler.CLAIMS_DIGEST_PATH
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_DIGEST_BYTES:
+            return None
+        matches = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict) and item.get("id") == claim_id \
+                    and isinstance(item.get("pagePath"), str):
+                matches.append(item)
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item["pagePath"])
+        owners = sorted({item["pagePath"] for item in matches})
+        if len(matches) > 1:
+            return {"id": claim_id, "ambiguous": True, "owners": owners,
+                    "match_count": len(matches)}
+        return matches[0]
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
 
 
 def _get_status(provider):
+    from . import dream_phases, scheduler
+
     provider.index.refresh()
     counts = provider.index.counts()
     by_status = {}
@@ -244,6 +320,10 @@ def _get_status(provider):
     qmd_backend = getattr(provider, "qmd", None)
     qmd = qmd_backend.status() if qmd_backend is not None else {
         "enabled": False}
+    compiler = _compiler_status(provider.cfg)
+    dream_state = dream_phases.status(provider.cfg)
+    schedule = scheduler.status(
+        provider.cfg, hermes_home=getattr(provider, "_hermes_home", None))
     return ok(ref="status",
               wiki_root=str(provider.cfg.wiki_root),
               read_only=provider.read_only,
@@ -251,14 +331,19 @@ def _get_status(provider):
               search_backend=str(getattr(provider.cfg, "search_backend", "local")),
               last_search_backend=provider.last_search_backend,
               qmd=qmd,
+              compiler=compiler,
+              dream=dream_state,
+              schedule=schedule,
               pages={k: v for k, v in sorted(counts.items()) if k != "candidate"},
               candidates=by_status,
               prompt_block_chars=len(provider.system_prompt_block()),
               config={k: getattr(provider.cfg, k) for k in
                       ("auto_capture", "llm_extraction", "search_backend",
+                       "auto_compile",
                        "journal_episodes",
                        "prefetch_limit", "max_candidates_per_session",
-                       "candidate_stale_days", "dream_limit")})
+                       "candidate_stale_days", "dream_limit",
+                       "dream_schedule_enabled", "dream_schedule")})
 
 
 def _get_review_queue(provider, args=None):
@@ -281,6 +366,59 @@ def _get_dream(provider):
     result = dream.run(provider.cfg, provider.index, apply_safe=False,
                        actor="tool", session_id=provider.session_id)
     return ok(ref="dream", **result)
+
+
+def _get_dream_state(provider):
+    from . import dream_phases
+    return ok(ref="dream-state", **dream_phases.status(provider.cfg))
+
+
+def _get_compiler(provider):
+    return ok(ref="compiler", **_compiler_status(provider.cfg))
+
+
+def _compiler_status(cfg):
+    from . import compiler
+
+    path = Path(cfg.wiki_root) / compiler.AGENT_DIGEST_PATH
+    base = {
+        "available": False,
+        "path": compiler.AGENT_DIGEST_PATH,
+        "claims_path": compiler.CLAIMS_DIGEST_PATH,
+        "page_count": 0,
+        "claim_count": 0,
+        "page_counts": {},
+        "claim_health": {},
+        "contradiction_clusters": 0,
+        "error": "",
+    }
+    try:
+        if not path.is_file():
+            return base
+        if path.stat().st_size > _MAX_DIGEST_BYTES:
+            return {**base, "error": "compiler digest exceeded size limit"}
+        digest = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(digest, dict):
+            raise ValueError("compiler digest was not an object")
+        page_counts = digest.get("pageCounts")
+        page_counts = page_counts if isinstance(page_counts, dict) else {}
+        clusters = digest.get("contradictionClusters")
+        clusters = clusters if isinstance(clusters, list) else []
+        health = digest.get("claimHealth")
+        health = health if isinstance(health, dict) else {}
+        return {
+            **base,
+            "available": True,
+            "page_count": sum(
+                value for value in page_counts.values()
+                if isinstance(value, int) and not isinstance(value, bool)),
+            "claim_count": max(0, int(digest.get("claimCount") or 0)),
+            "page_counts": page_counts,
+            "claim_health": health,
+            "contradiction_clusters": len(clusters),
+        }
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return {**base, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _get_decisions(provider):
@@ -370,15 +508,64 @@ def _apply(provider, args):
                   note="pending human review")
 
     if action == "dream":
-        from . import dream
+        from . import dream, dream_phases
         provider.index.refresh()
-        result = dream.run(cfg, provider.index, limit=args.get("limit"),
-                           apply_safe=_bool_arg(args, "apply_safe", False),
-                           write_report=_bool_arg(args, "write_report", False),
-                           actor="tool", session_id=session)
-        if any(a.get("ok") for a in result.get("applied", [])):
-            provider.on_wiki_mutation()
-        return ok(action=action, **result)
+        phase = str(args.get("phase") or "deep").strip().lower()
+        if phase not in ("light", "rem", "deep", "all"):
+            return err("dream phase must be light, rem, deep, or all")
+        apply_safe = _bool_arg(args, "apply_safe", False)
+        write_report = _bool_arg(args, "write_report", False)
+        scheduled = _bool_arg(args, "scheduled", False)
+        compile_requested = _bool_arg(args, "compile", False)
+        if phase in ("light", "rem") and (apply_safe or write_report):
+            return err("apply_safe and write_report require deep or all")
+        if phase in ("light", "rem") and scheduled:
+            return err("scheduled policy requires deep or all")
+
+        limit = args.get("limit")
+        if phase == "light":
+            phases = dream_phases.run_tracked(
+                cfg, ("light",),
+                lambda _phase, _completed: dream_phases.run_light(
+                    cfg, provider.index, limit=limit))
+            result = phases["light"]
+            deep_result = {}
+        elif phase == "rem":
+            def run_phase(name, completed):
+                if name == "light":
+                    return dream_phases.run_light(
+                        cfg, provider.index, limit=limit)
+                return dream_phases.run_rem(
+                    cfg, completed["light"], limit=limit)
+
+            phases = dream_phases.run_tracked(
+                cfg, ("light", "rem"), run_phase)
+            result = {"phase_order": ["light", "rem"],
+                      "light": phases["light"], "rem": phases["rem"]}
+            deep_result = {}
+        elif phase == "all":
+            result = dream.run_sweep(
+                cfg, provider.index, limit=limit, apply_safe=apply_safe,
+                write_report=write_report, actor="tool", session_id=session,
+                scheduled=scheduled)
+            deep_result = result.get("deep") or {}
+        else:
+            phases = dream_phases.run_tracked(
+                cfg, ("deep",),
+                lambda _phase, _completed: dream.run(
+                    cfg, provider.index, limit=limit,
+                    apply_safe=apply_safe, write_report=write_report,
+                    actor="tool", session_id=session, scheduled=scheduled))
+            result = phases["deep"]
+            deep_result = result
+
+        changed = any(
+            item.get("ok") for item in deep_result.get("applied", []))
+        if changed or write_report or compile_requested:
+            provider.on_wiki_mutation(force_compile=compile_requested)
+        payload = dict(result)
+        payload.setdefault("phase", phase)
+        return ok(action=action, **payload)
 
     if action in ("approve", "reject", "supersede"):
         cand_id = (args.get("id") or "").strip()

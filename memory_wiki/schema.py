@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from . import wikifs
+from . import claims, wikifs
 
 # -- page types (check.py mirror + memory extensions) ---------------------
 
@@ -18,13 +18,14 @@ DIR_TYPE = {
     "claims": "claim", "concepts": "concept", "sources": "source",
     "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",
     "profile": "profile", "journal": "journal", "tastes": "taste",
+    "reports": "report",
 }
 TYPE_DIR = {v: k for k, v in DIR_TYPE.items()}
 KNOWLEDGE_TYPES = ("concept", "claim", "source", "atlas", "synthesis", "ref",
-                   "taste")
+                   "taste", "report")
 MEMORY_TYPES = ("profile", "journal")
 
-REQUIRED = ["type", "title", "topics", "created"]
+REQUIRED = ["type", "title", "topics"]
 EXTRA_REQUIRED = {
     "claim": ["stance", "confidence", "maturity"],
     "source": ["author", "medium"],
@@ -54,7 +55,8 @@ EVIDENCE_HEADING = "## Evidence"
 
 # extra frontmatter keys allowed in candidate `fields` for new-page promotion
 FIELDS_ALLOWLIST = ("author", "medium", "year", "url", "aliases", "ref",
-                    "supports", "contradicts", "stance", "maturity", "status")
+                    "supports", "contradicts", "stance", "maturity", "status",
+                    "claim_id")
 
 INBOX_DIR = "_inbox"
 DECISIONS_FILE = "_inbox/decisions.jsonl"
@@ -96,14 +98,14 @@ def profile_seed(filename, created=None):
     created = created or wikifs.today()
     title, headings = _PROFILE_SEEDS[filename]
     fm = {"type": "profile", "title": title, "topics": ["profile"],
-          "created": created, "updated": created}
+          "createdAt": created, "updated": created}
     body = "\n\n".join(headings) + "\n"
     return fm, body
 
 
 def journal_frontmatter(date_str):
     return {"type": "journal", "title": date_str, "topics": ["journal"],
-            "created": date_str}
+            "createdAt": date_str}
 
 
 def journal_seed_body():
@@ -131,6 +133,7 @@ def page_frontmatter(ntype, title, topics=None, created=None, extras=None):
         fm["maturity"] = extras.get("maturity", "seedling")
         fm["supports"] = extras.get("supports", [])
         fm["contradicts"] = extras.get("contradicts", [])
+        fm["claims"] = extras.get("claims", [])
     elif ntype == "source":
         fm["author"] = extras.get("author", "")
         if extras.get("year"):
@@ -147,9 +150,12 @@ def page_frontmatter(ntype, title, topics=None, created=None, extras=None):
         fm["status"] = extras.get("status", "draft")
         fm["claims"] = extras.get("claims", [])
         fm["topics"] = topics
-    else:  # atlas, profile, journal
+    elif ntype == "report":
         fm["topics"] = topics
-    fm["created"] = created
+        fm["status"] = extras.get("status", "published")
+    else:  # atlas, profile, journal, taste
+        fm["topics"] = topics
+    fm["createdAt"] = created
     if ntype == "profile":
         fm["updated"] = extras.get("updated", created)
     return fm
@@ -176,16 +182,26 @@ def validate_page(relpath, text):
             continue  # warning-only in check.py
         if field not in fm or fm[field] in ("", []):
             errors.append(f"{relpath}: missing or empty field '{field}'")
+    if not fm.get("createdAt") and not fm.get("created"):
+        errors.append(f"{relpath}: missing or empty field 'createdAt'")
     if fm.get("type") != ntype:
         errors.append(f"{relpath}: type '{fm.get('type')}' but lives in {d}/ "
                       f"(expected '{ntype}')")
-    created = fm.get("created", "")
-    if isinstance(created, str) and created and not DATE.match(created):
-        errors.append(f"{relpath}: created '{created}' is not an ISO date")
+    created_at = fm.get("createdAt") or fm.get("created") or ""
+    if isinstance(created_at, str) and created_at and not DATE.match(created_at):
+        errors.append(
+            f"{relpath}: createdAt '{created_at}' is not an ISO date")
     for field, allowed in ENUMS.items():
         val = fm.get(field)
         if isinstance(val, str) and val and val not in allowed:
             errors.append(f"{relpath}: {field} '{val}' not in {sorted(allowed)}")
+    structured_claims = fm.get("claims")
+    legacy_synthesis_refs = (
+        ntype == "synthesis" and isinstance(structured_claims, list)
+        and not any(isinstance(item, dict) for item in structured_claims))
+    if "claims" in fm and not legacy_synthesis_refs:
+        errors.extend(f"{relpath}: {error}"
+                      for error in claims.validate_claims(structured_claims))
     return errors
 
 

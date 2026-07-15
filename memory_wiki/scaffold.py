@@ -11,7 +11,7 @@ from . import schema, wikifs
 
 logger = logging.getLogger(__name__)
 
-RUNTIME_DIRS = ("profile", "journal", schema.INBOX_DIR)
+RUNTIME_DIRS = ("profile", "journal", "reports", schema.INBOX_DIR)
 
 # Exact anchor in ~/wiki/_scripts/check.py (verified against the file).
 CHECK_ANCHOR = (
@@ -20,24 +20,47 @@ CHECK_ANCHOR = (
 )
 CHECK_REPLACEMENT = (
     '    "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",\n'
+    '    "reports": "report",  # memory-wiki\n'
     '    "profile": "profile", "journal": "journal", "tastes": "taste",  # memory-wiki\n'
     '}'
 )
-CHECK_SENTINEL = '"profile": "profile"'
+CHECK_SENTINEL = '"reports": "report"'
+LEGACY_CHECK_SENTINEL = '"profile": "profile"'
+LEGACY_CHECK_LINE = (
+    '    "profile": "profile", "journal": "journal", "tastes": "taste",  # memory-wiki\n'
+)
+
+# Current ~/wiki validator anchors. New pages use createdAt, while existing
+# pages may retain the former created field.
+CHECK_DATE_REQUIRED_ANCHOR = (
+    'REQUIRED = {"type", "title", "topics", "createdAt"}'
+)
+CHECK_DATE_REQUIRED_REPLACEMENT = 'REQUIRED = {"type", "title", "topics"}'
+CHECK_DATE_ANCHOR = '''        created_at = fm.get("createdAt")
+        if (created_at and
+                (not isinstance(created_at, str) or not DATE.fullmatch(created_at))):
+            errors.append(f"{rel}: invalid createdAt {created_at!r}")'''
+CHECK_DATE_REPLACEMENT = '''        # memory-wiki: legacy-created-compat
+        created_at = fm.get("createdAt") or fm.get("created")
+        if not created_at:
+            errors.append(f"{rel}: missing or empty createdAt")
+        elif not isinstance(created_at, str) or not DATE.fullmatch(created_at):
+            errors.append(f"{rel}: invalid createdAt {created_at!r}")'''
+CHECK_DATE_FALLBACK = 'fm.get("createdAt") or fm.get("created")'
 
 STYLE_GUIDE_SECTION = f"""
 {schema.STYLE_GUIDE_BEGIN}
 ## Agent memory extensions
 
-Two additional types are maintained by the hermes memory-wiki plugin.
+Additional types are maintained by the hermes memory-wiki plugin.
 profile/ holds two singleton pages (user.md, agent.md): living context,
 jointly edited by human and agent, `updated` bumped on write. journal/
 holds one page per day, named by ISO date (the one sanctioned exception
 to the no-dates filename rule); episodic, append-mostly. _inbox/ is
 infrastructure (staged memory candidates awaiting review), not notes.
-Knowledge types (concepts/claims/sources/atlases/syntheses/refs) are
-never written directly by automation: captures stage into _inbox/ and
-reach pages only through review (`hermes memory-wiki review`).
+Knowledge captures stage into _inbox/ and reach pages only through review
+(`hermes memory-wiki review`). reports/ contains compiler-owned health
+dashboards; generated blocks are replaceable, human blocks are preserved.
 {schema.STYLE_GUIDE_END}
 """
 
@@ -103,11 +126,38 @@ def _patch_check_py(root, dry_run):
     old = wikifs.read_text(path)
     if old is None:
         return "no-file", ""
-    if CHECK_SENTINEL in old:
+    new = old
+    if CHECK_SENTINEL not in new:
+        if LEGACY_CHECK_SENTINEL in new and LEGACY_CHECK_LINE in new:
+            new = new.replace(
+                LEGACY_CHECK_LINE,
+                '    "reports": "report",  # memory-wiki\n' + LEGACY_CHECK_LINE,
+                1)
+        elif CHECK_ANCHOR in new:
+            new = new.replace(CHECK_ANCHOR, CHECK_REPLACEMENT, 1)
+        else:
+            return "anchor-missing", _diff(
+                "check.py", CHECK_ANCHOR, CHECK_REPLACEMENT)
+
+    date_compatible = (CHECK_DATE_REQUIRED_REPLACEMENT in new
+                       and CHECK_DATE_FALLBACK in new)
+    if not date_compatible and "createdAt" in new:
+        if (CHECK_DATE_REQUIRED_ANCHOR not in new
+                or CHECK_DATE_ANCHOR not in new):
+            expected = (CHECK_DATE_REQUIRED_ANCHOR + "\n" +
+                        CHECK_DATE_ANCHOR + "\n")
+            replacement = (CHECK_DATE_REQUIRED_REPLACEMENT + "\n" +
+                           CHECK_DATE_REPLACEMENT + "\n")
+            return "anchor-missing", _diff(
+                "check.py createdAt compatibility", expected, replacement)
+        new = new.replace(
+            CHECK_DATE_REQUIRED_ANCHOR,
+            CHECK_DATE_REQUIRED_REPLACEMENT,
+            1)
+        new = new.replace(CHECK_DATE_ANCHOR, CHECK_DATE_REPLACEMENT, 1)
+
+    if new == old:
         return "already", ""
-    if CHECK_ANCHOR not in old:
-        return "anchor-missing", _diff("check.py", CHECK_ANCHOR, CHECK_REPLACEMENT)
-    new = old.replace(CHECK_ANCHOR, CHECK_REPLACEMENT, 1)
     diff = _diff("_scripts/check.py", old, new)
     if not dry_run:
         wikifs.atomic_write(path, new)
@@ -119,9 +169,20 @@ def _append_style_guide(root, dry_run):
     old = wikifs.read_text(path)
     if old is None:
         return "no-file", ""
-    if schema.STYLE_GUIDE_BEGIN in old:
-        return "already", ""
-    new = old.rstrip("\n") + "\n" + STYLE_GUIDE_SECTION
+    begin = schema.STYLE_GUIDE_BEGIN
+    end = schema.STYLE_GUIDE_END
+    if begin in old and end in old:
+        start = old.index(begin)
+        stop = old.index(end, start) + len(end)
+        replacement = STYLE_GUIDE_SECTION.strip("\n")
+        new = old[:start] + replacement + old[stop:]
+        if new == old:
+            return "already", ""
+    elif begin in old or end in old:
+        return "anchor-missing", _diff(
+            "_meta/style-guide.md", old, old.rstrip("\n") + "\n" + STYLE_GUIDE_SECTION)
+    else:
+        new = old.rstrip("\n") + "\n" + STYLE_GUIDE_SECTION
     diff = _diff("_meta/style-guide.md", old, new)
     if not dry_run:
         wikifs.atomic_write(path, new)

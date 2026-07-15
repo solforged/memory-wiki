@@ -13,6 +13,7 @@ shape). Cosine is pure Python: at wiki scale (hundreds of notes,
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import sqlite3
@@ -42,8 +43,13 @@ def default_cache_path(wiki_root):
 
 def record_text(rec):
     """Canonical text embedded for one record, without body truncation."""
+    claim_text = json.dumps(
+        getattr(rec, "claims", []) or [], ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"))
+    if claim_text == "[]":
+        claim_text = ""
     return " | ".join(x for x in (
-        rec.title, " ".join(rec.topics), rec.body) if x)
+        rec.title, " ".join(rec.topics), rec.body, claim_text) if x)
 
 
 def record_key(rec):

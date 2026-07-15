@@ -1,0 +1,14 @@
+{
+  "name": "memory-wiki",
+  "label": "Memory wiki",
+  "description": "Claim health, dream phases, promotion queue, and QMD status.",
+  "icon": "Database",
+  "version": "0.2.0",
+  "tab": {
+    "path": "/memory-wiki",
+    "position": "after:analytics"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

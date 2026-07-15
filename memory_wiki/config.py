@@ -35,6 +35,7 @@ class MemoryWikiConfig:
     qmd_embed_interval_seconds: int = 3600
     qmd_rerank: bool = True
     qmd_state_dir: str = ""
+    auto_compile: bool = True
     journal_episodes: bool = True
     prefetch_limit: int = 5
     prefetch_char_budget: int = 1200
@@ -49,6 +50,8 @@ class MemoryWikiConfig:
     dream_min_recall_count: int = 3
     dream_min_unique_queries: int = 2
     dream_recency_half_life_days: int = 14
+    dream_schedule_enabled: bool = False
+    dream_schedule: str = "0 3 * * *"
     backup_include_wiki: bool = True
 
 

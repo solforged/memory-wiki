@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from memory_wiki import schema, search, wikifs
+from memory_wiki.embed import record_text
 from memory_wiki.index import WikiIndex, tokenize
 
 
@@ -45,6 +46,22 @@ def test_index_refresh_add_change_delete(fixture_wiki, make_page):
     p.unlink()
     idx.refresh()
     assert "concepts/spaced-repetition.md" not in idx.pages
+
+
+def test_index_does_not_follow_page_symlinks(fixture_wiki, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        "---\ntype: concept\ntitle: Private\ntopics: []\ncreatedAt: 2026-07-14\n---\n"
+        "secret-symlink-token\n",
+        encoding="utf-8",
+    )
+    (fixture_wiki / "concepts" / "private.md").symlink_to(outside)
+
+    index = WikiIndex(fixture_wiki)
+    index.refresh()
+
+    assert "concepts/private.md" not in index.pages
+    assert search.score_records(index, "secret symlink token") == []
 
 
 def test_index_keeps_full_body_without_expanding_lexical_cap(
@@ -122,6 +139,43 @@ def test_result_dict_claim_metadata(fixture_wiki):
     d = search.result_dict(scored[0][1], scored[0][0], "small tools")
     assert d["ref"] == "claims/small-tools-beat-frameworks.md"
     assert d["confidence"] == "likely" and d["maturity"] == "seedling"
+
+
+def test_structured_claims_and_evidence_are_searchable(fixture_wiki, make_page):
+    make_page(
+        fixture_wiki, "concepts/release-policy.md", "concept", "Release policy",
+        extras={}, body="A short human summary.\n")
+    path = fixture_wiki / "concepts" / "release-policy.md"
+    fm, body = wikifs.parse_frontmatter(path.read_text(encoding="utf-8"))
+    fm["claims"] = [{
+        "id": "claim.release.quorum",
+        "text": "Production deploys require a starlight quorum.",
+        "status": "supported",
+        "confidence": 0.82,
+        "evidence": [{
+            "kind": "runbook", "sourceId": "source.release-runbook",
+            "note": "Operator policy for midnight releases.",
+        }],
+    }]
+    wikifs.atomic_write(path, wikifs.render_page(fm, body))
+
+    index = WikiIndex(fixture_wiki)
+    index.refresh()
+    scored = search.score_records(index, "starlight quorum")
+    assert scored[0][1].rel == "concepts/release-policy.md"
+    result = search.result_dict(scored[0][1], scored[0][0], "starlight quorum")
+    assert "starlight quorum" in record_text(scored[0][1]).lower()
+    assert result["snippet"] == "Production deploys require a starlight quorum."
+    assert result["matched_claim"] == {
+        "id": "claim.release.quorum",
+        "text": "Production deploys require a starlight quorum.",
+        "status": "supported",
+        "confidence": 0.82,
+        "evidence_kinds": ["runbook"],
+        "evidence_source_ids": ["source.release-runbook"],
+    }
+    evidence_hit = search.score_records(index, "operator midnight releases")
+    assert evidence_hit[0][1].rel == "concepts/release-policy.md"
 
 
 def test_prefetch_block_shape_and_budget(fixture_wiki, cfg, make_page):

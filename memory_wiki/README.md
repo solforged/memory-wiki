@@ -1,8 +1,8 @@
 # memory-wiki
 
 Hermes memory provider that replaces the built-in MEMORY.md/USER.md with a
-plaintext wiki. No database: markdown files, one advisory lock, one JSONL audit
-log.
+plaintext wiki. Markdown is authoritative; JSON, JSONL, QMD, and dashboard
+state are derived or advisory.
 
 This combines active memory and wiki curation in one Hermes provider. OpenClaw's
 bundled `memory-wiki` has a different boundary: its active memory backend owns
@@ -14,13 +14,16 @@ claims, digests, and dashboards. See
   `profile/agent.md` (the agent's notes) are living pages, injected into the
   system prompt under char budgets. `journal/YYYY-MM-DD.md` holds timestamped
   notes and one episode per session.
-- **Knowledge base**: the wiki's six types (concepts, claims, sources, atlases,
-  syntheses, refs) following the wiki's own `_meta/style-guide.md` and validated
-  by its `_scripts/check.py`.
-- **Review-first writes**: automation never edits knowledge pages. Auto-captured
-  facts and proposed page changes are staged as one-file candidates in
+- **Knowledge base**: typed concepts, claims, sources, atlases, syntheses,
+  refs, tastes, and generated reports, following the wiki's own
+  `_meta/style-guide.md` and validated by `_scripts/check.py`.
+- **Review-first writes**: automation never silently edits human-authored
+  knowledge pages. Auto-captured facts and proposed page changes are staged in
   `_inbox/`, and reach pages only through approval (`wiki_apply approve`,
   `hermes memory-wiki review`, or your editor).
+- **Derived health**: a deterministic compiler produces machine digests and
+  Markdown reports. A read-only Hermes dashboard presents compiler, dream,
+  queue, scheduler, and QMD state.
 
 ## Install
 
@@ -36,6 +39,8 @@ memory:
   memory_enabled: false # built-in MEMORY.md off (this replaces it)
   user_profile_enabled: false # built-in USER.md off
 plugins:
+  enabled:
+    - memory-wiki # required for the dashboard tab and API
   memory-wiki:
     wiki_root: ~/wiki
 ```
@@ -46,6 +51,26 @@ check.py and style guide):
 ```bash
 hermes memory-wiki init          # add --dry-run to preview
 ```
+
+## Curation skill
+
+The plugin owns a companion `memory-wiki` skill under
+`memory_wiki/skills/research/memory-wiki/`. Expose that directory through
+Hermes's external-skill mechanism so the skill appears in the normal skill
+index and can be loaded automatically for wiki work:
+
+```yaml
+skills:
+  external_dirs:
+    - /path/to/memory-wiki/memory_wiki/skills
+  disabled:
+    - llm-wiki
+```
+
+The stock `llm-wiki` skill assumes a different repository architecture
+(`raw/`, `SCHEMA.md`, and `log.md`). Disable it for profiles that use this
+plugin to avoid conflicting curation procedures. Restart the session or
+gateway after changing skill configuration.
 
 ## Tools (model-facing)
 
@@ -104,6 +129,11 @@ first run may download large local models. Increase `qmd_timeout_seconds` for
 that mode on slower machines. `wiki_get status` and `hermes memory-wiki status`
 expose QMD availability and state.
 
+QMD is only a retrieval sidecar. It ranks and excerpts Markdown, including
+generated report pages, while the in-memory index enforces corpus, type, and
+candidate-state visibility. It never becomes the claim or promotion source of
+truth. The compiler does not depend on QMD.
+
 ### Local semantic recall
 
 Embeddings are optional and local: `fastembed` (ONNX, `BAAI/bge-small-en-v1.5`
@@ -120,6 +150,7 @@ state as `embedding_state`.
 ```
 hermes memory-wiki init [--wiki-root PATH] [--dry-run]
 hermes memory-wiki status
+hermes memory-wiki compile
 hermes memory-wiki review [--list] [--kind KIND] [--confidence-filter LEVEL]
                           [--target-filter PATH | --effective-target PATH]
                           [--stale-only] [--min-age DAYS] [--limit N]
@@ -127,8 +158,11 @@ hermes memory-wiki review [--approve ID | --reject ID --reason R]
 hermes memory-wiki review FILTERS
                           [--approve-filtered | --reject-filtered] --yes
 hermes memory-wiki review --prune [--days N]
-hermes memory-wiki dream [--limit N] [--apply-safe] [--report]
+hermes memory-wiki dream [--phase light|rem|deep|all] [--limit N]
+                         [--apply-safe] [--report] [--scheduled]
+                         [--compile] [--quiet]
 hermes memory-wiki dream --explain ID
+hermes memory-wiki schedule [--enable | --disable] [--cron EXPRESSION]
 hermes memory-wiki lint
 ```
 
@@ -154,6 +188,7 @@ batch mutations require at least one filter plus `--yes`.
 | `qmd_embed_interval_seconds`      | `3600`                   | semantic embedding refresh interval                        |
 | `qmd_rerank`                      | `true`                   | rerank `query` results                                     |
 | `qmd_state_dir`                   | empty                    | private QMD state override                                 |
+| `auto_compile`                    | `true`                   | refresh compiler artifacts after wiki mutations            |
 | `journal_episodes`                | `true`                   | session episode at session end                             |
 | `prefetch_limit`                  | `5`                      | max recall results per turn                                |
 | `prefetch_char_budget`            | `1200`                   | recall block cap (chars)                                   |
@@ -168,18 +203,71 @@ batch mutations require at least one filter plus `--yes`.
 | `dream_min_recall_count`          | `3`                      | minimum organic recalls                                    |
 | `dream_min_unique_queries`        | `2`                      | minimum distinct hashed queries                            |
 | `dream_recency_half_life_days`    | `14`                     | recall freshness half-life                                 |
+| `dream_schedule_enabled`          | `false`                  | reconcile one managed Hermes dream job                     |
+| `dream_schedule`                  | `0 3 * * *`              | managed job cron expression                                |
 | `backup_include_wiki`             | `true`                   | include wiki_root in `hermes backup`                       |
 
-## Dreaming / curation
+## Structured claims and compiler
 
-`hermes memory-wiki dream` is the conservative consolidation pass. It does not
-write by default. It groups similar pending candidates, flags items already
-covered by existing pages (`reject_covered`) and candidates pending longer than
-`candidate_stale_days` (`reject_stale`), suggests better targets, and separates
-knowledge-page candidates from direct profile/agent memories. Corrections that
-overlap an existing memory get `supersede_existing`, never a reject suggestion:
-token overlap cannot tell confirmation from contradiction. The output is a
-review plan with exact follow-up commands where useful.
+Typed pages use `createdAt: YYYY-MM-DD` for new creation dates. Legacy
+`created` remains readable. `hermes memory-wiki init` updates the wiki checker
+to accept that fallback without changing existing pages. Pages may carry a
+JSON-compatible `claims` list in frontmatter. `text` is required. `id`,
+`status`, numeric `confidence` from 0 to 1, `updatedAt`, and `evidence` are
+optional. Claim IDs, when present, use
+`claim.<namespace>.<local-name>`, with kebab-case inside each component.
+Missing status normalizes to `supported`. Evidence may record `kind`,
+`sourceId`, `path`, `lines`, `weight`, `confidence`, `privacyTier`, `note`, and
+`updatedAt`.
+
+```yaml
+claims: [{"id":"claim.deploy.rollback-required","text":"Rollback is required before retrying a failed deploy.","status":"supported","confidence":0.9,"evidence":[{"kind":"source","sourceId":"runbook.deploy","path":"sources/deploy-runbook.md","lines":"18-24","updatedAt":"2026-07-14"}],"updatedAt":"2026-07-14"}]
+```
+
+Legacy claim pages remain valid. The compiler derives one claim from the page
+title and `## Evidence` when no structured claims exist.
+
+Promoting into `## Evidence` updates both Markdown and structured provenance.
+For a page with multiple structured claims, target one explicitly with
+`--field claim_id=CLAIM_ID`. Supersession updates the canonical claim or
+evidence record, not only its prose marker. Duplicate claim IDs are reported as
+ambiguous by `wiki_get`.
+
+`hermes memory-wiki compile` writes only changed files while holding the wiki
+lock:
+
+- `.memory-wiki/cache/agent-digest.json`
+- `.memory-wiki/cache/claims.jsonl`
+- `reports/open-questions.md`
+- `reports/contradictions.md`
+- `reports/low-confidence.md`
+- `reports/claim-health.md`
+- `reports/stale-pages.md`
+- `reports/provenance-coverage.md`
+- `reports/privacy-review.md`
+
+Report managed blocks are replaceable. Human-authored blocks are preserved.
+Freshness is fresh below 30 days, aging at 30 to 89 days, stale at 90 days, and
+unknown without a usable timestamp. A repeated claim ID forms a contradiction
+cluster only when its normalized text or status differs. `auto_compile` keeps
+artifacts current after plugin-owned mutations.
+
+## Dreaming and curation
+
+`hermes memory-wiki dream` defaults to the conservative deep planning pass and
+does not write. `--phase all` runs one serialized light, REM, deep sweep:
+
+- Light ranks and deduplicates pending candidates from organic recall evidence.
+- REM derives recurring themes and a bounded set of lasting-truth suggestions.
+- Deep groups overlaps, flags covered or stale items, suggests targets, scores
+  promotion, and remains the only phase allowed to write via `--apply-safe`.
+
+Light and REM reinforcement lives in bounded `.memory-wiki/dream-state.json`.
+It is bound to exact candidate content and changed recall evidence, decays with
+a 14-day half-life, and contributes at most `0.06` plus `0.09` to the deep
+score. `DREAMS.md` is report output only and is never read as dream input.
+Corrections overlapping existing memory get `supersede_existing`, not an
+automatic rejection, because token overlap cannot establish contradiction.
 
 `--apply-safe` is deliberately narrow: it only promotes pending high-confidence
 `preference` or `note` candidates whose default target is `profile/user.md` or
@@ -199,6 +287,33 @@ rechecks candidate state, content hash, and safe routing while holding the write
 lock. `--explain ID` shows the gates. `--report` appends a human-readable
 `DREAMS.md` entry, which is never a promotion input.
 
+Manual gates use the configured defaults: score `0.75`, three recalls, and two
+distinct query hashes. `--scheduled` uses fixed stricter gates: `0.80`, three,
+and three. The distinction prevents a relaxed interactive config from silently
+weakening unattended promotion.
+
+## Managed schedule
+
+`hermes memory-wiki schedule --enable` reconciles one Hermes no-agent cron job,
+disabled by default and scheduled for `0 3 * * *`. `--cron EXPRESSION` changes
+the schedule and accepts recurring cron expressions only. With no mutation
+flag, the command reports current state.
+`--disable` removes the managed job and script, including obsolete per-phase
+jobs.
+
+Each run performs ordered light, REM, and deep phases with safe apply, scheduled
+gates, compilation, and quiet success output. There are never three independent
+phase jobs that could overlap.
+
+## Dashboard
+
+The plugin contributes a native Hermes dashboard tab at `/memory-wiki`, after
+Analytics. It is a read-only overview of claim health, compiler artifacts,
+reports, dream phases, managed scheduling, pending candidates, and QMD state.
+The bundled UI also has a standalone legacy fallback. Both read the native
+dashboard plugin API and never mutate the wiki. Restart or rescan the Hermes
+dashboard after first enabling the extension.
+
 ## Safety and retry behavior
 
 Automatic capture, model extraction, session excerpts, staging, and direct
@@ -206,8 +321,9 @@ writes reject obvious credentials and private keys. Turn and session caps apply
 across deterministic and LLM extraction together. Direct profile and journal
 writes carry hidden retry markers, so repeated tool deliveries do not duplicate
 content. Reusing an explicit idempotency key with different content is an error.
-Any successful mutation clears prefetch state and refreshes the active search
-backend.
+Any successful mutation refreshes compiler output before the active search
+backend, then clears prefetch state. This makes generated reports immediately
+searchable and invalidates QMD maintenance state.
 
 ## Concurrency model
 

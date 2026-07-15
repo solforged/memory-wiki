@@ -15,6 +15,13 @@ from . import candidates, layers, safety, schema, wikifs
 
 logger = logging.getLogger(__name__)
 
+_CLAIM_CONFIDENCE = {
+    "speculative": 0.25,
+    "plausible": 0.5,
+    "likely": 0.75,
+    "confident": 0.9,
+}
+
 # kind -> (target rel, section) when the candidate has no explicit target
 ROUTES = {
     "preference": ("profile/user.md", "## Preferences"),
@@ -241,7 +248,8 @@ def promote(cfg, index, cand_id, actor="tool", session_id="",
                            "section": route.get("section", "")})
         try:
             if route["mode"] == "append":
-                result = _promote_append(cfg, cand_id, content, route,
+                result = _promote_append(cfg, cand_id, fm, content, evidence,
+                                         route,
                                          supersedes=fm.get("supersedes", ""))
             else:
                 result = _promote_new_page(
@@ -309,6 +317,8 @@ def _resolve(cfg, fm, content):
     d = target.split("/", 1)[0]
     if d not in schema.DIR_TYPE:
         return {"error": f"target must be inside a type folder: {target}"}
+    if d == "reports":
+        return {"error": "reports/ is compiler-owned and cannot receive promotions"}
     if d == "journal" and target.endswith(".md"):
         return {"mode": "append", "target": target,
                 "section": section or schema.JOURNAL_NOTES,
@@ -336,7 +346,8 @@ def _title_from(content):
 
 # -- writers (wiki lock already held) ------------------------------------------
 
-def _promote_append(cfg, cand_id, content, route, supersedes=""):
+def _promote_append(cfg, cand_id, candidate_fm, content, evidence, route,
+                    supersedes=""):
     rel, section = route["target"], route.get("section") or "## Notes"
     if candidates.page_shaped(content):
         raise ValueError(f"page-shaped content needs a new-page target, "
@@ -348,8 +359,19 @@ def _promote_append(cfg, cand_id, content, route, supersedes=""):
             "a one-line content override")
     marker = schema.candidate_marker(cand_id)
     existing = wikifs.read_text(Path(cfg.wiki_root) / rel) or ""
-    if marker in existing:
+    if marker in existing or schema.promoted_comment(cand_id) in existing:
         return {"ok": True, "target": rel, "result": "already_promoted"}
+    page_fm, _body = wikifs.parse_frontmatter(existing)
+    structured = (page_fm or {}).get("claims")
+    if isinstance(structured, list) and any(
+            isinstance(item, dict) for item in structured):
+        if supersedes:
+            return _supersede_structured(
+                cfg, cand_id, candidate_fm, content, rel, section,
+                supersedes)
+        if section == schema.EVIDENCE_HEADING:
+            return _append_structured_evidence(
+                cfg, cand_id, candidate_fm, content, rel, section)
     if supersedes:
         prefix = f"{wikifs.local_hhmm()} " if rel.startswith("journal/") else ""
         entry = f"- {prefix}{content} {marker}"
@@ -370,6 +392,170 @@ def _promote_append(cfg, cand_id, content, route, supersedes=""):
     return {"ok": True, "target": rel}
 
 
+def _supersede_structured(cfg, cand_id, candidate_fm, content, rel, section,
+                          old_id):
+    """Replace one structured claim or evidence record atomically."""
+    path = Path(cfg.wiki_root) / rel
+    text = wikifs.read_text(path)
+    page_fm, body = wikifs.parse_frontmatter(text or "")
+    if page_fm is None:
+        raise ValueError(f"target has no frontmatter: {rel}")
+    structured = page_fm.get("claims")
+    if not isinstance(structured, list):
+        raise ValueError(f"target has no structured claims: {rel}")
+
+    old_loaded = candidates.load(cfg, old_id)
+    old_fields = old_loaded[1].get("fields") or {} if old_loaded else {}
+    generated_id = str(old_fields.get("claim_id") or "").strip()
+    if not generated_id:
+        generated_id = f"claim.{Path(rel).stem}.primary"
+    created_page = schema.promoted_comment(old_id) in body
+    claim_matches = ([index for index, claim in enumerate(structured)
+                      if isinstance(claim, dict)
+                      and str(claim.get("id") or "") == generated_id]
+                     if created_page else [])
+    if len(claim_matches) > 1:
+        raise ValueError(f"claim id {generated_id} is ambiguous in {rel}")
+    old_content = old_loaded[2] if old_loaded else ""
+    if claim_matches:
+        index = claim_matches[0]
+        old_claim = structured[index]
+        replacement = _structured_claim(
+            candidate_fm, content, [f"supersedes {old_id}"], generated_id)
+        structured[index] = replacement
+        old_text = str(old_claim.get("text") or old_content)
+        if old_text and old_text in body:
+            body = body.replace(old_text, content, 1)
+        old_marker = schema.promoted_comment(old_id)
+        new_marker = schema.promoted_comment(cand_id)
+        body = (body.replace(old_marker, new_marker, 1)
+                if old_marker in body
+                else body.rstrip() + "\n\n" + new_marker + "\n")
+        page_fm["claims"] = structured
+        if "confidence" in page_fm:
+            page_fm["confidence"] = candidate_fm.get(
+                "confidence", page_fm["confidence"])
+        _touch_frontmatter(page_fm)
+        _write_validated_page(path, rel, page_fm, body)
+        return {"ok": True, "target": rel, "result": "replaced"}
+
+    claim_index = _structured_claim_index(page_fm, candidate_fm, rel)
+    claim = structured[claim_index]
+    evidence = claim.get("evidence")
+    evidence = list(evidence) if isinstance(evidence, list) else []
+    normalized_old = " ".join(str(old_content).split())
+    matches = [index for index, item in enumerate(evidence)
+               if isinstance(item, dict)
+               and " ".join(str(item.get("note") or "").split())
+               == normalized_old]
+    if len(matches) > 1:
+        raise ValueError(
+            f"evidence for candidate {old_id} is ambiguous in {rel}")
+    replacement = _structured_evidence(cand_id, candidate_fm, content)
+    if matches:
+        evidence[matches[0]] = replacement
+    else:
+        evidence.append(replacement)
+    claim = dict(claim)
+    claim["evidence"] = evidence
+    claim["updatedAt"] = wikifs.today()
+    structured[claim_index] = claim
+    page_fm["claims"] = structured
+    old_marker = schema.candidate_marker(old_id)
+    new_entry = f"- {content} {schema.candidate_marker(cand_id)}"
+    body, replaced = _replace_body_marker(body, old_marker, new_entry)
+    if not replaced:
+        body = layers._append_under(body, section, new_entry)
+    _touch_frontmatter(page_fm)
+    _write_validated_page(path, rel, page_fm, body)
+    return {"ok": True, "target": rel, "result": "replaced"}
+
+
+def _append_structured_evidence(cfg, cand_id, candidate_fm, content, rel,
+                                section):
+    path = Path(cfg.wiki_root) / rel
+    text = wikifs.read_text(path)
+    page_fm, body = wikifs.parse_frontmatter(text or "")
+    if page_fm is None:
+        raise ValueError(f"target has no frontmatter: {rel}")
+    structured = list(page_fm.get("claims") or [])
+    claim_index = _structured_claim_index(page_fm, candidate_fm, rel)
+    claim = dict(structured[claim_index])
+    evidence = claim.get("evidence")
+    evidence = list(evidence) if isinstance(evidence, list) else []
+    item = _structured_evidence(cand_id, candidate_fm, content)
+    if item not in evidence:
+        evidence.append(item)
+    claim["evidence"] = evidence
+    claim["updatedAt"] = wikifs.today()
+    structured[claim_index] = claim
+    page_fm["claims"] = structured
+    body = layers._append_under(
+        body, section, f"- {content} {schema.candidate_marker(cand_id)}")
+    _touch_frontmatter(page_fm)
+    _write_validated_page(path, rel, page_fm, body)
+    return {"ok": True, "target": rel}
+
+
+def _structured_claim_index(page_fm, candidate_fm, rel):
+    structured = page_fm.get("claims")
+    structured = structured if isinstance(structured, list) else []
+    target_id = str(
+        (candidate_fm.get("fields") or {}).get("claim_id") or "").strip()
+    if target_id:
+        matches = [index for index, claim in enumerate(structured)
+                   if isinstance(claim, dict)
+                   and str(claim.get("id") or "") == target_id]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise ValueError(f"claim id {target_id} was not found in {rel}")
+        raise ValueError(f"claim id {target_id} is ambiguous in {rel}")
+    matches = [index for index, claim in enumerate(structured)
+               if isinstance(claim, dict)]
+    if len(matches) == 1:
+        return matches[0]
+    raise ValueError(
+        f"{rel} has {len(matches)} structured claims; set field claim_id")
+
+
+def _structured_evidence(cand_id, candidate_fm, content):
+    origin = str(candidate_fm.get("origin") or "unknown")
+    item = {
+        "kind": origin,
+        "note": content,
+        "updatedAt": wikifs.today(),
+    }
+    session = str(candidate_fm.get("session") or "").strip()
+    item["sourceId"] = (f"session:{candidates.session8(session)}" if session
+                        else f"candidate:{cand_id}")
+    return item
+
+
+def _replace_body_marker(body, old_marker, entry):
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if old_marker in line:
+            lines[index] = entry
+            return "\n".join(lines) + "\n", True
+    return body, False
+
+
+def _touch_frontmatter(fm):
+    if fm.get("type") == "profile" or "updated" in fm:
+        fm["updated"] = wikifs.today()
+    else:
+        fm["updatedAt"] = wikifs.today()
+
+
+def _write_validated_page(path, rel, fm, body):
+    new_text = wikifs.render_page(fm, body)
+    errors = schema.validate_page(rel, new_text)
+    if errors:
+        raise ValueError("; ".join(errors))
+    wikifs.atomic_write(path, new_text)
+
+
 def _replace_marker_line(cfg, rel, old_marker, entry):
     """Swap the bullet carrying old_marker for entry; False if absent.
     Caller holds the wiki lock."""
@@ -385,8 +571,7 @@ def _replace_marker_line(cfg, rel, old_marker, entry):
         if old_marker in line:
             lines[i] = entry
             break
-    if "updated" in fm:
-        fm["updated"] = wikifs.today()
+    _touch_frontmatter(fm)
     new_text = wikifs.render_page(fm, "\n".join(lines) + "\n")
     errors = schema.validate_page(rel, new_text)
     if errors:
@@ -426,8 +611,7 @@ def _append_to_page(cfg, rel, section, entry):
     if fm is None:
         raise ValueError(f"target has no frontmatter: {rel}")
     body = layers._append_under(body, section, entry)
-    if "updated" in fm:
-        fm["updated"] = wikifs.today()
+    _touch_frontmatter(fm)
     new_text = wikifs.render_page(fm, body)
     errors = schema.validate_page(rel, new_text)
     if errors:
@@ -457,6 +641,12 @@ def _promote_new_page(cfg, cand_id, fm, content, evidence, route):
                     "fields={'author': ..., 'medium': ...}"}
     if ntype == "claim":
         fields.setdefault("confidence", fm.get("confidence", "plausible"))
+        explicit_claim_id = str(fields.pop("claim_id", "") or "").strip()
+        generated_claim_id = f"claim.{Path(rel).stem}.primary"
+        fields.setdefault("claims", [
+            _structured_claim(
+                fm, content, evidence,
+                explicit_claim_id or generated_claim_id)])
     page_fm = schema.page_frontmatter(ntype, title,
                                       topics=fm.get("topics") or [],
                                       extras=fields)
@@ -467,6 +657,43 @@ def _promote_new_page(cfg, cand_id, fm, content, evidence, route):
         return {"ok": False, "error": "; ".join(errors)}
     wikifs.atomic_write(path, text)
     return {"ok": True, "target": rel}
+
+
+def _structured_claim(fm, content, evidence, claim_id):
+    """Structured claim provenance for a promoted plain-text candidate."""
+    updated_at = str(fm.get("created") or wikifs.today())
+    origin = str(fm.get("origin") or "unknown")
+    source_id = ""
+    if fm.get("session"):
+        source_id = f"session:{candidates.session8(fm.get('session'))}"
+    entries = []
+    seen = set()
+    for raw in evidence or []:
+        note = str(raw).lstrip(">- ").strip()
+        if not note or note in seen:
+            continue
+        seen.add(note)
+        item = {"kind": origin, "note": note, "updatedAt": updated_at}
+        if source_id:
+            item["sourceId"] = source_id
+        entries.append(item)
+    if not entries:
+        entries.append({
+            "kind": origin,
+            "note": f"captured via {origin}",
+            "updatedAt": updated_at,
+            **({"sourceId": source_id} if source_id else {}),
+        })
+    confidence = _CLAIM_CONFIDENCE.get(
+        str(fm.get("confidence") or "").strip().lower(), 0.5)
+    return {
+        "id": claim_id,
+        "text": content,
+        "status": "supported",
+        "confidence": confidence,
+        "evidence": entries,
+        "updatedAt": updated_at,
+    }
 
 
 def _promote_page_shaped(cfg, cand_id, content, rel, path):

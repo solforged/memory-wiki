@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import claims as claim_model
 from . import schema, wikifs
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class PageRecord:
     cand_id: str = ""           # candidates only
     content_hash: str = ""      # candidates only (dedup key)
     headings: list = field(default_factory=list)
+    claims: list = field(default_factory=list)
     body: str = ""              # full canonical, comment-stripped body
     body_head: str = ""         # first lines, comments stripped
     tokens: Counter = field(default_factory=Counter)
@@ -92,7 +94,8 @@ class WikiIndex:
             except OSError:
                 continue
             for p in entries:
-                if p.suffix != ".md" or p.name.startswith("."):
+                if (p.suffix != ".md" or p.name.startswith(".")
+                        or p.is_symlink()):
                     continue
                 rel = f"{d}/{p.name}"
                 seen.add(rel)
@@ -134,25 +137,27 @@ class WikiIndex:
             if isinstance(fm.get("topics"), list) else []
         aliases = [str(a) for a in fm.get("aliases", []) if a] \
             if isinstance(fm.get("aliases"), list) else []
+        structured_claims = claim_model.normalize_claims(fm.get("claims"))
+        claim_text = _claim_search_text(structured_claims)[:_BODY_CAP]
         headings = [h.strip("# ").strip()
                     for h in re.findall(
                         r"^#{2,4} .+$", indexed_body, re.MULTILINE)]
         rec = PageRecord(
             rel=rel, ntype=ntype, title=title, topics=topics, aliases=aliases,
-            created=str(fm.get("created") or ""),
+            created=str(fm.get("createdAt") or fm.get("created") or ""),
             confidence=str(fm.get("confidence") or ""),
             maturity=str(fm.get("maturity") or ""),
             status=str(fm.get("status") or "") if is_candidate else "",
             kind=str(fm.get("kind") or ""),
             cand_id=str(fm.get("id") or "") if is_candidate else "",
-            headings=headings,
+            headings=headings, claims=structured_claims,
             body=canonical_body,
             body_head=" ".join(indexed_body.split())[:400],
             mtime_ns=st.st_mtime_ns, size=st.st_size,
         )
         rec.tokens = Counter(
             tokenize(title) + tokenize(" ".join(topics + aliases + headings))
-            + tokenize(indexed_body))
+            + tokenize(indexed_body) + tokenize(claim_text))
         rec.title_tokens = frozenset(tokenize(title))
         rec.topic_tokens = frozenset(tokenize(" ".join(topics)))
         rec.alias_tokens = frozenset(tokenize(" ".join(aliases)))
@@ -197,3 +202,14 @@ class WikiIndex:
             key = rec.ntype or "?"
             by[key] = by.get(key, 0) + 1
         return by
+
+
+def _claim_search_text(claims):
+    values = []
+    for claim in claims:
+        values.extend(str(claim.get(field) or "")
+                      for field in ("id", "text", "status"))
+        for evidence in claim.get("evidence", []):
+            values.extend(str(evidence.get(field) or "") for field in (
+                "kind", "sourceId", "path", "lines", "privacyTier", "note"))
+    return " ".join(values)

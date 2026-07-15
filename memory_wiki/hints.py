@@ -46,14 +46,18 @@ def build_review_queue(cfg, index, filters=None, limit=None):
         if limit < 1:
             raise ValueError("review queue limit must be at least 1")
     pending = candidates.list_candidates(cfg, statuses=("pending",))
+    approved = candidates.list_candidates(cfg, statuses=("approved",))
+    reviewable = sorted(pending + approved, key=lambda item: item.get("ref", ""))
     stale_days = getattr(cfg, "candidate_stale_days", 30)
     items = [_review_item(cfg, index, cand, pending, stale_days)
-             for cand in pending]
+             for cand in reviewable]
     items = [item for item in items if _matches_filters(item, filters)]
     if limit is not None:
         items = items[:limit]
     summary = {
         "total_pending": len(pending),
+        "total_approved": len(approved),
+        "total_reviewable": len(reviewable),
         "matched": len(items),
         "stale_count": sum(1 for item in items if item["stale"]),
         "by_kind": _counts(items, "kind"),

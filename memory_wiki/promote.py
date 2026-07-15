@@ -7,10 +7,11 @@ decision in _inbox/decisions.jsonl.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
-from . import candidates, layers, schema, wikifs
+from . import candidates, layers, safety, schema, wikifs
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ ROUTES = {
 
 
 def approve(cfg, index, cand_id, overrides=None, and_promote=True,
-            actor="tool", session_id=""):
+            actor="tool", session_id="", precondition=None,
+            decision_detail=None):
     """Mark a candidate approved (optionally overriding content/target/
     fields), then promote unless and_promote=False."""
     overrides = dict(overrides or {})
@@ -53,9 +55,28 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
             return {"ok": False, "error":
                     f"{cand_id} was superseded ({fm.get('reviewed', '')}); "
                     "approving it would re-append stale content"}
+        if precondition is not None:
+            problem = precondition(fm, content, evidence)
+            if problem:
+                return {"ok": False, "error": str(problem)}
         content_override = str(overrides.pop("content", "") or "").strip()
         if content_override:
             content = content_override
+        override_metadata = json.dumps(overrides, ensure_ascii=False,
+                                       default=str)
+        try:
+            wikifs.validate_frontmatter_value(overrides)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if safety.contains_sensitive_content(content) \
+                or safety.contains_sensitive_content(override_metadata):
+            return {"ok": False,
+                    "error": "approval contains credential material"}
+        if overrides.get("section"):
+            try:
+                wikifs.validate_section_heading(overrides["section"])
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
         fm_overrides = {k: v for k, v in overrides.items()
                         if k in ("target", "section", "confidence", "topics")}
         if content_override:
@@ -77,10 +98,12 @@ def approve(cfg, index, cand_id, overrides=None, and_promote=True,
         candidates.record_unlocked(
             cfg, "approved", cand_id=cand_id,
             target=fm.get("target", ""), session=session_id,
-            actor=actor, chash=fm.get("hash", ""))
+            actor=actor, chash=fm.get("hash", ""),
+            detail=dict(decision_detail or {}))
     if not and_promote:
         return {"ok": True, "result": "approved", "id": cand_id}
-    return promote(cfg, index, cand_id, actor=actor, session_id=session_id)
+    return promote(cfg, index, cand_id, actor=actor, session_id=session_id,
+                   decision_detail=decision_detail)
 
 
 def supersede(cfg, index, old_id, content, confidence="", actor="tool",
@@ -132,6 +155,10 @@ def supersede(cfg, index, old_id, content, confidence="", actor="tool",
 
 
 def reject(cfg, cand_id, reason="", actor="tool", session_id=""):
+    if "\n" in str(reason) or "\r" in str(reason):
+        return {"ok": False, "error": "reject reason must be one line"}
+    if safety.contains_sensitive_content(reason):
+        return {"ok": False, "error": "reject reason contains credential material"}
     with wikifs.wiki_lock(cfg.wiki_root):
         loaded = candidates.load(cfg, cand_id)
         if loaded is None:
@@ -158,7 +185,8 @@ def reject(cfg, cand_id, reason="", actor="tool", session_id=""):
     return {"ok": True, "result": "rejected", "id": cand_id}
 
 
-def promote(cfg, index, cand_id, actor="tool", session_id=""):
+def promote(cfg, index, cand_id, actor="tool", session_id="",
+            decision_detail=None):
     """Write an approved (or pending, when invoked directly) candidate
     into its target and mark it promoted."""
     with wikifs.wiki_lock(cfg.wiki_root):
@@ -186,15 +214,38 @@ def promote(cfg, index, cand_id, actor="tool", session_id=""):
                 return {"ok": False, "error":
                         f"{old_id} is {old_status}; replacement already "
                         "claimed or no longer promotable"}
+        stored_metadata = json.dumps({
+            "target": fm.get("target", ""),
+            "section": fm.get("section", ""),
+            "topics": fm.get("topics", []),
+            "fields": fm.get("fields", {}),
+        }, ensure_ascii=False, default=str)
+        if safety.contains_sensitive_content(content) \
+                or any(safety.contains_sensitive_content(line)
+                       for line in evidence) \
+                or safety.contains_sensitive_content(stored_metadata):
+            return {"ok": False,
+                    "error": "candidate contains credential material"}
+        if fm.get("section"):
+            try:
+                wikifs.validate_section_heading(fm["section"])
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
         route = _resolve(cfg, fm, content)
         if "error" in route:
             return {"ok": False, "error": route["error"]}
+        if route.get("journal") and not fm.get("target"):
+            fm = candidates.set_status_unlocked(
+                cfg, path, fm, content, evidence, status,
+                overrides={"target": route["target"],
+                           "section": route.get("section", "")})
         try:
             if route["mode"] == "append":
                 result = _promote_append(cfg, cand_id, content, route,
                                          supersedes=fm.get("supersedes", ""))
             else:
-                result = _promote_new_page(cfg, cand_id, fm, content, route)
+                result = _promote_new_page(
+                    cfg, cand_id, fm, content, evidence, route)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
         if not result.get("ok"):
@@ -216,7 +267,8 @@ def promote(cfg, index, cand_id, actor="tool", session_id=""):
             target=result["target"], session=session_id,
             actor=actor, chash=fm.get("hash", ""),
             detail={"kind": fm.get("kind", ""),
-                    "result": result.get("result", "promoted")})
+                    "result": result.get("result", "promoted"),
+                    **dict(decision_detail or {})})
     if index is not None:
         try:
             index.refresh()
@@ -257,6 +309,10 @@ def _resolve(cfg, fm, content):
     d = target.split("/", 1)[0]
     if d not in schema.DIR_TYPE:
         return {"error": f"target must be inside a type folder: {target}"}
+    if d == "journal" and target.endswith(".md"):
+        return {"mode": "append", "target": target,
+                "section": section or schema.JOURNAL_NOTES,
+                "journal": True}
     if path.exists():
         default = schema.JOURNAL_NOTES if d == "journal" else "## Notes"
         return {"mode": "append", "target": target,
@@ -301,12 +357,14 @@ def _promote_append(cfg, cand_id, content, route, supersedes=""):
                                 schema.candidate_marker(supersedes), entry):
             return {"ok": True, "target": rel, "result": "replaced"}
         # old bullet was hand-edited away; fall through and append instead
-    if rel.startswith("profile/"):
-        page = "user" if rel.endswith("user.md") else "agent"
+    if rel in schema.PROFILE_PAGES:
+        page = "user" if rel == "profile/user.md" else "agent"
         layers.write_profile_unlocked(cfg, page, content, section=section,
                                       marker=marker)
     elif route.get("journal") or rel.startswith("journal/"):
-        rel = layers.append_journal_note_unlocked(cfg, content, marker=marker)
+        date_str = Path(rel).stem if rel.startswith("journal/") else None
+        rel = layers.append_journal_note_unlocked(
+            cfg, content, date_str=date_str, marker=marker)
     else:
         _append_to_page(cfg, rel, section, f"- {content} {marker}")
     return {"ok": True, "target": rel}
@@ -377,7 +435,7 @@ def _append_to_page(cfg, rel, section, entry):
     wikifs.atomic_write(path, new_text)
 
 
-def _promote_new_page(cfg, cand_id, fm, content, route):
+def _promote_new_page(cfg, cand_id, fm, content, evidence, route):
     rel, ntype, title = route["target"], route["ntype"], route["title"]
     path = Path(cfg.wiki_root) / rel
     existing = wikifs.read_text(path)
@@ -402,7 +460,7 @@ def _promote_new_page(cfg, cand_id, fm, content, route):
     page_fm = schema.page_frontmatter(ntype, title,
                                       topics=fm.get("topics") or [],
                                       extras=fields)
-    body = _new_page_body(cand_id, fm, content, ntype)
+    body = _new_page_body(cand_id, fm, content, evidence, ntype)
     text = wikifs.render_page(page_fm, body)
     errors = schema.validate_page(rel, text)
     if errors:
@@ -427,14 +485,20 @@ def _promote_page_shaped(cfg, cand_id, content, rel, path):
     return {"ok": True, "target": rel}
 
 
-def _new_page_body(cand_id, fm, content, ntype):
+def _new_page_body(cand_id, fm, content, evidence, ntype):
     parts = [content, ""]
     if ntype == "claim":
         created = fm.get("created") or wikifs.today()
         s8 = candidates.session8(fm.get("session", ""))
-        parts += ["## Evidence",
-                  f"- [[journal/{created}|journal]] - captured in "
-                  f"conversation, session {s8}",
+        captured = [str(line).lstrip(">- ").strip() for line in evidence
+                    if str(line).lstrip(">- ").strip()]
+        if fm.get("session"):
+            captured.append(
+                f"captured via {fm.get('origin') or 'unknown'}, session {s8}")
+        if not captured:
+            captured = [f"captured via {fm.get('origin') or 'unknown'} on "
+                        f"{created}"]
+        parts += ["## Evidence", *[f"- {line}" for line in captured],
                   "", "## Open questions", ""]
     parts.append(schema.promoted_comment(cand_id))
     return "\n".join(parts) + "\n"

@@ -70,6 +70,8 @@ def test_index_candidates_and_hashes(fixture_wiki):
     assert len(idx.pending_candidates()) == 1
     assert idx.pending_candidates()[0].cand_id == CID1
     assert idx.candidate_hashes == {"h01", "h02"}
+    assert all("Evidence" not in rec.body for rec in cands)
+    assert all("quote" not in rec.tokens for rec in cands)
 
 
 def test_taste_page_indexed_and_searchable(fixture_wiki, make_page):
@@ -216,15 +218,140 @@ def test_provider_prefetch_caches(fixture_wiki, tmp_path, monkeypatch):
         overrides={"wiki_root": str(fixture_wiki)})
     provider.initialize("sess-1", hermes_home=str(tmp_path), platform="cli")
     calls = []
-    real = search.prefetch_block
-    monkeypatch.setattr(search, "prefetch_block",
+    real = search.prefetch_results_block
+    monkeypatch.setattr(search, "prefetch_results_block",
                         lambda *a, **k: calls.append(1) or real(*a, **k))
     b1 = provider.prefetch("zettelkasten notes", session_id="s")
     b2 = provider.prefetch("zettelkasten notes", session_id="s")
     assert b1 == b2 and len(calls) == 1
-    provider.prefetch("different query entirely", session_id="s")
+    written = json.loads(provider.handle_tool_call(
+        "wiki_apply", {"action": "append_journal", "content": "Cache reset"}))
+    assert written["ok"]
+    provider.prefetch("zettelkasten notes", session_id="s")
     assert len(calls) == 2
+    provider.prefetch("different query entirely", session_id="s")
+    assert len(calls) == 3
     assert provider.prefetch("", session_id="s") == ""
+
+
+def test_prefetch_records_only_candidate_results_injected(
+        fixture_wiki, tmp_path, monkeypatch):
+    import memory_wiki
+    from memory_wiki import recall
+
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False,
+        "prefetch_limit": 1})
+    provider.initialize("recall-session", hermes_home=str(tmp_path),
+                        platform="cli")
+    hidden = {
+        "type": "candidate", "id": "hidden", "status": "pending",
+        "kind": "note", "created": wikifs.today(), "snippet": "hidden",
+    }
+    stale = dict(hidden, id="stale", created="2000-01-01")
+    page = {"type": "concept", "ref": "concepts/zettelkasten.md",
+            "title": "Zettelkasten", "snippet": "visible page"}
+    monkeypatch.setattr(provider, "search_results",
+                        lambda *args, **kwargs: [stale, page, hidden])
+    assert "visible page" in provider.prefetch("first", session_id="s")
+    assert recall.metrics(provider.cfg, "stale")["recall_count"] == 0
+    assert recall.metrics(provider.cfg, "hidden")["recall_count"] == 0
+
+    provider.clear_prefetch_cache()
+    monkeypatch.setattr(provider, "search_results",
+                        lambda *args, **kwargs: [hidden])
+    provider.prefetch("second", session_id="s")
+    assert recall.metrics(provider.cfg, "hidden")["recall_count"] == 1
+
+
+def test_recall_telemetry_failures_do_not_break_search_or_prefetch(
+        fixture_wiki, tmp_path, monkeypatch):
+    import memory_wiki
+    from memory_wiki import recall
+
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("telemetry-session", hermes_home=str(tmp_path),
+                        platform="cli")
+    monkeypatch.setattr(recall, "record",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            OSError("telemetry unavailable")))
+
+    results = provider.search_results("zettelkasten", limit=1)
+    assert results and results[0]["ref"] == "concepts/zettelkasten.md"
+
+    visible = {
+        "type": "candidate", "id": "visible", "status": "pending",
+        "kind": "note", "created": wikifs.today(),
+        "snippet": "visible candidate",
+    }
+    monkeypatch.setattr(provider, "search_results",
+                        lambda *args, **kwargs: [visible])
+    assert "visible candidate" in provider.prefetch("visible", session_id="s")
+
+
+def test_mutation_invalidation_is_fail_soft(fixture_wiki, tmp_path, monkeypatch):
+    import memory_wiki
+
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("mutation-session", hermes_home=str(tmp_path),
+                        platform="cli")
+    provider._prefetch_cache[("s", "query")] = "stale"
+    calls = []
+
+    def fail(label):
+        def run(*_args):
+            calls.append(label)
+            raise OSError(label)
+        return run
+
+    monkeypatch.setattr(provider.index, "refresh", fail("index"))
+    provider.embed = type("Embed", (), {"request_sync": fail("embed")})()
+    provider.qmd = type("Qmd", (), {"invalidate": fail("qmd")})()
+    monkeypatch.setattr(provider, "recompile_prompt_block", fail("prompt"))
+
+    out = json.loads(provider.handle_tool_call(
+        "wiki_apply", {"action": "append_journal", "content": "Durable"}))
+    assert out["ok"]
+    assert provider._prefetch_cache == {}
+    assert calls == ["index", "embed", "qmd", "prompt"]
+
+
+def test_prefetch_does_not_cache_results_crossing_a_mutation(
+        fixture_wiki, tmp_path, monkeypatch):
+    import memory_wiki
+
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("race-session", hermes_home=str(tmp_path),
+                        platform="cli")
+    page = {"type": "concept", "ref": "concepts/zettelkasten.md",
+            "title": "Zettelkasten", "snippet": "stale result"}
+
+    def mutate_during_search(*args, **kwargs):
+        provider.on_wiki_mutation()
+        return [page]
+
+    monkeypatch.setattr(provider, "search_results", mutate_during_search)
+    assert provider.prefetch("race", session_id="s") == ""
+    assert provider._prefetch_cache == {}
+
+
+def test_local_relevance_is_absolute_query_coverage(fixture_wiki, tmp_path):
+    import memory_wiki
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("coverage-session", hermes_home=str(tmp_path),
+                        platform="cli")
+    staged = json.loads(provider.handle_tool_call("wiki_apply", {
+        "action": "stage", "kind": "note",
+        "content": "Red terminal themes are preferred.",
+    }))
+    results = provider.search_results(
+        "red unrelated alpha beta", corpus="candidates", limit=5)
+    result = next(item for item in results if item["id"] == staged["id"])
+    assert result["relevance"] == 0.25
 
 
 def test_read_only_provider_hides_apply(fixture_wiki, tmp_path):

@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import threading
 
 from agent.memory_provider import MemoryProvider
 
@@ -32,12 +33,16 @@ class MemoryWikiProvider(MemoryProvider):
         self.cfg = None
         self.index = None
         self.embed = None
+        self.qmd = None
+        self.last_search_backend = "local"
         self.read_only = False
         self.platform = ""
         self.state = hooks.SessionState()
         self._session_id = ""
         self._prompt_block = ""
         self._prefetch_cache = {}
+        self._prefetch_lock = threading.Lock()
+        self._mutation_generation = 0
         self._status_callback = None
 
     # -- required contract -------------------------------------------------
@@ -73,12 +78,19 @@ class MemoryWikiProvider(MemoryProvider):
         self.recompile_prompt_block()
         self._status_callback = kwargs.get("status_callback")
         self._nudge_review()
+        backend = str(getattr(self.cfg, "search_backend", "local")).lower()
+        if backend not in ("local", "qmd", "auto"):
+            logger.warning("memory-wiki: unknown search_backend %r; using local",
+                           backend)
+            backend = "local"
+        if backend in ("qmd", "auto"):
+            from .qmd import QmdBackend
+            self.qmd = QmdBackend(self.cfg, self.index,
+                                  read_only=self.read_only)
         # semantic layer: worker thread owns the model; read-only
         # contexts (subagent/cron) stay lexical to avoid model spin-up
-        if self.cfg.embeddings and not self.read_only:
-            from .embed import EmbedIndex
-            self.embed = EmbedIndex(self.index, model=self.cfg.embedding_model)
-            self.embed.start()
+        if backend == "local":
+            self._start_embed()
 
     def get_tool_schemas(self):
         return tools.tool_schemas(read_only=self.read_only)
@@ -107,13 +119,13 @@ class MemoryWikiProvider(MemoryProvider):
             oldest_pending_days=oldest)
 
     def _pending_stats(self):
-        """(pending count, age in days of the oldest pending candidate)."""
+        """(reviewable count, age in days of the oldest candidate)."""
         if self.index is None:
             return 0, None
         from . import wikifs
         ages = [wikifs.days_since(r.created)
                 for r in self.index.records("candidates")
-                if r.status == "pending"]
+                if r.status in ("pending", "approved")]
         oldest = max((a for a in ages if a is not None), default=None)
         return len(ages), oldest
 
@@ -127,12 +139,68 @@ class MemoryWikiProvider(MemoryProvider):
         age = f", oldest {oldest}d" if oldest else ""
         try:
             self._status_callback(
-                f"memory-wiki: {pending} candidate(s) pending review{age} "
+                f"memory-wiki: {pending} candidate(s) awaiting review or "
+                f"promotion{age} "
                 "- hermes memory-wiki review")
         except Exception as e:
             logger.debug("memory-wiki: status callback failed: %s", e)
 
     # -- recall ---------------------------------------------------------------
+
+    def search_results(self, query, *, corpus="pages", type_filter=None,
+                       limit=5, source="wiki_search", session_id="",
+                       record_recall=True):
+        """Search through QMD when configured, with local fallback."""
+        self.index.refresh()
+        results = None
+        if self.qmd is not None:
+            results = self.qmd.search(query, corpus=corpus,
+                                      type_filter=type_filter, limit=limit)
+        if results is None:
+            self._start_embed()
+            if self.embed is not None:
+                self.embed.request_sync()
+            from . import search
+            scored = search.hybrid_scores(
+                self.index, self.embed, query, corpus=corpus,
+                type_filter=type_filter)
+            results = []
+            for score, rec in scored[:limit]:
+                item = search.result_dict(rec, score, query)
+                semantic_ready = bool(
+                    self.embed is not None and self.embed.ready
+                    and not self.embed.failed)
+                relevance = (min(1.0, max(0.0, score)) if semantic_ready
+                             else search.query_coverage(query, rec))
+                item["relevance"] = round(relevance, 4)
+                item["backend"] = "local"
+                results.append(item)
+            self.last_search_backend = "local"
+        else:
+            self.last_search_backend = "qmd"
+        if record_recall and not self.read_only and results:
+            self._record_recall(
+                results, query, session_id=session_id or self._session_id,
+                source=source)
+        return results
+
+    def _record_recall(self, results, query, *, session_id, source):
+        """Persist recall telemetry without breaking successful recall."""
+        try:
+            from . import recall
+            recall.record(self.cfg, results, query, session_id=session_id,
+                          source=source)
+        except Exception as e:
+            logger.warning("memory-wiki: recall telemetry failed: %s", e)
+
+    def _start_embed(self):
+        """Start local semantic recall once, including after QMD fallback."""
+        if self.embed is not None or self.read_only or self.cfg is None \
+                or not self.cfg.embeddings:
+            return
+        from .embed import EmbedIndex
+        self.embed = EmbedIndex(self.index, model=self.cfg.embedding_model)
+        self.embed.start()
 
     def prefetch(self, query, *, session_id=""):
         """Per-turn recall block. Fires before every API call, so results
@@ -141,29 +209,65 @@ class MemoryWikiProvider(MemoryProvider):
             return ""
         key = (session_id or self._session_id,
                hashlib.sha1(query.encode("utf-8", "replace")).hexdigest()[:16])
-        cached = self._prefetch_cache.get(key)
+        with self._prefetch_lock:
+            cached = self._prefetch_cache.get(key)
+            generation = self._mutation_generation
         if cached is not None:
             return cached
         try:
-            self.index.refresh()
-            if self.embed is not None:
-                self.embed.request_sync()
             from . import search
-            block = search.prefetch_block(self.index, self.cfg, query,
-                                          embedder=self.embed)
+            results = self.search_results(
+                query, corpus="all", limit=max(self.cfg.prefetch_limit * 3, 10),
+                source="prefetch", session_id=session_id,
+                record_recall=False)
+            visible = []
+            block = search.prefetch_results_block(
+                results, self.cfg, selected=visible)
+            if not self.read_only and visible:
+                self._record_recall(
+                    visible, query,
+                    session_id=session_id or self._session_id,
+                    source="prefetch")
         except Exception as e:
             logger.warning("memory-wiki: prefetch failed: %s", e)
             return ""
-        if len(self._prefetch_cache) >= _PREFETCH_CACHE_MAX:
-            self._prefetch_cache.pop(next(iter(self._prefetch_cache)))
-        self._prefetch_cache[key] = block
+        with self._prefetch_lock:
+            if generation != self._mutation_generation:
+                return ""
+            if len(self._prefetch_cache) >= _PREFETCH_CACHE_MAX:
+                self._prefetch_cache.pop(next(iter(self._prefetch_cache)))
+            self._prefetch_cache[key] = block
         return block
 
     def set_session_id(self, session_id):
         self._session_id = session_id
 
     def clear_prefetch_cache(self):
-        self._prefetch_cache = {}
+        with self._prefetch_lock:
+            self._prefetch_cache.clear()
+
+    def on_wiki_mutation(self):
+        """Invalidate all derived recall state after a successful write."""
+        with self._prefetch_lock:
+            self._mutation_generation += 1
+            self._prefetch_cache.clear()
+        steps = (
+            ("index refresh", self.index.refresh if self.index is not None
+             else None),
+            ("embedding sync", self.embed.request_sync
+             if self.embed is not None else None),
+            ("QMD invalidation", self.qmd.invalidate
+             if self.qmd is not None else None),
+            ("prompt recompilation", self.recompile_prompt_block),
+        )
+        for label, step in steps:
+            if step is None:
+                continue
+            try:
+                step()
+            except Exception as e:
+                logger.warning("memory-wiki: %s after mutation failed: %s",
+                               label, e)
 
     # -- lifecycle hooks (delegated; must never raise into the agent loop) ----
 

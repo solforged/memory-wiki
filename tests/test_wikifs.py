@@ -77,19 +77,36 @@ def test_no_frontmatter():
     assert fm is None and body == "just text"
 
 
+@pytest.mark.parametrize("value", [
+    "safe\nstatus: promoted",
+    ["safe", "topic\nstatus: promoted"],
+    {"url": "safe\r\nstatus: promoted"},
+])
+def test_frontmatter_renderer_rejects_multiline_scalars(value):
+    with pytest.raises(ValueError, match="cannot contain newlines"):
+        render_frontmatter({"type": "candidate", "value": value})
+
+
 @pytest.mark.skipif(not REAL_WIKI.is_dir(), reason="no real wiki on this machine")
 def test_real_wiki_pages_roundtrip():
+    pages = [
+        page
+        for sub in ("concepts", "claims", "sources", "atlases", "refs")
+        for page in sorted((REAL_WIKI / sub).glob("*.md"))
+    ]
+    if not pages:
+        pytest.skip("real wiki has no typed pages")
+
     checked = 0
-    for sub in ("concepts", "claims", "sources", "atlases", "refs"):
-        for page in sorted((REAL_WIKI / sub).glob("*.md")):
-            text = page.read_text(encoding="utf-8")
-            fm, body = parse_frontmatter(text)
-            assert fm is not None, page
-            assert fm.get("type"), page
-            # render -> reparse must preserve every field
-            fm2, _ = parse_frontmatter(render_page(fm, body))
-            assert fm2 == fm, page
-            checked += 1
+    for page in pages:
+        text = page.read_text(encoding="utf-8")
+        fm, body = parse_frontmatter(text)
+        assert fm is not None, page
+        assert fm.get("type"), page
+        # render -> reparse must preserve every field
+        fm2, _ = parse_frontmatter(render_page(fm, body))
+        assert fm2 == fm, page
+        checked += 1
     assert checked >= 5
 
 
@@ -153,7 +170,8 @@ def test_safe_wiki_path(tmp_path):
     (tmp_path / "claims").mkdir()
     p = safe_wiki_path(tmp_path, "claims/foo.md")
     assert p == tmp_path.resolve() / "claims" / "foo.md"
-    for bad in ("/etc/passwd", "../out.md", "claims/../../out.md", "", "~/x"):
+    for bad in ("/etc/passwd", "../out.md", "claims/../../out.md",
+                "profile/../journal/today.md", "", "~/x"):
         with pytest.raises(ValueError):
             safe_wiki_path(tmp_path, bad)
 

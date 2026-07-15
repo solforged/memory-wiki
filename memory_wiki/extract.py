@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from . import safety
 from .index import tokenize
 
 _MAX_INPUT = 4000      # longer user turns are pastes, not statements
@@ -70,6 +71,8 @@ def extract(text):
                 continue
         if len(sentence) > _MAX_SENTENCE:
             sentence = sentence[:_MAX_SENTENCE].rsplit(" ", 1)[0] + "..."
+        if safety.contains_sensitive_content(sentence):
+            continue
         key = sentence.lower()
         if key in seen:
             continue

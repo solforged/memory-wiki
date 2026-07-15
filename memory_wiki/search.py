@@ -84,6 +84,11 @@ def _query_term_coverage(query_terms, record_terms):
     return len(query_terms.intersection(record_terms)) / len(query_terms)
 
 
+def query_coverage(query, rec):
+    """Absolute lexical relevance, independent of other result scores."""
+    return _query_term_coverage(set(tokenize(query)), rec.tokens)
+
+
 def _recent_cutoff():
     return (date.today() - timedelta(days=_JOURNAL_RECENCY_DAYS)).isoformat()
 
@@ -144,36 +149,49 @@ def result_dict(rec, s, query):
     if rec.ntype == "claim":
         out["confidence"], out["maturity"] = rec.confidence, rec.maturity
     if rec.ntype == "candidate":
-        out.update(id=rec.cand_id, status=rec.status, kind=rec.kind)
+        out.update(id=rec.cand_id, status=rec.status, kind=rec.kind,
+                   created=rec.created, content_hash=rec.content_hash)
     return out
 
 
 def prefetch_block(index, cfg, query, session_id="", embedder=None):
     """Compact cited recall block for per-turn injection ('' if nothing)."""
     scored = hybrid_scores(index, embedder, query, corpus="all")
+    results = [result_dict(rec, score, query) for score, rec in scored]
+    return prefetch_results_block(results, cfg)
+
+
+def prefetch_results_block(results, cfg, selected=None):
+    """Compact recall block from backend-neutral result dictionaries."""
     lines = ["## Wiki recall"]
     used = len(lines[0]) + 1
     shown = 0
-    for s, rec in scored:
-        if rec.ntype in ("profile",):     # already in the system prompt
+    for result in results:
+        ntype = result.get("type", "")
+        if ntype == "profile":     # already in the system prompt
             continue
-        if rec.ntype == "candidate" and rec.status != "pending":
+        if ntype == "candidate" and result.get("status") != "pending":
             continue
-        if rec.ntype == "candidate":
-            age = wikifs.days_since(rec.created)
+        if ntype == "candidate":
+            age = wikifs.days_since(result.get("created", ""))
             if age is not None and age > cfg.candidate_stale_days:
                 continue          # stale proposal; review queue still lists it
             staged = f", staged {age}d ago" if age else ""
-            line = (f"- [cand {rec.cand_id}] (unreviewed {rec.kind}{staged}) "
-                    f"{snippet(rec, query)}")
+            line = (f"- [cand {result.get('id', '')}] "
+                    f"(unreviewed {result.get('kind', '')}{staged}) "
+                    f"{result.get('snippet', '')}")
         else:
             meta = ""
-            if rec.ntype == "claim" and rec.confidence:
-                meta = f" ({rec.confidence}, {rec.maturity})"
-            line = f"- [{rec.rel}] {rec.title}{meta}: {snippet(rec, query)}"
+            if ntype == "claim" and result.get("confidence"):
+                meta = (f" ({result.get('confidence')}, "
+                        f"{result.get('maturity', '')})")
+            line = (f"- [{result.get('ref', '')}] {result.get('title', '')}"
+                    f"{meta}: {result.get('snippet', '')}")
         if used + len(line) + 1 > cfg.prefetch_char_budget - 60:
             break
         lines.append(line)
+        if selected is not None:
+            selected.append(result)
         used += len(line) + 1
         shown += 1
         if shown >= cfg.prefetch_limit:

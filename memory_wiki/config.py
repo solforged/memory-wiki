@@ -24,8 +24,17 @@ class MemoryWikiConfig:
     wiki_root: Path = field(default_factory=lambda: Path(DEFAULT_WIKI_ROOT).expanduser())
     auto_capture: bool = True
     llm_extraction: bool = False
+    search_backend: str = "local"
     embeddings: bool = True
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    qmd_command: str = "qmd"
+    qmd_search_mode: str = "search"
+    qmd_timeout_seconds: int = 8
+    qmd_maintenance_timeout_seconds: int = 120
+    qmd_update_interval_seconds: int = 300
+    qmd_embed_interval_seconds: int = 3600
+    qmd_rerank: bool = True
+    qmd_state_dir: str = ""
     journal_episodes: bool = True
     prefetch_limit: int = 5
     prefetch_char_budget: int = 1200
@@ -36,6 +45,10 @@ class MemoryWikiConfig:
     max_candidates_per_session: int = 40
     candidate_stale_days: int = 30
     dream_limit: int = 50
+    dream_min_score: float = 0.75
+    dream_min_recall_count: int = 3
+    dream_min_unique_queries: int = 2
+    dream_recency_half_life_days: int = 14
     backup_include_wiki: bool = True
 
 
@@ -60,6 +73,11 @@ def load_config(hermes_home=None, overrides=None):
                 setattr(cfg, f.name, int(raw))
             except (TypeError, ValueError):
                 logger.debug("memory-wiki: bad int for %s: %r", f.name, raw)
+        elif isinstance(getattr(cfg, f.name), float):
+            try:
+                setattr(cfg, f.name, float(raw))
+            except (TypeError, ValueError):
+                logger.debug("memory-wiki: bad float for %s: %r", f.name, raw)
         else:
             setattr(cfg, f.name, str(raw))
     return cfg
@@ -106,7 +124,7 @@ def save_plugin_block(values, hermes_home):
 
 
 def config_schema():
-    """Fields prompted by `hermes memory setup` — kept to the minimum."""
+    """Fields prompted by `hermes memory setup`, kept to the minimum."""
     return [{
         "key": "wiki_root",
         "description": "Path to your wiki repository",

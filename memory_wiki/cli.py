@@ -82,6 +82,10 @@ def register_cli(subparser):
                          help="Max pending candidates to inspect (default: config dream_limit)")
     p_dream.add_argument("--apply-safe", action="store_true",
                          help="Promote only high-confidence profile/agent suggestions")
+    p_dream.add_argument("--report", action="store_true",
+                         help="Append the plan to DREAMS.md")
+    p_dream.add_argument("--explain", metavar="ID", default=None,
+                         help="Explain one candidate's score without writing")
 
     subs.add_parser("lint", help="Validate pages and candidates, then run the "
                                  "wiki's own _scripts/check.py")
@@ -177,10 +181,23 @@ def _cmd_status(args):
         print("recent decisions:")
         for line in tail:
             print(f"  {line}")
-    for k in ("auto_capture", "llm_extraction", "embeddings",
-              "embedding_model", "journal_episodes", "prefetch_limit",
-              "prompt_block_budget", "candidate_stale_days", "dream_limit"):
+    for k in ("auto_capture", "llm_extraction", "search_backend",
+              "embeddings", "embedding_model", "qmd_search_mode",
+              "qmd_update_interval_seconds", "qmd_embed_interval_seconds",
+              "journal_episodes",
+              "prefetch_limit", "prompt_block_budget",
+              "candidate_stale_days", "dream_limit", "dream_min_score",
+              "dream_min_recall_count", "dream_min_unique_queries"):
         print(f"config {k}: {getattr(cfg, k)}")
+    if cfg.search_backend in ("qmd", "auto"):
+        from .index import WikiIndex
+        from .qmd import QmdBackend
+        qmd = QmdBackend(cfg, WikiIndex(root)).status()
+        state = "ready" if qmd["initialized"] else "uninitialized"
+        available = "available" if qmd["available"] else "unavailable"
+        print(f"qmd: {available}, {state}, mode {qmd['search_mode']}")
+        if qmd["last_error"]:
+            print(f"qmd error: {qmd['last_error']}")
     return 0
 
 
@@ -193,8 +210,32 @@ def _cmd_dream(args):
         return 1
     index = WikiIndex(cfg.wiki_root)
     index.refresh()
+    apply_safe = bool(getattr(args, "apply_safe", False))
+    write_report = bool(getattr(args, "report", False))
+    explain_id = getattr(args, "explain", None)
+    if explain_id:
+        if apply_safe or write_report:
+            print("--explain cannot be combined with --apply-safe or --report")
+            return 1
+        try:
+            result = dream.explain(cfg, index, explain_id)
+        except ValueError as exc:
+            print(exc)
+            return 1
+        ranking = result["promotion"]
+        print(f"{result['id']}: {result['status']}, score "
+              f"{ranking['score']:.4f}, eligible {ranking['eligible']}")
+        print(f"recalls {ranking['recall_count']}, unique queries "
+              f"{ranking['unique_queries']}")
+        failed = [name for name, passed in ranking["gates"].items()
+                  if not passed]
+        print("failed gates: " + (", ".join(failed) if failed else "none"))
+        if result.get("suggestion"):
+            _print_dream_suggestion(result["suggestion"])
+        return 0
     result = dream.run(cfg, index, limit=args.limit,
-                       apply_safe=args.apply_safe, actor="cli")
+                       apply_safe=apply_safe, write_report=write_report,
+                       actor="cli")
     print(f"dream: considered {result['considered']} of {result['pending']} "
           f"pending candidate(s)")
     if result["summary"]:
@@ -204,7 +245,9 @@ def _cmd_dream(args):
         print("summary: no suggestions")
     for suggestion in result["suggestions"]:
         _print_dream_suggestion(suggestion)
-    if args.apply_safe:
+    if result.get("report"):
+        print(f"report: {result['report']}")
+    if apply_safe:
         applied = result.get("applied", [])
         failed = [a for a in applied if not a.get("ok")]
         print(f"applied safe promotions: {len(applied) - len(failed)}/"
@@ -236,6 +279,11 @@ def _print_dream_suggestion(suggestion):
               f"{suggestion.get('target', '')}")
         print(f"  {suggestion['reason']}")
         print(f"  {suggestion.get('excerpt', '')}")
+        ranking = suggestion.get("promotion") or {}
+        if ranking:
+            print(f"  score {ranking.get('score', 0):.4f}; recalls "
+                  f"{ranking.get('recall_count', 0)}; unique queries "
+                  f"{ranking.get('unique_queries', 0)}")
     if suggestion.get("covered_by"):
         print("  covered by: " + ", ".join(suggestion["covered_by"]))
     if suggestion.get("suggested_target"):
@@ -277,7 +325,10 @@ def _cmd_review(args):
     if batch and overrides:
         print("override flags cannot be used with filtered batch mode")
         return 1
-    if batch and not filters and getattr(args, "limit", None) is None:
+    if batch and getattr(args, "limit", None) is not None and args.limit < 1:
+        print("invalid review filter: review queue limit must be at least 1")
+        return 1
+    if batch and not filters:
         print("filtered batch mode requires at least one filter")
         return 1
     if batch and not getattr(args, "yes", False):
@@ -329,18 +380,19 @@ def _cmd_review(args):
             completed += 1
         return 0
     if not pending:
-        if queue["summary"]["total_pending"]:
-            print("no pending candidates match the filters")
+        if queue["summary"]["total_reviewable"]:
+            print("no reviewable candidates match the filters")
         else:
-            print("no pending candidates")
+            print("no reviewable candidates")
         return 0
     if args.list_only:
         summary = queue["summary"]
-        print(f"matched {summary['matched']} of {summary['total_pending']} "
-              f"pending candidate(s); {summary['stale_count']} stale")
+        print(f"matched {summary['matched']} of {summary['total_reviewable']} "
+              f"reviewable candidate(s); {summary['stale_count']} stale")
         for c in pending:
             age = f"  {c['age_days']}d" if c.get("age_days") else ""
-            print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11}{age} "
+            state = " [approved]" if c.get("status") == "approved" else ""
+            print(f"{c['id']}  {c['kind']:<10} {c['confidence']:<11}{age}{state} "
                   f"-> {c['effective_target']}")
             print(f"    {c['title']}")
             if c["preview"] != c["title"]:
@@ -406,7 +458,7 @@ def _hint_line(cand):
 
 def _review_interactive(cfg, index, pending):
     from . import promote
-    print(f"{len(pending)} pending candidate(s). "
+    print(f"{len(pending)} reviewable candidate(s). "
           "[a]pprove+promote / [e]dit then approve / "
           "[t]arget then approve / [r]eject / [s]kip / [q]uit")
     for c in pending:

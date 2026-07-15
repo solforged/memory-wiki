@@ -1,20 +1,26 @@
 # memory-wiki
 
-Hermes memory provider that replaces the built-in MEMORY.md/USER.md
-with a plaintext wiki. No database: markdown files, one advisory lock,
-one JSONL audit log.
+Hermes memory provider that replaces the built-in MEMORY.md/USER.md with a
+plaintext wiki. No database: markdown files, one advisory lock, one JSONL audit
+log.
+
+This combines active memory and wiki curation in one Hermes provider. OpenClaw's
+bundled `memory-wiki` has a different boundary: its active memory backend owns
+recall, promotion, and dreaming, while the wiki plugin compiles entities,
+claims, digests, and dashboards. See
+[`OPENCLAW_PARITY.md`](../docs/OPENCLAW_PARITY.md) for the capability map.
 
 - **Day-to-day memory**: `profile/user.md` (who the user is) and
-  `profile/agent.md` (the agent's notes) are living pages, injected
-  into the system prompt under char budgets. `journal/YYYY-MM-DD.md`
-  holds timestamped notes and one episode per session.
-- **Knowledge base**: the wiki's six types (concepts, claims, sources,
-  atlases, syntheses, refs) following the wiki's own `_meta/style-guide.md`
-  and validated by its `_scripts/check.py`.
-- **Review-first writes**: automation never edits knowledge pages.
-  Auto-captured facts and proposed page changes are staged as one-file
-  candidates in `_inbox/`, and reach pages only through approval
-  (`wiki_apply approve`, `hermes memory-wiki review`, or your editor).
+  `profile/agent.md` (the agent's notes) are living pages, injected into the
+  system prompt under char budgets. `journal/YYYY-MM-DD.md` holds timestamped
+  notes and one episode per session.
+- **Knowledge base**: the wiki's six types (concepts, claims, sources, atlases,
+  syntheses, refs) following the wiki's own `_meta/style-guide.md` and validated
+  by its `_scripts/check.py`.
+- **Review-first writes**: automation never edits knowledge pages. Auto-captured
+  facts and proposed page changes are staged as one-file candidates in
+  `_inbox/`, and reach pages only through approval (`wiki_apply approve`,
+  `hermes memory-wiki review`, or your editor).
 
 ## Install
 
@@ -27,15 +33,15 @@ In `$HERMES_HOME/config.yaml`:
 ```yaml
 memory:
   provider: memory-wiki
-  memory_enabled: false        # built-in MEMORY.md off (this replaces it)
-  user_profile_enabled: false  # built-in USER.md off
+  memory_enabled: false # built-in MEMORY.md off (this replaces it)
+  user_profile_enabled: false # built-in USER.md off
 plugins:
   memory-wiki:
     wiki_root: ~/wiki
 ```
 
-Then scaffold the wiki (idempotent; prints diffs before patching the
-wiki's check.py and style guide):
+Then scaffold the wiki (idempotent; prints diffs before patching the wiki's
+check.py and style guide):
 
 ```bash
 hermes memory-wiki init          # add --dry-run to preview
@@ -43,50 +49,71 @@ hermes memory-wiki init          # add --dry-run to preview
 
 ## Tools (model-facing)
 
-- `wiki_search(query, corpus, type, limit)`: cited hybrid recall
-  (0.7 embedding similarity + 0.3 lexical tf-idf, OpenClaw's split).
-- `wiki_get(ref)`: read a page, a candidate id, or `status` /
-  `review-queue` / `dream` / `decisions`.
-- `wiki_apply(action, ...)`: `write_profile` and `append_journal` write
-  directly (day-to-day memory); `stage` proposes knowledge; `approve`
-  (promotes by default; re-approve to promote later), `reject` manage
-  the queue;
-  `supersede` replaces an outdated promoted memory in place (id = the
-  old candidate id from the bullet's marker; profile/journal targets
-  replace immediately, knowledge pages stay review-first). `dream`
-  returns a curation plan and, only with `apply_safe=true`, promotes
-  conservative high-confidence profile/agent bullets.
+- `wiki_search(query, corpus, type, limit)`: cited recall through QMD or local
+  search. Local semantic search blends 0.7 embedding similarity and 0.3 lexical
+  tf-idf.
+- `wiki_get(ref)`: read a page, a candidate id, or `status` / `review-queue` /
+  `dream` / `decisions`.
+- `wiki_apply(action, ...)`: `write_profile` and `append_journal` write directly
+  (day-to-day memory); `stage` proposes knowledge; `approve` (promotes by
+  default; re-approve to promote later), `reject` manage the queue; `supersede`
+  replaces an outdated promoted memory in place (id = the old candidate id from
+  the bullet's marker; profile/journal targets replace immediately, knowledge
+  pages stay review-first). `dream` returns a scored curation plan and, only
+  with `apply_safe=true`, promotes recall-qualified profile/agent bullets.
+  Direct writes accept an optional `idempotency_key` for safe tool retries.
 
-Per-turn recall is injected automatically (prefetch); the profile pages
-ride in the system prompt. Pending candidates surface in recall with
-their staged age and drop out after `candidate_stale_days`; when any
-are waiting, the prompt block carries a review nudge and CLI sessions
-get one status line at start.
+Per-turn recall is injected automatically (prefetch); the profile pages ride in
+the system prompt. Pending candidates surface in recall with their staged age
+and drop out after `candidate_stale_days`; when any are waiting, the prompt
+block carries a review nudge and CLI sessions get one status line at start.
 
 ## Auto-capture
 
-`sync_turn` runs deterministic sentence heuristics (preference,
-identity fact, decision, correction) over each user turn; matches are
-staged as `pending` candidates, capped per turn and per session.
-`on_pre_compress` catches unprocessed turns before compaction.
-Session end appends an idempotent journal episode. Nothing auto-caught
-becomes a page without review.
+`sync_turn` runs deterministic sentence heuristics (preference, identity fact,
+decision, correction) over each user turn; matches are staged as `pending`
+candidates, capped per turn and per session. `on_pre_compress` catches
+unprocessed turns before compaction. Session end appends an idempotent journal
+episode. Nothing auto-caught reaches a knowledge page without review. An
+explicit dream `--apply-safe` may promote only recall-qualified, grounded
+profile bullets under the narrow policy described below.
 
-Optional: `llm_extraction: true` adds one structured PluginLlm call per
-turn (`purpose: memory-wiki.extract`); failures degrade silently to
+Optional: `llm_extraction: true` adds one structured PluginLlm call per turn
+(`purpose: memory-wiki.extract`); failures degrade silently to
 deterministic-only.
 
-## Semantic recall
+## Recall backends
 
-Embeddings are optional and local: `fastembed` (ONNX,
-`BAAI/bge-small-en-v1.5` by default) must be installed in the Hermes
-venv. The model loads on a background thread and vectors live in a
-throwaway sqlite cache under `~/.cache/memory-wiki/`, keyed by page path
-and full canonical content. Markdown remains the only source of truth;
-the cache rebuilds itself if deleted or if the model changes. While
-loading, if the import fails, or in read-only contexts
-(subagent/cron), recall degrades to lexical-only. `wiki_get status`
-reports the state as `embedding_state`.
+`search_backend: local` uses the built-in lexical or FastEmbed path.
+`search_backend: qmd` uses an isolated QMD collection and falls back to local
+search after command failures or timeouts. QMD state lives outside the wiki
+under `~/.cache/memory-wiki/qmd/` by default, so Markdown remains the source of
+truth. Collection updates run every five minutes. `query` and `vsearch` modes
+also refresh embeddings hourly. Read-only sessions can query existing state but
+never initialize or update it.
+
+```yaml
+plugins:
+  memory-wiki:
+    search_backend: qmd
+    qmd_search_mode: search # search, vsearch, or query
+```
+
+`search` is BM25-only. `query` adds expansion, vectors, and reranking, but its
+first run may download large local models. Increase `qmd_timeout_seconds` for
+that mode on slower machines. `wiki_get status` and `hermes memory-wiki status`
+expose QMD availability and state.
+
+### Local semantic recall
+
+Embeddings are optional and local: `fastembed` (ONNX, `BAAI/bge-small-en-v1.5`
+by default) must be installed in the Hermes venv. The model loads on a
+background thread and vectors live in a throwaway sqlite cache under
+`~/.cache/memory-wiki/`, keyed by page path and full canonical content. Markdown
+remains the only source of truth; the cache rebuilds itself if deleted or if the
+model changes. While loading, if the import fails, or in read-only contexts
+(subagent/cron), recall degrades to lexical-only. `wiki_get status` reports the
+state as `embedding_state`.
 
 ## CLI
 
@@ -100,62 +127,95 @@ hermes memory-wiki review [--approve ID | --reject ID --reason R]
 hermes memory-wiki review FILTERS
                           [--approve-filtered | --reject-filtered] --yes
 hermes memory-wiki review --prune [--days N]
-hermes memory-wiki dream [--limit N] [--apply-safe]
+hermes memory-wiki dream [--limit N] [--apply-safe] [--report]
+hermes memory-wiki dream --explain ID
 hermes memory-wiki lint
 ```
 
-The review list, interactive reviewer, and `wiki_get review-queue` share
-the same candidate metadata, routing, staleness, filters, and summary.
-Filtered batch mutations require at least one filter plus `--yes`.
+The review list, interactive reviewer, and `wiki_get review-queue` share the
+same candidate metadata, routing, staleness, filters, and summary. Filtered
+batch mutations require at least one filter plus `--yes`.
 
 ## Config reference (`plugins.memory-wiki`)
 
-| key | default | meaning |
-|---|---|---|
-| `wiki_root` | `~/wiki` | wiki repository root |
-| `auto_capture` | `true` | deterministic per-turn extraction |
-| `llm_extraction` | `false` | PluginLlm structured extraction |
-| `embeddings` | `true` | hybrid semantic recall (needs fastembed) |
-| `embedding_model` | `BAAI/bge-small-en-v1.5` | fastembed model name |
-| `journal_episodes` | `true` | session episode at session end |
-| `prefetch_limit` | `5` | max recall results per turn |
-| `prefetch_char_budget` | `1200` | recall block cap (chars) |
-| `profile_user_budget` | `6000` | profile/user.md chars in prompt |
-| `profile_agent_budget` | `4000` | profile/agent.md chars in prompt |
-| `prompt_block_budget` | `9000` | whole prompt block cap |
-| `max_candidates_per_turn` | `3` | staging cap per turn |
-| `max_candidates_per_session` | `40` | staging cap per session |
-| `candidate_stale_days` | `30` | pending age after which recall stops surfacing a candidate |
-| `dream_limit` | `50` | max pending candidates inspected by a dream pass |
-| `backup_include_wiki` | `true` | include wiki_root in `hermes backup` |
+| key                               | default                  | meaning                                                    |
+| --------------------------------- | ------------------------ | ---------------------------------------------------------- |
+| `wiki_root`                       | `~/wiki`                 | wiki repository root                                       |
+| `auto_capture`                    | `true`                   | deterministic per-turn extraction                          |
+| `llm_extraction`                  | `false`                  | PluginLlm structured extraction                            |
+| `search_backend`                  | `local`                  | `local`, `qmd`, or fail-soft `auto` recall                 |
+| `embeddings`                      | `true`                   | hybrid semantic recall (needs fastembed)                   |
+| `embedding_model`                 | `BAAI/bge-small-en-v1.5` | fastembed model name                                       |
+| `qmd_command`                     | `qmd`                    | QMD executable or absolute path                            |
+| `qmd_search_mode`                 | `search`                 | `search`, `vsearch`, or `query`                            |
+| `qmd_timeout_seconds`             | `8`                      | QMD search timeout                                         |
+| `qmd_maintenance_timeout_seconds` | `120`                    | QMD add, update, and embed timeout                         |
+| `qmd_update_interval_seconds`     | `300`                    | Markdown index refresh interval                            |
+| `qmd_embed_interval_seconds`      | `3600`                   | semantic embedding refresh interval                        |
+| `qmd_rerank`                      | `true`                   | rerank `query` results                                     |
+| `qmd_state_dir`                   | empty                    | private QMD state override                                 |
+| `journal_episodes`                | `true`                   | session episode at session end                             |
+| `prefetch_limit`                  | `5`                      | max recall results per turn                                |
+| `prefetch_char_budget`            | `1200`                   | recall block cap (chars)                                   |
+| `profile_user_budget`             | `6000`                   | profile/user.md chars in prompt                            |
+| `profile_agent_budget`            | `4000`                   | profile/agent.md chars in prompt                           |
+| `prompt_block_budget`             | `9000`                   | whole prompt block cap                                     |
+| `max_candidates_per_turn`         | `3`                      | staging cap per turn                                       |
+| `max_candidates_per_session`      | `40`                     | staging cap per session                                    |
+| `candidate_stale_days`            | `30`                     | pending age after which recall stops surfacing a candidate |
+| `dream_limit`                     | `50`                     | max pending candidates inspected by a dream pass           |
+| `dream_min_score`                 | `0.75`                   | minimum deep-promotion score                               |
+| `dream_min_recall_count`          | `3`                      | minimum organic recalls                                    |
+| `dream_min_unique_queries`        | `2`                      | minimum distinct hashed queries                            |
+| `dream_recency_half_life_days`    | `14`                     | recall freshness half-life                                 |
+| `backup_include_wiki`             | `true`                   | include wiki_root in `hermes backup`                       |
 
 ## Dreaming / curation
 
-`hermes memory-wiki dream` is the conservative consolidation pass. It
-does not write by default. It groups similar pending candidates, flags
-items already covered by existing pages (`reject_covered`) and
-candidates pending longer than `candidate_stale_days` (`reject_stale`),
-suggests better targets, and separates knowledge-page candidates from
-direct profile/agent memories. Corrections that overlap an existing
-memory get `supersede_existing`, never a reject suggestion: token
-overlap cannot tell confirmation from contradiction. The output is a
+`hermes memory-wiki dream` is the conservative consolidation pass. It does not
+write by default. It groups similar pending candidates, flags items already
+covered by existing pages (`reject_covered`) and candidates pending longer than
+`candidate_stale_days` (`reject_stale`), suggests better targets, and separates
+knowledge-page candidates from direct profile/agent memories. Corrections that
+overlap an existing memory get `supersede_existing`, never a reject suggestion:
+token overlap cannot tell confirmation from contradiction. The output is a
 review plan with exact follow-up commands where useful.
 
-`--apply-safe` is deliberately narrow: it only promotes pending
-high-confidence `preference` or `note` candidates whose default target
-is `profile/user.md` or `profile/agent.md`, with no
-duplicate/similarity/quality warnings. Corrections, claims, concepts,
-refs, tastes, sources, journal decisions, lower-confidence facts,
-retargets, and consolidation groups remain review-first.
+`--apply-safe` is deliberately narrow: it only promotes pending high-confidence
+`preference` or `note` candidates whose default target is `profile/user.md` or
+`profile/agent.md`, whose content overlaps exact quoted user evidence from a
+deterministic capture hook, and which have no duplicate/similarity/quality
+warnings. Tool and LLM proposals, corrections, claims, concepts, refs, tastes,
+sources, journal decisions, lower-confidence facts, retargets, and
+consolidation groups remain review-first.
+
+The promotion score mirrors OpenClaw's six base signals: relevance 0.30,
+frequency 0.24, query diversity 0.15, recency 0.15, consolidation 0.10, and
+conceptual richness 0.06. Score, recall-count, and unique-query gates must all
+pass. Candidate recalls are kept in bounded machine state at
+`_inbox/short-term-recall.json`; raw queries and session ids are never stored.
+Recall evidence is bound to the exact candidate content hash. The planner
+rechecks candidate state, content hash, and safe routing while holding the write
+lock. `--explain ID` shows the gates. `--report` appends a human-readable
+`DREAMS.md` entry, which is never a promotion input.
+
+## Safety and retry behavior
+
+Automatic capture, model extraction, session excerpts, staging, and direct
+writes reject obvious credentials and private keys. Turn and session caps apply
+across deterministic and LLM extraction together. Direct profile and journal
+writes carry hidden retry markers, so repeated tool deliveries do not duplicate
+content. Reusing an explicit idempotency key with different content is an error.
+Any successful mutation clears prefetch state and refreshes the active search
+backend.
 
 ## Concurrency model
 
-Candidate files are created `O_EXCL` with unique ids (no contention);
-page writes are atomic tmp+rename; read-modify-write of shared files
-(profile, journal, promotion targets, decisions.jsonl) serializes on
-one flock (`_inbox/.lock`, 5s timeout). Profile edits are
-last-writer-wins. Not handled: multi-host git sync (git is the recovery
-story), file watching, NFS, Windows.
+Candidate files are created `O_EXCL` with unique ids (no contention); page
+writes are atomic tmp+rename; read-modify-write of shared files (profile,
+journal, promotion targets, decisions.jsonl) serializes on one flock
+(`_inbox/.lock`, 5s timeout). Profile edits are last-writer-wins. Not handled:
+multi-host git sync (git is the recovery story), file watching, NFS, Windows.
 
 ## Development
 
@@ -163,5 +223,5 @@ story), file watching, NFS, Windows.
 uv run --group dev pytest        # tests live in ../tests
 ```
 
-Repo layout: this directory is the plugin (symlink target); tests and
-tooling live one level up.
+Repo layout: this directory is the plugin (symlink target); tests and tooling
+live one level up.

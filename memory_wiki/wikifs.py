@@ -26,6 +26,17 @@ class LockTimeout(RuntimeError):
     """Could not acquire the wiki lock within the timeout."""
 
 
+_SECTION_HEADING = re.compile(r"^## [^\r\n]+$")
+
+
+def validate_section_heading(section):
+    """Require one plain level-2 heading, preventing Markdown injection."""
+    section = str(section or "")
+    if not _SECTION_HEADING.fullmatch(section):
+        raise ValueError("section must be one line like '## Notes'")
+    return section
+
+
 # -- frontmatter ---------------------------------------------------------
 
 def parse_frontmatter(text):
@@ -98,6 +109,8 @@ def _render_scalar(v):
     if isinstance(v, (int, float)):
         return str(v)
     s = str(v)
+    if "\n" in s or "\r" in s:
+        raise ValueError("frontmatter scalars cannot contain newlines")
     if s == "":
         return '""'
     if _NEEDS_QUOTES.search(s):
@@ -109,6 +122,8 @@ def render_frontmatter(fm):
     """Render a frontmatter dict in the wiki's house style."""
     out = ["---"]
     for k, v in fm.items():
+        validate_frontmatter_value(k)
+        validate_frontmatter_value(v)
         if isinstance(v, dict):
             if not v:
                 out.append(f"{k}: {{}}")
@@ -122,6 +137,21 @@ def render_frontmatter(fm):
             out.append(f"{k}: {_render_scalar(v)}")
     out.append("---")
     return "\n".join(out) + "\n"
+
+
+def validate_frontmatter_value(value):
+    """Reject newline-bearing scalar data before it reaches YAML."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            validate_frontmatter_value(key)
+            validate_frontmatter_value(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            validate_frontmatter_value(item)
+        return
+    if isinstance(value, str) and ("\n" in value or "\r" in value):
+        raise ValueError("frontmatter scalars cannot contain newlines")
 
 
 def render_page(fm, body):
@@ -222,7 +252,9 @@ def wiki_lock(wiki_root, timeout=5.0):
 def safe_wiki_path(wiki_root, rel):
     """Resolve a repo-relative path, refusing escapes from wiki_root."""
     rel = (rel or "").strip()
-    if not rel or rel.startswith(("/", "~")) or "\\" in rel:
+    parts = Path(rel).parts
+    if (not rel or rel.startswith(("/", "~")) or "\\" in rel
+            or any(part in (".", "..") for part in parts)):
         raise ValueError(f"invalid wiki path: {rel!r}")
     root = Path(wiki_root).resolve()
     p = (root / rel).resolve()

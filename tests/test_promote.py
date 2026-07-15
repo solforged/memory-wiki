@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_wiki import candidates, layers, promote, scaffold, schema, wikifs
+from memory_wiki import candidates, hints, layers, promote, scaffold, schema, wikifs
 from memory_wiki.index import WikiIndex
 
 
@@ -60,6 +60,51 @@ def test_note_and_decision_routes(ready):
     assert schema.validate_page(layers.journal_rel(), jtext) == []
 
 
+def test_existing_custom_profile_target_writes_the_reported_page(ready):
+    cfg, idx = ready
+    custom = Path(cfg.wiki_root) / "profile/custom.md"
+    fm = schema.page_frontmatter("profile", "Custom profile")
+    custom.write_text(wikifs.render_page(fm, "## Notes\n"), encoding="utf-8")
+    cid = stage(cfg, idx, "Keep custom routing exact.", kind="note",
+                target="profile/custom.md")
+
+    result = promote.approve(cfg, idx, cid)
+
+    assert result["ok"] and result["target"] == "profile/custom.md"
+    assert "Keep custom routing exact." in read(cfg, "profile/custom.md")
+    assert "Keep custom routing exact." not in read(cfg, "profile/agent.md")
+
+
+def test_journal_promotion_retry_stays_on_original_day(ready, monkeypatch):
+    cfg, idx = ready
+    cid = stage(cfg, idx, "Ship phase three before the weekend.",
+                kind="decision")
+    day = ["2026-07-14"]
+    monkeypatch.setattr(wikifs, "today", lambda: day[0])
+    original = candidates.set_status_unlocked
+    calls = 0
+
+    def crash_after_page_write(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated crash")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(candidates, "set_status_unlocked", crash_after_page_write)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        promote.promote(cfg, idx, cid)
+    first_rel = "journal/2026-07-14.md"
+    assert read(cfg, first_rel).count(schema.candidate_marker(cid)) == 1
+
+    monkeypatch.setattr(candidates, "set_status_unlocked", original)
+    day[0] = "2026-07-15"
+    result = promote.promote(cfg, idx, cid)
+    assert result["ok"] and result["target"] == first_rel
+    assert read(cfg, first_rel).count(schema.candidate_marker(cid)) == 1
+    assert read(cfg, "journal/2026-07-15.md") is None
+
+
 def test_claim_new_page(ready):
     cfg, idx = ready
     cid = stage(cfg, idx, "Review-first staging beats direct writes for "
@@ -74,7 +119,7 @@ def test_claim_new_page(ready):
     assert fm["type"] == "claim" and fm["confidence"] == "likely"
     assert fm["maturity"] == "seedling" and fm["topics"] == ["memory"]
     assert "## Evidence" in body and "## Open questions" in body
-    assert "[[journal/" in body and "session 8f3e9c12" in body
+    assert "proposed via tool" in body and "session 8f3e9c12" in body
     assert schema.promoted_comment(cid) in body
     assert schema.validate_page(rel, text) == []
 
@@ -96,6 +141,10 @@ def test_concept_new_page_and_existing_refused(ready):
     assert not result2["ok"] and "already exists" in result2["error"]
     _, fm2, _, _ = candidates.load(cfg, cid2)
     assert fm2["status"] == "approved"  # stays approved for retargeting
+    queue = hints.build_review_queue(cfg, idx)
+    item = next(item for item in queue["candidates"] if item["id"] == cid2)
+    assert item["status"] == "approved"
+    assert queue["summary"]["total_approved"] == 1
 
 
 FULL_CLAIM_PAGE = ("---\ntype: claim\ntitle: staged pages promote verbatim\n"
@@ -465,6 +514,139 @@ def test_apply_tool_end_to_end(fixture_wiki, tmp_path):
     dec = json.loads(provider.handle_tool_call("wiki_get",
                                                {"ref": "decisions"}))
     assert dec["ok"] and dec["count"] >= 5
+
+
+def test_direct_tool_writes_are_retry_idempotent(
+        fixture_wiki, tmp_path, monkeypatch):
+    import memory_wiki
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("retry-session", hermes_home=str(tmp_path),
+                        platform="cli")
+
+    def apply(**args):
+        return json.loads(provider.handle_tool_call("wiki_apply", args))
+
+    first = apply(action="write_profile", page="user",
+                  content="Prefers retry-safe writes", idempotency_key="pref-1")
+    second = apply(action="write_profile", page="user",
+                   content="Prefers retry-safe writes", idempotency_key="pref-1")
+    assert first["write_id"] == second["write_id"]
+    assert first["replayed"] is False and second["replayed"] is True
+    profile = read(provider.cfg, "profile/user.md")
+    assert profile.count("Prefers retry-safe writes") == 1
+
+    apply(action="write_profile", page="user", section="## Current focus",
+          mode="replace_section", content="First accepted focus",
+          idempotency_key="focus-1")
+    conflict = apply(
+        action="write_profile", page="user", section="## Current focus",
+        mode="replace_section", content="Retry must not replace it",
+        idempotency_key="focus-1")
+    assert not conflict["ok"] and "different content" in conflict["error"]
+    profile = read(provider.cfg, "profile/user.md")
+    assert "First accepted focus" in profile
+    assert "Retry must not replace it" not in profile
+    assert "memory-wiki: write" not in provider.system_prompt_block()
+
+    apply(action="write_profile", page="user", section="## Current focus",
+          mode="replace_section", content="Newer accepted focus",
+          idempotency_key="focus-2")
+    apply(action="write_profile", page="user", section="## Current focus",
+          mode="replace_section", content="First accepted focus",
+          idempotency_key="focus-1")
+    profile = read(provider.cfg, "profile/user.md")
+    assert "Newer accepted focus" in profile
+    assert "First accepted focus" not in profile
+
+    agent = apply(action="write_profile", page="agent",
+                  content="Same key, distinct target", idempotency_key="pref-1")
+    assert agent["write_id"] != first["write_id"]
+    assert "Same key, distinct target" in read(provider.cfg, "profile/agent.md")
+
+    day = ["2026-07-14"]
+    monkeypatch.setattr(wikifs, "today", lambda: day[0])
+    journal_first = apply(action="append_journal", content="One journal event",
+                          idempotency_key="journal-1")
+    day[0] = "2026-07-15"
+    journal_second = apply(action="append_journal", content="One journal event",
+                           idempotency_key="journal-1")
+    assert journal_first["write_id"] == journal_second["write_id"]
+    assert journal_second["ref"] == journal_first["ref"]
+    assert read(provider.cfg, journal_first["ref"]).count("One journal event") == 1
+    assert read(provider.cfg, "journal/2026-07-15.md") is None
+
+    omitted = apply(action="write_profile", page="agent",
+                    content="Normalized retry")
+    explicit = apply(action="write_profile", page="agent",
+                     content="  Normalized retry  ", mode="append")
+    assert omitted["write_id"] == explicit["write_id"]
+    assert read(provider.cfg, "profile/agent.md").count("Normalized retry") == 1
+
+
+def test_direct_tool_write_and_audit_share_one_lock(
+        fixture_wiki, tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import memory_wiki
+    from memory_wiki import tools
+
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("transaction-session", hermes_home=str(tmp_path),
+                        platform="cli")
+    real_lock = tools.wikifs.wiki_lock
+    real_record = candidates.record_unlocked
+    held = {"value": False}
+    audited = []
+
+    @contextmanager
+    def observed_lock(*args, **kwargs):
+        with real_lock(*args, **kwargs):
+            held["value"] = True
+            try:
+                yield
+            finally:
+                held["value"] = False
+
+    def observed_record(*args, **kwargs):
+        assert held["value"]
+        audited.append((args[1], kwargs.get("target")))
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(tools.wikifs, "wiki_lock", observed_lock)
+    monkeypatch.setattr(candidates, "record_unlocked", observed_record)
+    monkeypatch.setattr(candidates, "record",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            AssertionError("nested audit lock")))
+
+    profile = json.loads(provider.handle_tool_call("wiki_apply", {
+        "action": "write_profile", "page": "user", "content": "Atomic"}))
+    journal = json.loads(provider.handle_tool_call("wiki_apply", {
+        "action": "append_journal", "content": "Also atomic"}))
+    assert profile["ok"] and journal["ok"]
+    assert audited == [("write_profile", "profile/user.md"),
+                       ("append_journal", journal["ref"])]
+
+
+def test_apply_tool_rejects_string_booleans(fixture_wiki, tmp_path):
+    import memory_wiki
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki), "embeddings": False})
+    provider.initialize("boolean-session", hermes_home=str(tmp_path),
+                        platform="cli")
+
+    def apply(**args):
+        return json.loads(provider.handle_tool_call("wiki_apply", args))
+
+    staged = apply(action="stage", content="Keep boolean tools strict.",
+                   kind="note")
+    rejected = apply(action="approve", id=staged["id"],
+                     and_promote="false")
+    assert not rejected["ok"] and "must be a boolean" in rejected["error"]
+    _path, fm, _body, _evidence = candidates.load(provider.cfg, staged["id"])
+    assert fm["status"] == "pending"
+    rejected = apply(action="dream", apply_safe="false")
+    assert not rejected["ok"] and "must be a boolean" in rejected["error"]
 
 
 def test_apply_supersede_tool(fixture_wiki, tmp_path):

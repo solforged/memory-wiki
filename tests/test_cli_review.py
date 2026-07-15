@@ -169,6 +169,8 @@ def test_review_queue_stale_target_filters_and_summary(ready):
     assert [item["id"] for item in queue["candidates"]] == [old["id"]]
     assert queue["summary"] == {
         "total_pending": 2,
+        "total_approved": 0,
+        "total_reviewable": 2,
         "matched": 1,
         "stale_count": 1,
         "by_kind": {"preference": 1},
@@ -221,6 +223,10 @@ def test_filtered_batch_guards_do_not_mutate(ready, capsys):
     assert "--yes" in capsys.readouterr().out
 
     assert cli._cmd_review(ns(approve_filtered=True, yes=True)) == 1
+    assert candidates.load(cfg, staged["id"])[1]["status"] == "pending"
+    assert "requires at least one filter" in capsys.readouterr().out
+
+    assert cli._cmd_review(ns(approve_filtered=True, yes=True, limit=1)) == 1
     assert candidates.load(cfg, staged["id"])[1]["status"] == "pending"
     assert "requires at least one filter" in capsys.readouterr().out
 

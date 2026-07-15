@@ -12,7 +12,7 @@ import logging
 import re
 from pathlib import Path
 
-from . import schema, wikifs
+from . import safety, schema, wikifs
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,8 @@ def compile_prompt_block(cfg, pending_count=0, page_count=0,
         body = _page_body(root / rel)
         if body:
             parts.append(f"{heading}\n{_truncate(body, budget, rel)}")
-    status = f"Wiki: {page_count} pages, {pending_count} candidates pending review."
+    status = (f"Wiki: {page_count} pages, {pending_count} candidates awaiting "
+              "review or promotion.")
     if pending_count:
         oldest = (f", oldest {oldest_pending_days}d"
                   if oldest_pending_days else "")
@@ -91,11 +92,11 @@ def _truncate(text, budget, what):
 
 # -- profile writes ---------------------------------------------------------
 
-def write_profile(cfg, page, content, section=None, mode="append"):
+def write_profile(cfg, page, content, section=None, mode="append", marker=""):
     """Append to (or replace a section of) a profile page under the wiki
     lock. Returns the repo-relative path written."""
     with wikifs.wiki_lock(cfg.wiki_root):
-        return write_profile_unlocked(cfg, page, content, section, mode)
+        return write_profile_unlocked(cfg, page, content, section, mode, marker)
 
 
 def write_profile_unlocked(cfg, page, content, section=None, mode="append",
@@ -109,6 +110,12 @@ def write_profile_unlocked(cfg, page, content, section=None, mode="append",
     content = (content or "").strip()
     if not content:
         raise ValueError("content is empty")
+    if safety.contains_sensitive_content(content):
+        raise ValueError("content looks like credential material; not written")
+    if section:
+        wikifs.validate_section_heading(section)
+        if safety.contains_sensitive_content(section):
+            raise ValueError("section looks like credential material; not written")
     rel = f"profile/{page}.md"
     path = Path(cfg.wiki_root) / rel
     text = wikifs.read_text(path)
@@ -118,14 +125,19 @@ def write_profile_unlocked(cfg, page, content, section=None, mode="append",
         fm, body = wikifs.parse_frontmatter(text)
         if fm is None:
             fm, body = schema.profile_seed(f"{page}.md")[0], text
+    if marker and marker in body:
+        return rel
+    direct_marker = marker.startswith("<!-- memory-wiki: write ")
     target = section or "## Notes"
     if mode == "append":
         entry = content if content.startswith("- ") else f"- {content}"
-        if marker:
+        if marker and not direct_marker:
             entry = f"{entry} {marker}"
         body = _append_under(body, target, entry)
     else:
         body = _replace_section(body, target, content)
+    if marker and direct_marker:
+        body = f"{marker}\n{body.lstrip()}"
     fm["updated"] = wikifs.today()
     wikifs.atomic_write(path, wikifs.render_page(fm, body))
     return rel
@@ -178,10 +190,10 @@ def journal_rel(date_str=None):
     return f"journal/{date_str or wikifs.today()}.md"
 
 
-def append_journal_note(cfg, content, date_str=None):
+def append_journal_note(cfg, content, date_str=None, marker=""):
     """Timestamped bullet under ## Notes of today's journal page."""
     with wikifs.wiki_lock(cfg.wiki_root):
-        return append_journal_note_unlocked(cfg, content, date_str)
+        return append_journal_note_unlocked(cfg, content, date_str, marker)
 
 
 def append_journal_note_unlocked(cfg, content, date_str=None, marker=""):
@@ -189,12 +201,21 @@ def append_journal_note_unlocked(cfg, content, date_str=None, marker=""):
     content = (content or "").strip()
     if not content:
         raise ValueError("content is empty")
+    if safety.contains_sensitive_content(content):
+        raise ValueError("content looks like credential material; not written")
+    root = Path(cfg.wiki_root)
+    if marker:
+        for existing in sorted((root / "journal").glob("*.md")):
+            if marker in (wikifs.read_text(existing) or ""):
+                return f"journal/{existing.name}"
     rel = journal_rel(date_str)
-    path = Path(cfg.wiki_root) / rel
+    path = root / rel
     entry = f"- {wikifs.local_hhmm()} {content}"
     if marker:
         entry = f"{entry} {marker}"
     fm, body = _load_journal(path, rel)
+    if marker and marker in body:
+        return rel
     body = _append_under(body, schema.JOURNAL_NOTES, entry)
     wikifs.atomic_write(path, wikifs.render_page(fm, body))
     return rel

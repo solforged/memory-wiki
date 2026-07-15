@@ -10,7 +10,7 @@ import re
 import time
 from pathlib import Path
 
-from . import schema, wikifs
+from . import safety, schema, wikifs
 from .index import tokenize
 
 logger = logging.getLogger(__name__)
@@ -132,6 +132,12 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
     content = (content or "").strip()
     if not content:
         return {"staged": False, "reason": "empty content"}
+    if safety.contains_sensitive_content(content):
+        return {"staged": False,
+                "reason": "content looks like credential material"}
+    if any(safety.contains_sensitive_content(line) for line in (evidence or [])):
+        return {"staged": False,
+                "reason": "evidence looks like credential material"}
     if len(content) > _MAX_CONTENT:
         return {"staged": False, "reason":
                 f"content is {len(content)} chars (max {_MAX_CONTENT}); "
@@ -142,8 +148,32 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
         return {"staged": False, "reason": f"unknown confidence '{confidence}'"}
     if origin not in schema.CANDIDATE_ORIGINS:
         return {"staged": False, "reason": f"unknown origin '{origin}'"}
+    if topics is not None and not isinstance(topics, (list, tuple)):
+        return {"staged": False, "reason": "topics must be a list"}
+    if fields is not None and not isinstance(fields, dict):
+        return {"staged": False, "reason": "fields must be an object"}
+    topics = [str(topic) for topic in (topics or [])]
     fields = {k: v for k, v in (fields or {}).items()
               if k in schema.FIELDS_ALLOWLIST}
+    try:
+        wikifs.validate_frontmatter_value({
+            "target": target, "section": section,
+            "topics": topics, "fields": fields,
+        })
+    except ValueError as exc:
+        return {"staged": False, "reason": str(exc)}
+    metadata = json.dumps({
+        "target": target, "section": section,
+        "topics": topics, "fields": fields,
+    }, ensure_ascii=False, default=str)
+    if safety.contains_sensitive_content(metadata):
+        return {"staged": False,
+                "reason": "metadata looks like credential material"}
+    if section:
+        try:
+            wikifs.validate_section_heading(section)
+        except ValueError as exc:
+            return {"staged": False, "reason": str(exc)}
     if target:
         target_path = wikifs.safe_wiki_path(cfg.wiki_root, target)  # raises on escape
     if page_shaped(content):
@@ -167,7 +197,7 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
         "confidence": confidence, "origin": origin,
         "session": session_id or "", "turn": int(turn or 0),
         "created": wikifs.today(), "reviewed": "", "promoted_to": "",
-        "topics": list(topics or []), "fields": fields, "hash": chash,
+        "topics": topics, "fields": fields, "hash": chash,
     }
     if supersedes:
         fm["supersedes"] = supersedes
@@ -375,6 +405,8 @@ def list_candidates(cfg, statuses=("pending",)):
                     "session": fm.get("session", ""),
                     "turn": turn,
                     "created": fm.get("created", ""),
+                    "topics": list(fm.get("topics") or []),
+                    "hash": fm.get("hash", ""),
                     "supersedes": fm.get("supersedes", ""),
                     "age_days": wikifs.days_since(fm.get("created", "")),
                     "content": head, "ref": f"{schema.INBOX_DIR}/{path.name}"})

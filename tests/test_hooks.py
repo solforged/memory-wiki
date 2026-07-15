@@ -150,6 +150,24 @@ def test_memory_write_memory_target_goes_to_agent(provider):
     assert "Wiki pages use markdown links" in text
 
 
+def test_hook_writes_notify_search_state(provider, monkeypatch):
+    calls = []
+    monkeypatch.setattr(provider, "on_wiki_mutation",
+                        lambda: calls.append("mutation"))
+    provider.sync_turn("I prefer uv over pip for python projects.", "ok",
+                       session_id="s")
+    provider.on_pre_compress([
+        {"role": "user",
+         "content": "We decided to ship the release on Thursday."},
+    ])
+    provider.on_session_end([
+        {"role": "user", "content": "hello there"},
+        {"role": "assistant", "content": "hello"},
+    ])
+    provider.on_memory_write("add", "memory", "Keep the index current", {})
+    assert calls == ["mutation"] * 4
+
+
 def test_session_switch_reset_and_rewind(provider):
     provider.sync_turn("I prefer uv over pip for python projects.", "ok",
                        session_id="s")
@@ -188,7 +206,7 @@ def test_review_nudge_status_callback(fixture_wiki, tmp_path):
     p = memory_wiki.MemoryWikiProvider(overrides={"wiki_root": str(fixture_wiki)})
     p.initialize("sess", hermes_home=str(tmp_path), platform="cli",
                  status_callback=lines.append)
-    assert lines and "1 candidate(s) pending review" in lines[0]
+    assert lines and "1 candidate(s) awaiting review or promotion" in lines[0]
     assert "hermes memory-wiki review" in lines[0]
     # read-only contexts stay silent
     quiet = []

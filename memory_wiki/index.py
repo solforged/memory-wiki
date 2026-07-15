@@ -118,9 +118,16 @@ class WikiIndex:
         fm, body = wikifs.parse_frontmatter(text)
         fm = fm or {}
         body = _COMMENT.sub("", body)
-        indexed_body = body[:_BODY_CAP]
-        canonical_body = " ".join(body.split())
         is_candidate = rel.startswith(schema.INBOX_DIR + "/")
+        searchable_body = body
+        if is_candidate:
+            marker = f"\n{schema.EVIDENCE_HEADING}\n"
+            buffered = "\n" + body
+            marker_at = buffered.rfind(marker)
+            if marker_at >= 0:
+                searchable_body = buffered[1:marker_at]
+        indexed_body = searchable_body[:_BODY_CAP]
+        canonical_body = " ".join(searchable_body.split())
         ntype = "candidate" if is_candidate else str(fm.get("type") or "")
         title = str(fm.get("title") or path.stem)
         topics = [str(t) for t in fm.get("topics", []) if t] \

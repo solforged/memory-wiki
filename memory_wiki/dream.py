@@ -10,15 +10,32 @@ review-first.
 
 from __future__ import annotations
 
+import logging
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+
 from . import candidates, hints, promote, schema
+from .index import tokenize
+
+logger = logging.getLogger(__name__)
 
 _SAFE_PROFILE_KINDS = {"preference", "note"}
 _SAFE_CONFIDENCE = {"likely", "confident"}
-_DIRECT_TARGET_PREFIXES = ("profile/",)
+_GROUNDED_ORIGINS = {"sync_turn", "pre_compress", "session_end"}
 _EXCERPT = 140
+_WEIGHTS = {
+    "frequency": 0.24,
+    "relevance": 0.30,
+    "diversity": 0.15,
+    "recency": 0.15,
+    "consolidation": 0.10,
+    "conceptual": 0.06,
+}
 
 
-def run(cfg, index, limit=None, apply_safe=False, actor="tool", session_id=""):
+def run(cfg, index, limit=None, apply_safe=False, actor="tool", session_id="",
+        write_report=False):
     """Return a curation plan, optionally applying conservative promotions.
 
     ``apply_safe`` promotes only suggestions marked ``safe_apply``. It never
@@ -30,8 +47,16 @@ def run(cfg, index, limit=None, apply_safe=False, actor="tool", session_id=""):
         for suggestion in plan["suggestions"]:
             if not suggestion.get("safe_apply"):
                 continue
-            result = promote.approve(cfg, index, suggestion["id"], actor=actor,
-                                     session_id=session_id)
+            try:
+                result = promote.approve(
+                    cfg, index, suggestion["id"], actor=actor,
+                    session_id=session_id,
+                    precondition=_safe_apply_precondition_for(suggestion),
+                    decision_detail={
+                        "dream": suggestion.get("promotion", {})})
+            except Exception as exc:
+                logger.warning("memory-wiki: dream promotion failed: %s", exc)
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             applied.append({
                 "id": suggestion["id"],
                 "action": suggestion["action"],
@@ -41,8 +66,14 @@ def run(cfg, index, limit=None, apply_safe=False, actor="tool", session_id=""):
                 "error": result.get("error", ""),
             })
         if index is not None:
-            index.refresh()
+            try:
+                index.refresh()
+            except Exception as exc:
+                logger.warning(
+                    "memory-wiki: index refresh after dream failed: %s", exc)
     plan["applied"] = applied
+    if write_report:
+        plan["report"] = append_report(cfg, plan)
     return plan
 
 
@@ -53,8 +84,24 @@ def build_plan(cfg, index, limit=None):
     pending_all = candidates.list_candidates(cfg, statuses=("pending",))
     max_items = _coerce_limit(limit, getattr(cfg, "dream_limit", 50))
     stale_days = getattr(cfg, "candidate_stale_days", 30)
-    pending = pending_all[:max_items]
-    hint_by_id = {c["id"]: hints.candidate_hints(index, c, pending)
+    from . import recall
+    signal_by_id = recall.all_metrics(cfg)
+    rank_by_id = {}
+    for cand in pending_all:
+        loaded = candidates.load(cfg, cand["id"])
+        evidence = loaded[3] if loaded else []
+        cand["grounded"] = _grounded_evidence(
+            cand.get("origin"), evidence, cand.get("content", ""))
+        rank_by_id[cand["id"]] = promotion_score(
+            cfg, cand, signals=signal_by_id.get(cand["id"]))
+    pending = sorted(
+        pending_all,
+        key=lambda cand: (
+            not rank_by_id[cand["id"]]["eligible"],
+            -rank_by_id[cand["id"]]["score"],
+            cand.get("ref", "")),
+    )[:max_items]
+    hint_by_id = {c["id"]: hints.candidate_hints(index, c, pending_all)
                   for c in pending}
     groups = _similar_groups(pending, hint_by_id)
     emitted_groups = set()
@@ -69,10 +116,12 @@ def build_plan(cfg, index, limit=None):
                 continue
             emitted_groups.add(key)
             members = [c for c in pending if c["id"] in group]
-            suggestions.append(_group_suggestion(members, hint_by_id))
+            suggestions.append(_group_suggestion(
+                members, hint_by_id, rank_by_id))
             continue
         suggestions.append(_single_suggestion(cand, hint_by_id[cand_id],
-                                              stale_days))
+                                              stale_days,
+                                              rank_by_id[cand_id]))
 
     summary = {}
     for suggestion in suggestions:
@@ -81,8 +130,39 @@ def build_plan(cfg, index, limit=None):
         "pending": len(pending_all),
         "considered": len(pending),
         "limit": max_items,
+        "promotion_policy": _policy(cfg),
         "summary": summary,
         "suggestions": suggestions,
+    }
+
+
+def explain(cfg, index, cand_id):
+    """Explain one candidate's current promotion score and recommendation."""
+    if index is not None:
+        index.refresh()
+    cand_id = str(cand_id or "").strip()
+    matches = [item for item in candidates.list_candidates(cfg, statuses=())
+               if item.get("id") == cand_id]
+    if not matches:
+        raise ValueError(f"no candidate with id {cand_id}")
+    cand = matches[0]
+    loaded = candidates.load(cfg, cand_id)
+    evidence = loaded[3] if loaded else []
+    cand["grounded"] = _grounded_evidence(
+        cand.get("origin"), evidence, cand.get("content", ""))
+    ranking = promotion_score(cfg, cand)
+    suggestion = None
+    if cand.get("status") == "pending":
+        pending = candidates.list_candidates(cfg, statuses=("pending",))
+        hint = hints.candidate_hints(index, cand, pending)
+        suggestion = _single_suggestion(
+            cand, hint, getattr(cfg, "candidate_stale_days", 30), ranking)
+    return {
+        "id": cand_id,
+        "status": cand.get("status", ""),
+        "ref": cand.get("ref", ""),
+        "promotion": ranking,
+        "suggestion": suggestion,
     }
 
 
@@ -94,7 +174,7 @@ def _coerce_limit(value, default):
     return max(1, n)
 
 
-def _single_suggestion(cand, hint, stale_days):
+def _single_suggestion(cand, hint, stale_days, ranking):
     target = hint.get("default_target") or cand.get("target") or ""
     base = {
         "id": cand["id"],
@@ -102,15 +182,18 @@ def _single_suggestion(cand, hint, stale_days):
         "confidence": cand.get("confidence", ""),
         "target": target,
         "excerpt": _excerpt(cand.get("content", "")),
+        "content_hash": candidates.content_hash(cand.get("content", "")),
         "safe_apply": False,
+        "promotion": ranking,
     }
     age = cand.get("age_days")
     if age is not None and stale_days and age > stale_days \
-            and not _correction_like(cand):
+            and not _correction_like(cand) \
+            and not _recently_recalled(ranking, stale_days):
         base.update({
             "action": "reject_stale",
             "reason": f"pending for {age} days (stale after {stale_days}); "
-                      "recall no longer surfaces it",
+                      "no recent recall evidence supports keeping it",
             "command": f"hermes memory-wiki review --reject {cand['id']} --reason stale",
         })
     elif hint.get("covered_by") and _correction_like(cand):
@@ -156,11 +239,17 @@ def _single_suggestion(cand, hint, stale_days):
             "reason": "knowledge pages remain review-first",
             "command": f"hermes memory-wiki review --approve {cand['id']}",
         })
-    elif _safe_profile_candidate(cand, target):
+    elif _safe_profile_candidate(cand, target) and ranking["eligible"]:
         base.update({
             "action": "promote_profile",
-            "reason": "high-confidence direct profile/agent memory",
+            "reason": "high-confidence profile memory passed recall gates",
             "safe_apply": True,
+            "command": f"hermes memory-wiki review --approve {cand['id']}",
+        })
+    elif _safe_profile_candidate(cand, target):
+        base.update({
+            "action": "defer_unproven",
+            "reason": _gate_reason(ranking),
             "command": f"hermes memory-wiki review --approve {cand['id']}",
         })
     else:
@@ -172,7 +261,7 @@ def _single_suggestion(cand, hint, stale_days):
     return base
 
 
-def _group_suggestion(members, hint_by_id):
+def _group_suggestion(members, hint_by_id, rank_by_id):
     ids = [c["id"] for c in members]
     targets = sorted({(hint_by_id[c["id"]].get("default_target")
                        or c.get("target") or "") for c in members})
@@ -180,6 +269,7 @@ def _group_suggestion(members, hint_by_id):
     for c in members:
         hint = hint_by_id[c["id"]]
         item = {"id": c["id"], "excerpt": _excerpt(c.get("content", ""))}
+        item["promotion"] = rank_by_id[c["id"]]
         for key in ("covered_by", "warnings", "suggested_target"):
             if hint.get(key):
                 item[key] = hint[key]
@@ -257,9 +347,196 @@ def _safe_profile_candidate(cand, target):
     content = cand.get("content") or ""
     return (cand.get("kind") in _SAFE_PROFILE_KINDS
             and cand.get("confidence") in _SAFE_CONFIDENCE
-            and target.startswith(_DIRECT_TARGET_PREFIXES)
+            and cand.get("origin") in _GROUNDED_ORIGINS
+            and cand.get("grounded") is True
+            and not cand.get("target")
+            and target in schema.PROFILE_PAGES
             and "\n" not in content
             and not candidates.page_shaped(content))
+
+
+def _safe_apply_precondition(fm, content, evidence, expected_hash=""):
+    """Recheck autonomous-promotion safety while approve holds the wiki lock."""
+    route = promote.ROUTES.get(fm.get("kind") or "fact")
+    target = route[0] if route else ""
+    cand = dict(fm)
+    cand["content"] = content
+    cand["grounded"] = _grounded_evidence(
+        fm.get("origin"), evidence, content)
+    if fm.get("status") != "pending":
+        return "dream candidate is no longer pending"
+    if expected_hash and candidates.content_hash(content) != expected_hash:
+        return "candidate content changed after dream planning"
+    if not _safe_profile_candidate(cand, target):
+        return "candidate changed and no longer meets safe dream policy"
+    return ""
+
+
+def _safe_apply_precondition_for(suggestion):
+    expected_hash = suggestion.get("content_hash", "")
+    return lambda fm, content, evidence: _safe_apply_precondition(
+        fm, content, evidence, expected_hash=expected_hash)
+
+
+def _grounded_evidence(origin, evidence, content):
+    if origin not in _GROUNDED_ORIGINS:
+        return False
+    source = " ".join(str(line) for line in (evidence or [])
+                      if str(line).startswith("> [user, turn "))
+    content_tokens = set(tokenize(content))
+    if not source or not content_tokens:
+        return False
+    source_tokens = set(tokenize(source))
+    return len(content_tokens & source_tokens) / len(content_tokens) >= 0.7
+
+
+def _policy(cfg):
+    return {
+        "min_score": max(0.0, min(1.0, float(
+            getattr(cfg, "dream_min_score", 0.75)))),
+        "min_recall_count": max(0, int(
+            getattr(cfg, "dream_min_recall_count", 3))),
+        "min_unique_queries": max(0, int(
+            getattr(cfg, "dream_min_unique_queries", 2))),
+        "recency_half_life_days": max(1, int(
+            getattr(cfg, "dream_recency_half_life_days", 14))),
+    }
+
+
+def promotion_score(cfg, cand, signals=None):
+    """OpenClaw-style evidence score and independent threshold gates."""
+    from . import recall
+
+    signals = (recall.metrics(cfg, cand.get("id", ""))
+               if signals is None else signals)
+    expected_hash = (candidates.content_hash(cand.get("content", ""))
+                     if cand.get("content")
+                     else str(cand.get("hash") or "").strip())
+    signal_hash = str((signals or {}).get("content_hash") or "").strip()
+    if expected_hash and signal_hash != expected_hash:
+        signals = {}
+    recall_count = max(0, int(signals.get("recall_count") or 0))
+    total_score = max(0.0, float(signals.get("total_score") or 0.0))
+    avg_score = min(1.0, total_score / max(1, recall_count))
+    query_hashes = list(signals.get("query_hashes") or [])
+    recall_days = list(signals.get("recall_days") or [])
+    unique_queries = max(int(signals.get("unique_queries") or 0),
+                         len(query_hashes))
+    context_diversity = max(unique_queries, len(recall_days))
+    frequency = min(1.0, math.log1p(recall_count) / math.log1p(10))
+    diversity = min(1.0, context_diversity / 5.0)
+    recency = _recency(
+        signals.get("last_recalled_at") or signals.get("last_recalled"),
+        _policy(cfg)["recency_half_life_days"])
+    consolidation = _consolidation(recall_days)
+    conceptual = min(1.0, len(set(cand.get("topics") or [])) / 6.0)
+    components = {
+        "frequency": frequency,
+        "relevance": avg_score,
+        "diversity": diversity,
+        "recency": recency,
+        "consolidation": consolidation,
+        "conceptual": conceptual,
+    }
+    score = min(1.0, sum(_WEIGHTS[key] * components[key]
+                         for key in _WEIGHTS))
+    policy = _policy(cfg)
+    gates = {
+        "score": score >= policy["min_score"],
+        "recall_count": recall_count >= policy["min_recall_count"],
+        "unique_queries": unique_queries >= policy["min_unique_queries"],
+    }
+    return {
+        "eligible": all(gates.values()),
+        "score": round(score, 4),
+        "recall_count": recall_count,
+        "unique_queries": unique_queries,
+        "recall_days": recall_days,
+        "last_recalled_at": str(signals.get("last_recalled_at") or ""),
+        "components": {key: round(value, 4)
+                       for key, value in components.items()},
+        "gates": gates,
+        "thresholds": policy,
+    }
+
+
+def _recently_recalled(ranking, max_age_days):
+    value = str(ranking.get("last_recalled_at") or "")
+    if not value:
+        return False
+    try:
+        then = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    age = (datetime.now(timezone.utc) - then).total_seconds() / 86400.0
+    return 0 <= age <= max(0, max_age_days)
+
+
+def _recency(last_recalled_at, half_life_days):
+    if not last_recalled_at:
+        return 0.0
+    try:
+        stamp = str(last_recalled_at).replace("Z", "+00:00")
+        then = datetime.fromisoformat(stamp)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return 0.0
+    age_days = max(0.0, (datetime.now(timezone.utc) - then).total_seconds()
+                   / 86400.0)
+    return math.exp(-math.log(2) * age_days / half_life_days)
+
+
+def _consolidation(recall_days):
+    days = sorted(set(str(day) for day in recall_days if day))
+    if not days:
+        return 0.0
+    if len(days) == 1:
+        return 0.2
+    try:
+        first = datetime.fromisoformat(days[0]).date()
+        last = datetime.fromisoformat(days[-1]).date()
+        span_days = max(0, (last - first).days)
+    except ValueError:
+        span_days = 0
+    spacing = min(1.0, math.log1p(len(days) - 1) / math.log1p(4))
+    span = min(1.0, span_days / 7.0)
+    return min(1.0, 0.55 * spacing + 0.45 * span)
+
+
+def _gate_reason(ranking):
+    missing = [name for name, passed in ranking["gates"].items() if not passed]
+    return ("defer until organic recall evidence passes: "
+            + ", ".join(missing))
+
+
+def append_report(cfg, plan):
+    """Append a human-readable, non-promotable dream report."""
+    from . import wikifs
+
+    path = Path(cfg.wiki_root) / "DREAMS.md"
+    stamp = wikifs.utc_iso()
+    policy = plan.get("promotion_policy", {})
+    lines = [f"## Dream sweep {stamp}", "",
+             (f"Policy: score >= {policy.get('min_score')}, recalls >= "
+              f"{policy.get('min_recall_count')}, unique queries >= "
+              f"{policy.get('min_unique_queries')}"), ""]
+    for item in plan.get("suggestions", []):
+        ids = item.get("ids") or [item.get("id")]
+        ranking = item.get("promotion") or {}
+        score = ranking.get("score")
+        suffix = f", score {score:.3f}" if isinstance(score, (int, float)) else ""
+        lines.append(f"- {', '.join(i for i in ids if i)}: "
+                     f"{item.get('action', 'review')}{suffix}")
+    if not plan.get("suggestions"):
+        lines.append("- No pending candidates.")
+    lines += ["", "Dream reports are review artifacts, never promotion inputs.", ""]
+    with wikifs.wiki_lock(cfg.wiki_root):
+        current = wikifs.read_text(path) or "# Dream diary\n\n"
+        wikifs.atomic_write(path, current.rstrip() + "\n\n" + "\n".join(lines))
+    return "DREAMS.md"
 
 
 def _excerpt(text):

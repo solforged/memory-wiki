@@ -25,6 +25,8 @@ _MAX_JSON = 4 * 1024 * 1024
 _MAX_JSONL = 8 * 1024 * 1024
 _MAX_REPORT = 1024 * 1024
 _MAX_ITEMS = 40
+_MAX_CANDIDATE = 128 * 1024
+_SUPPORTED_SCHEMA_VERSION = 2
 _CONFIG_DEFAULTS = {
     "wiki_root": "~/wiki",
     "search_backend": "local",
@@ -35,6 +37,7 @@ _CONFIG_DEFAULTS = {
     "qmd_embed_interval_seconds": 3600,
     "dream_schedule_enabled": False,
     "dream_schedule": "0 3 * * *",
+    "candidate_stale_days": 30,
 }
 _REPORT_NAMES = (
     "open-questions",
@@ -70,6 +73,33 @@ async def get_overview() -> dict[str, Any]:
         }
 
 
+@router.get("/review")
+async def get_review(limit: int = _MAX_ITEMS, status: str = "",
+                     kind: str = "", origin: str = "") -> dict[str, Any]:
+    """Return bounded candidate details for read-only review."""
+    try:
+        return build_review(
+            limit=limit, status=status, kind=kind, origin=origin)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Review queue unavailable: {type(exc).__name__}",
+        }
+
+
+@router.get("/history")
+async def get_history(limit: int = _MAX_ITEMS, action: str = "",
+                      target: str = "") -> dict[str, Any]:
+    """Return bounded, sanitized lifecycle audit events."""
+    try:
+        return build_history(limit=limit, action=action, target=target)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"History unavailable: {type(exc).__name__}",
+        }
+
+
 def build_overview(hermes_home: str | Path | None = None) -> dict[str, Any]:
     home = _hermes_home(hermes_home)
     config, config_issue = _plugin_config(home)
@@ -96,6 +126,102 @@ def build_overview(hermes_home: str | Path | None = None) -> dict[str, Any]:
         "scheduler": _scheduler_overview(home, config),
         "candidates": _candidate_overview(root),
         "qmd": _qmd_overview(root, config),
+        "issues": issues[:20],
+    }
+
+
+def build_review(hermes_home: str | Path | None = None, limit: int = _MAX_ITEMS,
+                 status: str = "", kind: str = "",
+                 origin: str = "") -> dict[str, Any]:
+    """Read candidate Markdown without importing package write paths."""
+    home = _hermes_home(hermes_home)
+    config, config_issue = _plugin_config(home)
+    root = _wiki_root(config)
+    item_limit = _api_limit(limit)
+    stale_days = _positive_int(config.get("candidate_stale_days"), 30)
+    filters = {
+        "status": _clean_text(status, 30).lower(),
+        "kind": _clean_text(kind, 30).lower(),
+        "origin": _clean_text(origin, 40).lower(),
+    }
+    issues = [config_issue] if config_issue else []
+    candidates: list[dict[str, Any]] = []
+    inbox = root / "_inbox"
+    if inbox.is_dir():
+        try:
+            paths = sorted(inbox.glob("*.md"))[:20_000]
+        except OSError:
+            paths = []
+            issues.append("Candidate inbox could not be listed.")
+        for path in paths:
+            candidate, issue = _read_candidate(path, root, stale_days)
+            if issue:
+                issues.append(issue)
+            if candidate is None:
+                continue
+            if not filters["status"] and candidate.get("status") not in (
+                    "pending", "approved"):
+                continue
+            if any(filters[key] and candidate.get(key) != filters[key]
+                   for key in filters):
+                continue
+            candidates.append(candidate)
+    candidates.sort(key=lambda item: (item.get("ref", ""), item.get("id", "")))
+    total = len(candidates)
+    returned = candidates[:item_limit]
+    return {
+        "ok": True,
+        "read_only": True,
+        "summary": {
+            "matched": total,
+            "returned": len(returned),
+            "truncated": total > len(returned),
+            "stale": sum(1 for item in candidates if item.get("stale")),
+            "by_status": _item_counts(candidates, "status"),
+            "by_kind": _item_counts(candidates, "kind"),
+            "by_origin": _item_counts(candidates, "origin"),
+        },
+        "candidates": returned,
+        "issues": issues[:20],
+    }
+
+
+def build_history(hermes_home: str | Path | None = None,
+                  limit: int = _MAX_ITEMS, action: str = "",
+                  target: str = "") -> dict[str, Any]:
+    """Read lifecycle audit entries without repairing or locking the log."""
+    home = _hermes_home(hermes_home)
+    config, config_issue = _plugin_config(home)
+    root = _wiki_root(config)
+    item_limit = _api_limit(limit)
+    rows, issue = _read_jsonl(root / "_inbox" / "decisions.jsonl", _MAX_JSONL)
+    action = _clean_text(action, 80)
+    target = _clean_text(target, 240)
+    events = []
+    for row in rows:
+        if action and str(row.get("action") or "") != action:
+            continue
+        if target and str(row.get("target") or "") != target:
+            continue
+        events.append(_public_history_event(row))
+    events.sort(key=lambda item: (item.get("ts", ""), item["event_id"]),
+                reverse=True)
+    total = len(events)
+    returned = events[:item_limit]
+    issues = [value for value in (config_issue,
+              f"Audit log: {issue}." if issue not in ("", "missing") else "")
+              if value]
+    return {
+        "ok": True,
+        "read_only": True,
+        "summary": {
+            "matched": total,
+            "returned": len(returned),
+            "truncated": total > len(returned),
+            "by_action": _item_counts(events, "action"),
+            "by_actor": _item_counts(events, "actor"),
+        },
+        "events": returned,
         "issues": issues[:20],
     }
 
@@ -211,10 +337,25 @@ def _compiler_overview(root: Path) -> tuple[dict[str, Any], dict[str, Any], dict
     if digest_issue and digest_issue != "missing":
         issues.append(f"Compiler digest: {digest_issue}.")
     digest = digest if isinstance(digest, dict) else {}
+    artifact_issue = _schema_issue(digest, "Compiler digest")
+    if artifact_issue:
+        issues.append(artifact_issue)
+        digest = {}
 
     claim_rows, claims_issue = _read_jsonl(claims_path, _MAX_JSONL)
     if claims_issue and claims_issue != "missing":
         issues.append(f"Claim cache: {claims_issue}.")
+    supported_rows = []
+    rejected_claim_schema = False
+    for row in claim_rows:
+        artifact_issue = _schema_issue(row, "Claim cache")
+        if artifact_issue:
+            rejected_claim_schema = True
+            if artifact_issue not in issues:
+                issues.append(artifact_issue)
+            continue
+        supported_rows.append(row)
+    claim_rows = supported_rows
 
     reports = {
         name: _report_overview(root / "reports" / f"{name}.md")
@@ -314,7 +455,7 @@ def _compiler_overview(root: Path) -> tuple[dict[str, Any], dict[str, Any], dict
     compiler = {
         "available": bool(digest or claim_rows or any(r["exists"] for r in reports.values())),
         "digest_available": bool(digest),
-        "claims_available": claims_path.is_file(),
+        "claims_available": claims_path.is_file() and not rejected_claim_schema,
         "generated_at": generated_at,
         "schema_version": digest.get("version") or digest.get("schemaVersion") or "",
         "page_count": page_total,
@@ -333,6 +474,19 @@ def _compiler_overview(root: Path) -> tuple[dict[str, Any], dict[str, Any], dict
         "provenance_gaps": provenance_items[:_MAX_ITEMS],
     }
     return compiler, claims, reports, issues
+
+
+def _schema_issue(value: Any, label: str) -> str:
+    """Reject explicit artifact versions this bundled reader cannot parse."""
+    if not isinstance(value, dict) or "schemaVersion" not in value:
+        return ""
+    version = value.get("schemaVersion")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        return f"{label}: unsupported schemaVersion."
+    if version > _SUPPORTED_SCHEMA_VERSION:
+        return (f"{label}: schemaVersion {version} is newer than supported "
+                f"version {_SUPPORTED_SCHEMA_VERSION}.")
+    return ""
 
 
 def _read_json(path: Path, limit: int) -> tuple[Any, str]:
@@ -377,6 +531,150 @@ def _bounded_text(path: Path, limit: int) -> str:
     if size > limit:
         raise ValueError(f"file exceeds {limit} bytes")
     return path.read_text(encoding="utf-8")
+
+
+def _read_candidate(path: Path, root: Path,
+                    stale_days: int) -> tuple[dict[str, Any] | None, str]:
+    try:
+        text = _bounded_text(path, _MAX_CANDIDATE)
+    except (OSError, UnicodeError, ValueError):
+        return None, f"Candidate {path.name} is unreadable or too large."
+    frontmatter, body = _simple_frontmatter(text)
+    if not frontmatter:
+        return None, f"Candidate {path.name} has invalid frontmatter."
+    content = re.split(
+        r"(?m)^##\s+Evidence\s*$", body, maxsplit=1)[0].strip()
+    clean_content = _clean_content(content, 2_000)
+    created = _clean_text(frontmatter.get("created"), 40)
+    age_days = _days_since(created)
+    session = str(frontmatter.get("session") or "")
+    rel = path.relative_to(root).as_posix()
+    title = _candidate_title(content, frontmatter.get("id") or path.stem)
+    return {
+        "id": _clean_text(frontmatter.get("id"), 160),
+        "title": title,
+        "content": clean_content,
+        "content_truncated": len(content) > len(clean_content),
+        "preview": _clean_text(content, 240),
+        "status": _clean_text(frontmatter.get("status"), 30).lower(),
+        "kind": _clean_text(frontmatter.get("kind"), 30).lower(),
+        "confidence": _clean_text(frontmatter.get("confidence"), 30).lower(),
+        "origin": _clean_text(frontmatter.get("origin"), 40).lower(),
+        "session_hash": (_session_hash(session) if session else ""),
+        "turn": _positive_int(frontmatter.get("turn"), 0),
+        "created": created,
+        "age_days": age_days,
+        "stale": bool(age_days is not None and stale_days
+                      and age_days > stale_days),
+        "target": _clean_text(frontmatter.get("target"), 240),
+        "section": _clean_text(frontmatter.get("section"), 160),
+        "supersedes": _clean_text(frontmatter.get("supersedes"), 160),
+        "content_hash": _clean_text(frontmatter.get("hash"), 160),
+        "ref": rel,
+    }, ""
+
+
+def _simple_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    end = next((index for index, line in enumerate(lines[1:], 1)
+                if line.strip() == "---"), None)
+    if end is None:
+        return {}, text
+    values: dict[str, Any] = {}
+    for raw in lines[1:end]:
+        if not raw or raw[0].isspace() or ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        key = _yaml_key(key)
+        if key:
+            values[key] = _yaml_scalar(_strip_yaml_comment(value).strip())
+    return values, "\n".join(lines[end + 1:])
+
+
+def _candidate_title(content: str, fallback: Any) -> str:
+    for raw in content.splitlines():
+        line = re.sub(r"^(?:#{1,6}|[-*+])\s+", "", raw.strip())
+        if line:
+            return _clean_text(line, 240)
+    return _clean_text(fallback, 240) or "Untitled candidate"
+
+
+def _clean_content(value: Any, limit: int) -> str:
+    text = str(value or "").replace("\x00", "")
+    return text[:limit]
+
+
+def _days_since(value: Any) -> int | None:
+    raw = _clean_text(value, 40)
+    if not raw:
+        return None
+    try:
+        created = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+    return max(0, (datetime.now(timezone.utc).date() - created).days)
+
+
+def _public_history_event(row: dict[str, Any]) -> dict[str, Any]:
+    timestamp = _clean_text(row.get("ts"), 80)
+    action = _clean_text(row.get("action"), 80)
+    cand_id = _clean_text(row.get("id"), 160)
+    target = _clean_text(row.get("target"), 240)
+    actor = _clean_text(row.get("actor"), 80)
+    session = str(row.get("session") or "")
+    content_hash = _clean_text(row.get("hash"), 160)
+    seed = "\0".join((timestamp, action, cand_id, target, content_hash))
+    detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+    allowed = ("reason", "kind", "origin", "confidence", "status", "ref",
+               "superseded_by")
+    safe_detail = {
+        key: _clean_text(detail[key], 500) for key in allowed
+        if isinstance(detail.get(key), (str, int, float, bool))
+        and detail.get(key) not in (None, "")
+    }
+    return {
+        "event_id": "event-" + hashlib.sha256(
+            seed.encode("utf-8", "replace")).hexdigest()[:12],
+        "ts": timestamp,
+        "action": action,
+        "id": cand_id,
+        "target": target,
+        "actor": actor,
+        "session_hash": _session_hash(session) if session else "",
+        "content_hash": content_hash,
+        "detail": safe_detail,
+    }
+
+
+def _session_hash(value: str) -> str:
+    return hashlib.sha256(
+        value.encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def _api_limit(value: Any) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = _MAX_ITEMS
+    return min(_MAX_ITEMS, max(1, result))
+
+
+def _positive_int(value: Any, fallback: int) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(0, result)
+
+
+def _item_counts(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = _clean_text(item.get(key), 80) or "unknown"
+        counts[value] = counts.get(value, 0) + 1
+    return {name: counts[name] for name in sorted(counts)}
 
 
 def _report_overview(path: Path) -> dict[str, Any]:

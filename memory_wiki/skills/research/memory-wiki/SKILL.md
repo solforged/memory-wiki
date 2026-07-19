@@ -21,15 +21,17 @@ Use the memory wiki as one system with three distinct layers:
 
 - **Living memory:** `profile/user.md` and `profile/agent.md`, written directly for durable personal context and working agreements.
 - **Episodic memory:** `journal/YYYY-MM-DD.md`, appended directly for dated notes and session episodes.
-- **Durable knowledge:** concepts, claims, sources, atlases, syntheses, refs, and tastes. Changes enter through staged candidates and human review.
+- **Durable knowledge:** concepts, claims, sources, atlases, syntheses, entities, refs, and tastes. Changes enter through staged candidates and human review.
+- **Private archive:** `raw/` contains user-authorized edited transcripts and archival evidence. It is searchable through the `raw` or `all` corpus but excluded from the default curated `pages` corpus.
 
-This skill replaces the generic `llm-wiki` workflow for this repository. Do not impose that skill's `raw/`, `SCHEMA.md`, or append-only `log.md` architecture. The authoritative local contract is `_meta/style-guide.md`, the plugin's validators, and the review queue.
+This skill replaces the generic `llm-wiki` workflow for this repository. Do not impose that skill's repository-wide `raw/`, `SCHEMA.md`, or append-only `log.md` architecture. This plugin's `raw/` is a narrow evidence archive, not the canonical knowledge layer. The authoritative local contract is `_meta/style-guide.md`, the plugin's validators, and the review queue.
 
 ## When to use
 
 Load this skill when the user asks to:
 
 - query, research from, ingest into, or curate the memory wiki;
+- import, search, or curate user-authorized edited transcripts in the private `raw/` archive;
 - preserve a source, argument, concept, claim, reading guide, or synthesis;
 - review candidates, resolve duplication, supersede stale memory, or run a dream pass;
 - lint, compile, audit, or assess the wiki's health;
@@ -48,6 +50,7 @@ Don't use it merely because a substantive conversation *could* become a note. Pr
 7. **Preserve epistemic roles.** Keep source evidence, the user's hypothesis, rival interpretations, and agent analysis visibly distinct. Attribute private interpretations to the user rather than laundering them into neutral fact.
 8. **Cite what you use.** Answers grounded in the wiki cite repo-relative paths. Open cited pages with `wiki_get`; search snippets alone aren't enough for consequential claims.
 9. **Protect unrelated work.** Before bulk CLI or filesystem operations, inspect git status. Never overwrite, revert, commit, or fold in unrelated dirty files.
+10. **Raw is deliberate and private.** Add archival transcripts only at the user's request. Remove system prompts, tool traces, platform identifiers, local paths, secrets, and runtime metadata; label material as edited rather than presenting it as verbatim.
 
 ## Orientation procedure
 
@@ -59,7 +62,13 @@ At the start of a curation task:
 2. Open `_meta/style-guide.md` with `wiki_get`.
 3. Search the topic with `wiki_search`.
    - Use `corpus="pages"` for durable knowledge.
-   - Use `corpus="all"` only when profile, journal, or candidates may matter.
+   - Search `profile`, `journal`, or `candidates` explicitly when those layers
+     may matter. Reserve `corpus="all"`, which also includes private `raw/`, for
+     user-authorized archival recall.
+   - Prefer `granularity="auto"`; use `claim`, `evidence`, or `heading` when the
+     task needs an exact retrieval unit.
+   - For historical questions, set `as_of` deliberately. Do not include future,
+     expired, or superseded claims unless the question requires history.
 4. Open the relevant pages and any candidate refs returned.
 5. For lint, claim-health, or broad curation, also open `wiki_get(ref="compiler")` and `wiki_get(ref="review-queue")`.
 
@@ -76,7 +85,9 @@ At the start of a curation task:
    - **Rival interpretations**
    - **Agent analysis**
 5. Cite repo-relative paths inline, for example `claims/example.md` or `sources/example.md`.
-6. Don’t file every answer. Stage a synthesis only when it would be costly to reconstruct, materially connects existing pages, or the user asks to preserve it.
+6. Use `wiki_get(ref="context-pack", query="...")` when a task needs a bounded,
+   cited bundle rather than an unbounded sequence of searches.
+7. Don’t file every answer. Stage a synthesis only when it would be costly to reconstruct, materially connects existing pages, or the user asks to preserve it.
 
 **Completion criterion:** every important wiki-derived claim is traceable to an opened page, and any new synthesis remains explicitly proposed until reviewed.
 
@@ -107,9 +118,12 @@ Use the page-type table in `references/page-types.md`.
 - Use `claim` for one explicit, independently searchable proposition with evidence.
 - Use `concept` for a durable explanation or conceptual history.
 - Use `synthesis` for a multi-source argument or integrated analysis.
+- Use `entity` for a named actor that needs a stable ID and evidenced
+  relationships.
 - Use `ref` for a person, organization, technical guide, reusable reference, or entity dossier.
 - Use `atlas` for navigation across an established cluster.
 - Use `taste` for stable collaboration, research, or aesthetic preferences that merit a typed page rather than a profile bullet.
+- Use `raw` only for private archival evidence such as an edited conversation transcript. Raw records preserve context; they do not establish claims merely because an assistant said them.
 
 Avoid pages for passing mentions. Prefer one well-scoped page with links over a spray of stubs.
 
@@ -214,14 +228,40 @@ When a remembered item is outdated:
 
 Full pages promoted as page-shaped candidates can't be superseded through this bullet-level path. Don’t pretend otherwise; propose a reviewed companion/replacement strategy.
 
-## Curation and dreaming
+For structured claims, preserve history: the replacement gets `validFrom` and
+`supersedes`, while the prior claim becomes `superseded` with an exclusive
+`validUntil`. Evidence excerpts require a matching `sha256:` `excerptHash`.
+Never overwrite a prior claim merely to make current recall look tidy.
+
+## Entity workflow
+
+- Search `entities/` and `refs/`, including aliases, before creating a node.
+- Entity IDs use `entity.<namespace>`-style lowercase stable identifiers.
+- A relationship is an object with `predicate` and `targetId`; the target is an
+  entity ID, not a path or title.
+- Treat `reports/entity-migration-candidates.md` as review advice only. Do not
+  move a `refs/` page without an explicit curation decision.
+- Compile after graph changes and resolve duplicate IDs, invalid targets,
+  orphaned targets, and ambiguous relationships.
+
+## Curation, dreaming, and maintenance
 
 - Use `wiki_get(ref="dream")` for a read-only deep curation plan.
+- Use `wiki_get(ref="semantic-maintenance")` for read-only `duplicate`,
+  `supports`, `refines`, `contradicts`, `temporal_successor`, and `unrelated`
+  findings.
+- Semantic findings are content- and classifier-bound. Regenerate before any
+  decision. The user-facing write path is an explicitly confirmed CLI
+  acceptance, which stages a pending candidate and does not approve or promote
+  it.
 - Use `wiki_apply(action="dream", phase="deep"|"all", ...)` when the user asks to run a phase.
 - Treat `light` and `rem` as reinforcement/analysis, not promotion authority.
 - `apply_safe=true` is narrow but still a write. Use it only with explicit authorization.
 - Scheduled policy and dream reports are operational choices, not defaults to enable casually.
 - Staged dream suggestions are not established facts until promoted.
+- Use `wiki_get(ref="review")`, `maintenance`, or `history` for bounded,
+  privacy-aware operational views. None of these read models authorizes a
+  write.
 
 ## Lint, compile, and health
 
@@ -232,6 +272,7 @@ cd <wiki_root>
 python3 _scripts/check.py
 hermes memory-wiki lint
 hermes memory-wiki compile
+hermes memory-wiki migrate --plan
 git diff --check
 git status --short
 ```
@@ -243,6 +284,7 @@ Check at least:
 - schema and filename errors;
 - broken or malformed wikilinks from `_scripts/check.py`;
 - missing evidence, low-confidence claims, stale pages, and contradiction clusters;
+- temporal lineage and entity relationship integrity;
 - pending/approved candidates and stale review items;
 - compiler output freshness;
 - search backend degradation;
@@ -254,7 +296,7 @@ Compiler-owned `reports/` and `.memory-wiki/cache/` are derived. Don’t manuall
 
 ## Common pitfalls
 
-1. **Loading `llm-wiki` too.** Its architecture conflicts with this repository. Use this skill alone for memory-wiki curation.
+1. **Loading `llm-wiki` too.** Its architecture conflicts with this repository even though both can use a directory named `raw/`. Use this skill alone for memory-wiki curation.
 2. **Answering from recall snippets.** Search narrows the field; `wiki_get` supplies citeable content.
 3. **Treating a candidate as fact.** Pending and approved-but-unpromoted material is still provisional.
 4. **Approving your own proposal automatically.** Staging and review are separate acts.

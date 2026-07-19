@@ -9,13 +9,15 @@ import os
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import memory_wiki
 
-HERMES_SRC = Path(os.environ.get("HERMES_AGENT_SRC",
-                                 "/Users/admin/src/hermes-agent"))
+HERMES_SRC = Path(
+    os.environ.get("HERMES_AGENT_SRC", "~/.hermes/hermes-agent")
+).expanduser()
 
 
 def _load_memory_manager():
@@ -69,14 +71,15 @@ def test_signatures_match_the_abc():
                 for q in ours_params), f"{name} missing param {p}"
 
 
-def test_manager_round_trip(fixture_wiki, tmp_path):
+@pytest.mark.parametrize("platform", ("cli", "desktop"))
+def test_manager_round_trip(fixture_wiki, tmp_path, platform):
     mm = _load_memory_manager()
     manager = mm.MemoryManager()
     provider = memory_wiki.MemoryWikiProvider(
         overrides={"wiki_root": str(fixture_wiki)})
     manager.add_provider(provider)  # returns None; registration is by side effect
     assert provider in manager._providers
-    manager.initialize_all(session_id="rt123456-full", platform="cli",
+    manager.initialize_all(session_id="rt123456-full", platform=platform,
                            hermes_home=str(tmp_path), agent_context="primary")
 
     # tool schemas surface through the manager
@@ -120,3 +123,40 @@ def test_manager_round_trip(fixture_wiki, tmp_path):
     assert "session rt123456" in jtext
 
     manager.shutdown_all()
+
+
+@pytest.mark.parametrize(
+    ("enabled_toolsets", "expected"),
+    ((["terminal", "memory"], {"wiki_apply", "wiki_get", "wiki_search"}),
+     (["terminal"], set())),
+)
+def test_manager_tool_injection_respects_memory_toolset(
+        fixture_wiki, tmp_path, enabled_toolsets, expected):
+    mm = _load_memory_manager()
+    manager = mm.MemoryManager()
+    provider = memory_wiki.MemoryWikiProvider(overrides={
+        "wiki_root": str(fixture_wiki),
+        "embeddings": False,
+        "auto_compile": False,
+    })
+    manager.add_provider(provider)
+    manager.initialize_all(
+        session_id="desktop-tool-gate",
+        platform="desktop",
+        hermes_home=str(tmp_path),
+        agent_context="primary",
+    )
+    agent = SimpleNamespace(
+        _memory_manager=manager,
+        enabled_toolsets=enabled_toolsets,
+        tools=[],
+        valid_tool_names=set(),
+    )
+
+    try:
+        added = mm.inject_memory_provider_tools(agent)
+        assert agent.valid_tool_names == expected
+        assert {tool["function"]["name"] for tool in agent.tools} == expected
+        assert added == len(expected)
+    finally:
+        manager.shutdown_all()

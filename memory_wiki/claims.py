@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import math
 import re
+from hashlib import sha256
 from datetime import date, datetime, timezone
+
+from . import temporal
 
 
 AGING_DAYS = 30
@@ -18,16 +21,21 @@ CONTESTED_STATUSES = frozenset(
     ("contested", "contradicted", "refuted", "superseded"))
 
 CLAIM_FIELDS = frozenset(
-    ("id", "text", "status", "confidence", "evidence", "updatedAt"))
+    ("id", "text", "status", "confidence", "evidence", "updatedAt",
+     "validFrom", "validUntil", "supersedes"))
 EVIDENCE_FIELDS = frozenset((
     "kind", "sourceId", "path", "lines", "weight", "confidence",
-    "privacyTier", "note", "updatedAt",
+    "privacyTier", "note", "updatedAt", "observedAt", "excerpt",
+    "excerptHash",
 ))
 _EVIDENCE_STRING_FIELDS = (
     "kind", "sourceId", "path", "lines", "privacyTier", "note", "updatedAt",
+    "observedAt", "excerpt", "excerptHash",
 )
-_CLAIM_STRING_FIELDS = ("id", "status", "updatedAt")
+_CLAIM_STRING_FIELDS = (
+    "id", "status", "updatedAt", "validFrom", "validUntil")
 _SPACE = re.compile(r"\s+")
+_EXCERPT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 CLAIM_ID = re.compile(
     r"^claim\.[a-z0-9]+(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -55,6 +63,26 @@ def normalize_status(status=None):
 
 def is_contested(status=None):
     return normalize_status(status) in CONTESTED_STATUSES
+
+
+def excerpt_hash(excerpt):
+    """Content-bound SHA-256 anchor for an exact evidence excerpt."""
+    if not isinstance(excerpt, str):
+        raise ValueError("excerpt must be a string")
+    return "sha256:" + sha256(excerpt.encode("utf-8")).hexdigest()
+
+
+def superseded_claim_ids(value):
+    """Normalize a claim's predecessor reference(s) to a stable list."""
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple)):
+        return []
+    result = []
+    for item in values:
+        item = _string(item)
+        if item is not None and item not in result:
+            result.append(item)
+    return result
 
 
 def normalize_evidence(value):
@@ -109,6 +137,15 @@ def normalize_claims(value):
         updated_at = _string(entry.get("updatedAt"))
         if updated_at is not None:
             claim["updatedAt"] = updated_at
+        for field in ("validFrom", "validUntil"):
+            value = _string(entry.get(field))
+            if value is not None:
+                claim[field] = value
+        predecessors = superseded_claim_ids(entry.get("supersedes"))
+        if predecessors:
+            claim["supersedes"] = (predecessors[0]
+                                    if isinstance(entry.get("supersedes"), str)
+                                    else predecessors)
         normalized.append(claim)
     return normalized
 
@@ -140,6 +177,28 @@ def validate_claims(value, prefix="claims"):
         if claim_id is not None and not CLAIM_ID.fullmatch(claim_id):
             errors.append(
                 f"{path}.id must match claim.<namespace>.<local-name>")
+        errors.extend(temporal.interval_errors(entry, path))
+        predecessors = superseded_claim_ids(entry.get("supersedes"))
+        if "supersedes" in entry and not predecessors:
+            errors.append(
+                f"{path}.supersedes must be a claim id or non-empty list")
+        for predecessor in predecessors:
+            if not CLAIM_ID.fullmatch(predecessor):
+                errors.append(
+                    f"{path}.supersedes must contain claim ids")
+            elif predecessor == claim_id:
+                errors.append(f"{path}.supersedes must not reference itself")
+        raw_predecessors = entry.get("supersedes")
+        raw_predecessors = (raw_predecessors
+                            if isinstance(raw_predecessors, (list, tuple))
+                            else [raw_predecessors])
+        normalized_raw = [_string(item) for item in raw_predecessors]
+        normalized_raw = [item for item in normalized_raw if item is not None]
+        if len(normalized_raw) != len(set(normalized_raw)):
+            errors.append(f"{path}.supersedes must not contain duplicates")
+        if "updatedAt" in entry and temporal.parse_timestamp(
+                entry.get("updatedAt")) is None:
+            errors.append(f"{path}.updatedAt must be an ISO date or datetime")
         if "confidence" in entry:
             _validate_confidence(entry["confidence"], f"{path}.confidence", errors)
         evidence = entry.get("evidence", [])
@@ -166,23 +225,24 @@ def validate_claims(value, prefix="claims"):
             if "confidence" in item:
                 _validate_confidence(
                     item["confidence"], f"{evidence_path}.confidence", errors)
+            for field in ("updatedAt", "observedAt"):
+                if field in item and temporal.parse_timestamp(
+                        item.get(field)) is None:
+                    errors.append(
+                        f"{evidence_path}.{field} must be an ISO date or datetime")
+            excerpt = item.get("excerpt")
+            digest = item.get("excerptHash")
+            if excerpt is not None and digest is None:
+                errors.append(
+                    f"{evidence_path}.excerptHash is required with excerpt")
+            if digest is not None:
+                if not isinstance(digest, str) or not _EXCERPT_HASH.fullmatch(digest):
+                    errors.append(
+                        f"{evidence_path}.excerptHash must be sha256:<64 lowercase hex>")
+                elif isinstance(excerpt, str) and excerpt_hash(excerpt) != digest:
+                    errors.append(
+                        f"{evidence_path}.excerptHash does not match excerpt")
     return errors
-
-
-def _parse_timestamp(value):
-    value = _string(value)
-    if value is None:
-        return None
-    try:
-        if len(value) == 10:
-            parsed = datetime.combine(date.fromisoformat(value), datetime.min.time())
-        else:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _coerce_now(now):
@@ -197,7 +257,7 @@ def _coerce_now(now):
 
 def freshness(timestamp=None, now=None):
     """Classify one timestamp into fresh, aging, stale, or unknown."""
-    parsed = _parse_timestamp(timestamp)
+    parsed = temporal.parse_timestamp(timestamp)
     raw = _string(timestamp)
     if parsed is None or raw is None:
         return {"level": "unknown", "reason": "missing updatedAt"}
@@ -226,9 +286,13 @@ def assess_claim_freshness(page, claim, now=None):
     if _string(claim.get("updatedAt")) is not None:
         raw_timestamps.append(claim["updatedAt"])
     for evidence in claim.get("evidence", []):
-        if isinstance(evidence, dict) and _string(evidence.get("updatedAt")) is not None:
-            raw_timestamps.append(evidence["updatedAt"])
-    parsed = [(stamp, _parse_timestamp(stamp)) for stamp in raw_timestamps]
+        if not isinstance(evidence, dict):
+            continue
+        for field in ("observedAt", "updatedAt"):
+            if _string(evidence.get(field)) is not None:
+                raw_timestamps.append(evidence[field])
+    parsed = [(stamp, temporal.parse_timestamp(stamp))
+              for stamp in raw_timestamps]
     valid = [(stamp, when) for stamp, when in parsed if when is not None]
     if valid:
         latest = max(valid, key=lambda item: item[1])[0]
@@ -253,6 +317,7 @@ def collect_health(pages, now=None):
                 "evidenceCount": len(claim.get("evidence", [])),
                 "missingEvidence": not claim.get("evidence"),
                 "freshness": assess_claim_freshness(page, claim, now),
+                "temporalState": temporal.claim_state(claim, now),
             }
             if page.get("id"):
                 item["pageId"] = page["id"]
@@ -260,8 +325,64 @@ def collect_health(pages, now=None):
                 item["claimId"] = claim_id
             if _confidence(claim.get("confidence")) is not None:
                 item["confidence"] = float(claim["confidence"])
+            predecessors = superseded_claim_ids(claim.get("supersedes"))
+            if predecessors:
+                item["supersedes"] = predecessors
             records.append(item)
     return records
+
+
+def lineage_issues(pages):
+    """Find missing, duplicate, and cyclic semantic supersession links."""
+    claims_by_id = {}
+    for page in pages:
+        for claim in page.get("claims", []):
+            claim_id = _string(claim.get("id"))
+            if claim_id:
+                claims_by_id.setdefault(claim_id, []).append(
+                    (page.get("path", ""), claim))
+    issues = []
+    for claim_id, entries in sorted(claims_by_id.items()):
+        if len(entries) > 1:
+            issues.append({
+                "kind": "duplicate-id", "claimId": claim_id,
+                "paths": sorted(path for path, _claim in entries),
+            })
+    edges = {}
+    for claim_id, entries in claims_by_id.items():
+        predecessors = superseded_claim_ids(entries[0][1].get("supersedes"))
+        edges[claim_id] = predecessors
+        for predecessor in predecessors:
+            if predecessor not in claims_by_id:
+                issues.append({
+                    "kind": "missing-predecessor", "claimId": claim_id,
+                    "predecessorId": predecessor, "paths": [entries[0][0]],
+                })
+
+    visiting = set()
+    visited = set()
+    cycles = set()
+
+    def walk(node, trail):
+        if node in visiting:
+            start = trail.index(node)
+            cycles.add(tuple(trail[start:]))
+            return
+        if node in visited:
+            return
+        visiting.add(node)
+        for predecessor in edges.get(node, []):
+            if predecessor in edges:
+                walk(predecessor, trail + (
+                    [] if predecessor in trail else [predecessor]))
+        visiting.remove(node)
+        visited.add(node)
+
+    for claim_id in sorted(edges):
+        walk(claim_id, [claim_id])
+    for cycle in sorted(cycles):
+        issues.append({"kind": "cycle", "claimIds": list(cycle)})
+    return issues
 
 
 def contradiction_clusters(pages, now=None):

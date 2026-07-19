@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "candidateFields": [
+    "author", "medium", "year", "url", "aliases", "ref", "supports",
+    "contradicts", "stance", "maturity", "status", "claim_id",
+    "privacyTier", "recordFormat", "id", "entityKind", "relationships",
+    "validFrom", "validUntil", "supersedes", "observedAt"
+  ],
+  "enums": {
+    "stance": ["external", "candidate", "model"],
+    "confidence": ["unassessed", "speculative", "plausible", "likely", "confident"],
+    "maturity": ["seedling", "budding", "evergreen"],
+    "status": ["draft", "published"],
+    "medium": ["book", "textbook", "paper", "course", "video", "post", "podcast", "game", "thread", "wiki"],
+    "entityKind": ["person", "organization", "institution", "party", "collective", "place", "event", "other"],
+    "privacyTier": ["public", "local-private", "private"]
+  },
+  "types": [
+    {"directory": "claims", "type": "claim", "layer": "knowledge", "writer": "review", "required": ["stance", "confidence", "maturity"]},
+    {"directory": "concepts", "type": "concept", "layer": "knowledge", "writer": "review", "required": []},
+    {"directory": "sources", "type": "source", "layer": "knowledge", "writer": "review", "required": ["author", "medium"]},
+    {"directory": "atlases", "type": "atlas", "layer": "knowledge", "writer": "review", "required": []},
+    {"directory": "syntheses", "type": "synthesis", "layer": "knowledge", "writer": "review", "required": ["status"]},
+    {"directory": "refs", "type": "ref", "layer": "knowledge", "writer": "review", "required": []},
+    {"directory": "entities", "type": "entity", "layer": "knowledge", "writer": "review", "required": ["id", "entityKind"], "manageExternal": true},
+    {"directory": "tastes", "type": "taste", "layer": "knowledge", "writer": "review", "required": [], "manageExternal": true},
+    {"directory": "profile", "type": "profile", "layer": "memory", "writer": "direct", "required": [], "manageExternal": true},
+    {"directory": "journal", "type": "journal", "layer": "memory", "writer": "direct", "required": [], "manageExternal": true},
+    {"directory": "raw", "type": "raw", "layer": "archive", "writer": "review", "required": ["privacyTier"], "manageExternal": true},
+    {"directory": "reports", "type": "report", "layer": "derived", "writer": "compiler", "required": [], "manageExternal": true}
+  ]
+}

@@ -111,6 +111,27 @@ def test_session_end_writes_idempotent_episode(provider):
     assert text2.count(schema.session_marker("8f3e9c12-session")) == 1
 
 
+def test_session_end_neutralizes_obsolete_runtime_and_paths(provider):
+    messages = [
+        {"role": "user", "content": (
+            "Move the old wiki from ~/.local/share/wiki and the OpenClaw "
+            "state under /Users/admin/.openclaw into the canonical store.")},
+        {"role": "assistant", "content": (
+            "The OpenClaw migration from /Users/admin/.local/share/wiki "
+            "is complete.")},
+    ]
+    provider.on_session_end(messages)
+    from memory_wiki import layers
+    text = (wikifs.read_text(
+        Path(provider.cfg.wiki_root) / layers.journal_rel()) or "")
+    assert "OpenClaw" not in text
+    assert ".openclaw" not in text
+    assert ".local/share/wiki" not in text
+    assert "old wiki" not in text
+    assert "prior assistant runtime" in text
+    assert "prior repository" in text
+
+
 def test_session_end_skips_trivial_and_flagged(provider):
     provider.on_session_end([{"role": "user", "content": "hi"}])
     provider.cfg.journal_episodes = False

@@ -5,30 +5,24 @@ from __future__ import annotations
 
 import difflib
 import logging
+import re
 from pathlib import Path
 
-from . import schema, wikifs
+from . import schema, type_registry, wikifs
 
 logger = logging.getLogger(__name__)
 
-RUNTIME_DIRS = ("profile", "journal", "reports", schema.INBOX_DIR)
+RUNTIME_DIRS = ("profile", "journal", "raw", "entities", "reports",
+                schema.INBOX_DIR)
 
-# Exact anchor in ~/wiki/_scripts/check.py (verified against the file).
-CHECK_ANCHOR = (
-    '    "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",\n'
-    '}'
+CHECK_TYPES_BEGIN = f"    # memory-wiki:types:v{schema.SCHEMA_VERSION}:begin"
+CHECK_TYPES_END = f"    # memory-wiki:types:v{schema.SCHEMA_VERSION}:end"
+_CHECK_TYPES_BLOCK = re.compile(
+    r"(?m)^\s*# memory-wiki:types:v\d+:begin\n.*?"
+    r"^\s*# memory-wiki:types:v\d+:end\n?",
+    re.DOTALL,
 )
-CHECK_REPLACEMENT = (
-    '    "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",\n'
-    '    "reports": "report",  # memory-wiki\n'
-    '    "profile": "profile", "journal": "journal", "tastes": "taste",  # memory-wiki\n'
-    '}'
-)
-CHECK_SENTINEL = '"reports": "report"'
-LEGACY_CHECK_SENTINEL = '"profile": "profile"'
-LEGACY_CHECK_LINE = (
-    '    "profile": "profile", "journal": "journal", "tastes": "taste",  # memory-wiki\n'
-)
+_LEGACY_MANAGED_LINE = re.compile(r"(?m)^.*# memory-wiki\s*$\n?")
 
 # Current ~/wiki validator anchors. New pages use createdAt, while existing
 # pages may retain the former created field.
@@ -61,6 +55,11 @@ infrastructure (staged memory candidates awaiting review), not notes.
 Knowledge captures stage into _inbox/ and reach pages only through review
 (`hermes memory-wiki review`). reports/ contains compiler-owned health
 dashboards; generated blocks are replaceable, human blocks are preserved.
+raw/ contains private archival records, including edited conversation
+transcripts. Raw pages are searchable through the `raw` or `all` corpus but
+remain outside the default curated `pages` corpus. entities/ contains people,
+organizations, institutions, parties, and collectives with stable IDs and
+evidenced relationships; refs/ remains for reusable guides and lookup material.
 {schema.STYLE_GUIDE_END}
 """
 
@@ -127,17 +126,17 @@ def _patch_check_py(root, dry_run):
     if old is None:
         return "no-file", ""
     new = old
-    if CHECK_SENTINEL not in new:
-        if LEGACY_CHECK_SENTINEL in new and LEGACY_CHECK_LINE in new:
-            new = new.replace(
-                LEGACY_CHECK_LINE,
-                '    "reports": "report",  # memory-wiki\n' + LEGACY_CHECK_LINE,
-                1)
-        elif CHECK_ANCHOR in new:
-            new = new.replace(CHECK_ANCHOR, CHECK_REPLACEMENT, 1)
-        else:
+    managed = _managed_check_types_block()
+    if _CHECK_TYPES_BLOCK.search(new):
+        new = _CHECK_TYPES_BLOCK.sub(managed, new, count=1)
+    else:
+        new = _LEGACY_MANAGED_LINE.sub("", new)
+        inserted = _insert_dir_type_block(new, managed)
+        if inserted is None:
             return "anchor-missing", _diff(
-                "check.py", CHECK_ANCHOR, CHECK_REPLACEMENT)
+                "check.py managed types", "DIR_TYPE = {\n}\n",
+                "DIR_TYPE = {\n" + managed + "}\n")
+        new = inserted
 
     date_compatible = (CHECK_DATE_REQUIRED_REPLACEMENT in new
                        and CHECK_DATE_FALLBACK in new)
@@ -162,6 +161,30 @@ def _patch_check_py(root, dry_run):
     if not dry_run:
         wikifs.atomic_write(path, new)
     return ("would-apply" if dry_run else "applied"), diff
+
+
+def _managed_check_types_block():
+    lines = [CHECK_TYPES_BEGIN]
+    lines.extend(
+        f'    "{spec.directory}": "{spec.ntype}",'
+        for spec in type_registry.external_types())
+    lines.append(CHECK_TYPES_END)
+    return "\n".join(lines) + "\n"
+
+
+def _insert_dir_type_block(text, block):
+    """Insert before the closing brace of the host's DIR_TYPE literal."""
+    lines = text.splitlines(keepends=True)
+    start = next((index for index, line in enumerate(lines)
+                  if re.match(r"^DIR_TYPE\s*=\s*\{", line)), None)
+    if start is None:
+        return None
+    stop = next((index for index in range(start + 1, len(lines))
+                 if re.match(r"^}\s*(?:#.*)?$", lines[index].rstrip("\n"))), None)
+    if stop is None:
+        return None
+    lines.insert(stop, block)
+    return "".join(lines)
 
 
 def _append_style_guide(root, dry_run):

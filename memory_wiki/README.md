@@ -15,8 +15,12 @@ claims, digests, and dashboards. See
   system prompt under char budgets. `journal/YYYY-MM-DD.md` holds timestamped
   notes and one episode per session.
 - **Knowledge base**: typed concepts, claims, sources, atlases, syntheses,
-  refs, tastes, and generated reports, following the wiki's own
+  entities, refs, tastes, and generated reports, following the wiki's own
   `_meta/style-guide.md` and validated by `_scripts/check.py`.
+- **Private archive**: `raw/` holds edited conversation transcripts and other
+  archival evidence. It is searchable through `corpus=raw` or `corpus=all`,
+  but excluded from the default curated `pages` corpus and automatic prefetch
+  so unreviewed dialogue does not enter prompts or outrank durable knowledge.
 - **Review-first writes**: automation never silently edits human-authored
   knowledge pages. Auto-captured facts and proposed page changes are staged in
   `_inbox/`, and reach pages only through approval (`wiki_apply approve`,
@@ -52,6 +56,10 @@ check.py and style guide):
 hermes memory-wiki init          # add --dry-run to preview
 ```
 
+The provider is exposed through Hermes's built-in `memory` toolset. Enable that
+toolset on every platform that should recall from the wiki, including `cli` for
+Hermes Desktop sessions. See `desktop/README.md` for the native read-only pane.
+
 ## Curation skill
 
 The plugin owns a companion `memory-wiki` skill under
@@ -67,24 +75,32 @@ skills:
     - llm-wiki
 ```
 
-The stock `llm-wiki` skill assumes a different repository architecture
-(`raw/`, `SCHEMA.md`, and `log.md`). Disable it for profiles that use this
-plugin to avoid conflicting curation procedures. Restart the session or
-gateway after changing skill configuration.
+The stock `llm-wiki` skill assumes a different repository architecture in
+which `raw/`, `SCHEMA.md`, and `log.md` govern the whole knowledge base. This
+plugin's optional `raw/` directory is only a private evidence archive; the
+review-first typed pages remain canonical knowledge. Disable the stock skill
+for profiles that use this plugin to avoid conflicting curation procedures.
+Restart the session or gateway after changing skill configuration.
 
 ## Tools (model-facing)
 
-- `wiki_search(query, corpus, type, limit)`: cited recall through QMD or local
-  search. Local semantic search blends 0.7 embedding similarity and 0.3 lexical
-  tf-idf.
-- `wiki_get(ref)`: read a page, a candidate id, or `status` / `review-queue` /
-  `dream` / `decisions`.
+- `wiki_search(query, corpus, type, granularity, as_of, include_historical,
+  limit)`: cited recall through QMD or local search. `granularity` accepts
+  `auto`, `page`, `claim`, `evidence`, or `heading`. `corpus=raw` searches only
+  private archival records. Local semantic search blends 0.7 embedding
+  similarity and 0.3 lexical tf-idf. Explicit `raw` or `all` search may return
+  non-public material; automatic prefetch never does.
+- `wiki_get(ref)`: read a page, candidate id, or bounded read model including
+  `status`, `review`, `review-queue`, `maintenance`, `semantic-maintenance`,
+  `history`, `context-pack`, `dream`, and `decisions`. It also resolves the
+  stable `#claim:`, `#evidence:`, and `#heading:` refs returned by search.
 - `wiki_apply(action, ...)`: `write_profile` and `append_journal` write directly
   (day-to-day memory); `stage` proposes knowledge; `approve` (promotes by
   default; re-approve to promote later), `reject` manage the queue; `supersede`
-  replaces an outdated promoted memory in place (id = the old candidate id from
-  the bullet's marker; profile/journal targets replace immediately, knowledge
-  pages stay review-first). `dream` returns a scored curation plan and, only
+  supersedes an outdated promoted memory (id = the old candidate id from the
+  bullet's marker; profile/journal targets replace immediately, knowledge
+  pages stay review-first and structured claims retain lineage). `dream`
+  returns a scored curation plan and, only
   with `apply_safe=true`, promotes recall-qualified profile/agent bullets.
   Direct writes accept an optional `idempotency_key` for safe tool retries.
 
@@ -92,6 +108,24 @@ Per-turn recall is injected automatically (prefetch); the profile pages ride in
 the system prompt. Pending candidates surface in recall with their staged age
 and drop out after `candidate_stale_days`; when any are waiting, the prompt
 block carries a review nudge and CLI sessions get one status line at start.
+Automatic prefetch excludes `raw/` and any page whose page or claim evidence
+uses a non-public `privacyTier`. Access to those records requires an explicit
+`wiki_search` corpus request.
+
+### Retrieval units and traces
+
+`auto` recall ranks claim, evidence, heading, and page units, then keeps the
+best unit per page for diversity. Stable refs let callers open exactly the
+matched unit. Every result includes a bounded `retrieval_trace` with `backend`,
+`unit_backend`, `unit_kind`, `matched_terms`, `query_term_coverage`, and
+`ranking_score`, plus applicable candidate-backend, semantic-readiness, and
+temporal fields. QMD may nominate pages, but local unit scoring and visibility
+rules remain authoritative.
+
+Claims are evaluated at `as_of` (now by default). Future, expired, and
+superseded units are excluded unless `include_historical=true`; invalid units
+are always excluded. Claims without temporal bounds remain recallable with
+state `unknown`.
 
 ## Auto-capture
 
@@ -163,12 +197,49 @@ hermes memory-wiki dream [--phase light|rem|deep|all] [--limit N]
                          [--compile] [--quiet]
 hermes memory-wiki dream --explain ID
 hermes memory-wiki schedule [--enable | --disable] [--cron EXPRESSION]
+hermes memory-wiki maintain [--limit N] [--json] [--include-unrelated]
+hermes memory-wiki maintain --accept FINDING_ID --yes
+hermes memory-wiki eval --queries PATH [--backend local|qmd|all]
+                        [--baseline PATH] [--json] [--fail-on-regression]
+hermes memory-wiki migrate [--plan | --apply] [--wiki-root PATH]
 hermes memory-wiki lint
 ```
+
+### Retrieval evaluation
+
+`eval` runs a bounded JSONL query set against the real wiki. Each line names a
+query and one or more acceptable page refs. Expected targets may also identify
+a claim or a future derived unit:
+
+```json
+{"id":"atomic-notes","query":"atomic notes","expected":[{"ref":"concepts/zettelkasten.md","claim_id":"claim.notes.atomic"}]}
+```
+
+The report includes recall@1, recall@3, recall@5, MRR, zero-hit rate, and
+latency. `local` uses the deterministic lexical scorer. `qmd` uses only
+pre-existing read-only QMD state and reports unavailable state as an error,
+without relabelling local fallback. Save `--json` output and pass it later with
+`--baseline`; comparisons require the same query-set hash. Reports retain case
+IDs and result refs but omit query text.
 
 The review list, interactive reviewer, and `wiki_get review-queue` share the
 same candidate metadata, routing, staleness, filters, and summary. Filtered
 batch mutations require at least one filter plus `--yes`.
+
+`maintain` compares page and claim retrieval units locally. Findings use the
+exact classifications `duplicate`, `supports`, `refines`, `contradicts`,
+`temporal_successor`, and `unrelated`. Listing and
+`wiki_get semantic-maintenance` are read-only. `--accept ID --yes` regenerates
+the finding against current content and stages one pending candidate. It never
+approves, promotes, or edits a knowledge page.
+
+The bounded read models are deliberately non-mutating: `review` prioritizes
+queue and dream actions; `maintenance` summarizes existing compiler-derived
+integrity work without compiling; `history` sanitizes and filters the candidate
+lifecycle audit by action, target, session, or time; and `context-pack`
+assembles task-scoped cited context within a character budget. Context packs
+use an explicit primary corpus and optional profile, journal, or candidate
+layers; they do not expose recall telemetry or accept the broad `all` corpus.
 
 ## Config reference (`plugins.memory-wiki`)
 
@@ -213,12 +284,15 @@ Typed pages use `createdAt: YYYY-MM-DD` for new creation dates. Legacy
 `created` remains readable. `hermes memory-wiki init` updates the wiki checker
 to accept that fallback without changing existing pages. Pages may carry a
 JSON-compatible `claims` list in frontmatter. `text` is required. `id`,
-`status`, numeric `confidence` from 0 to 1, `updatedAt`, and `evidence` are
-optional. Claim IDs, when present, use
+`status`, numeric `confidence` from 0 to 1, `updatedAt`, `validFrom`,
+`validUntil`, `supersedes`, and `evidence` are optional. Claim IDs, when
+present, use
 `claim.<namespace>.<local-name>`, with kebab-case inside each component.
 Missing status normalizes to `supported`. Evidence may record `kind`,
-`sourceId`, `path`, `lines`, `weight`, `confidence`, `privacyTier`, `note`, and
-`updatedAt`.
+`sourceId`, `path`, `lines`, `weight`, `confidence`, `privacyTier`, `note`,
+`updatedAt`, `observedAt`, `excerpt`, and `excerptHash`. An excerpt hash is
+`sha256:` plus the lowercase digest of the exact excerpt and is validated on
+read. `validUntil` is exclusive.
 
 ```yaml
 claims: [{"id":"claim.deploy.rollback-required","text":"Rollback is required before retrying a failed deploy.","status":"supported","confidence":0.9,"evidence":[{"kind":"source","sourceId":"runbook.deploy","path":"sources/deploy-runbook.md","lines":"18-24","updatedAt":"2026-07-14"}],"updatedAt":"2026-07-14"}]
@@ -229,15 +303,18 @@ title and `## Evidence` when no structured claims exist.
 
 Promoting into `## Evidence` updates both Markdown and structured provenance.
 For a page with multiple structured claims, target one explicitly with
-`--field claim_id=CLAIM_ID`. Supersession updates the canonical claim or
-evidence record, not only its prose marker. Duplicate claim IDs are reported as
-ambiguous by `wiki_get`.
+`--field claim_id=CLAIM_ID`. Knowledge supersession retains the prior
+structured claim as `status: superseded` with `validUntil`, then creates a
+versioned successor with `validFrom` and `supersedes`; it does not merely edit
+the prose marker. Duplicate claim IDs are reported as ambiguous by `wiki_get`.
 
 `hermes memory-wiki compile` writes only changed files while holding the wiki
 lock:
 
 - `.memory-wiki/cache/agent-digest.json`
 - `.memory-wiki/cache/claims.jsonl`
+- `.memory-wiki/cache/entities.jsonl`
+- `.memory-wiki/cache/relationships.jsonl`
 - `reports/open-questions.md`
 - `reports/contradictions.md`
 - `reports/low-confidence.md`
@@ -245,12 +322,31 @@ lock:
 - `reports/stale-pages.md`
 - `reports/provenance-coverage.md`
 - `reports/privacy-review.md`
+- `reports/temporal-integrity.md`
+- `reports/entity-relationships.md`
+- `reports/entity-migration-candidates.md`
 
 Report managed blocks are replaceable. Human-authored blocks are preserved.
 Freshness is fresh below 30 days, aging at 30 to 89 days, stale at 90 days, and
 unknown without a usable timestamp. A repeated claim ID forms a contradiction
 cluster only when its normalized text or status differs. `auto_compile` keeps
 artifacts current after plugin-owned mutations.
+
+## Schema versions and entities
+
+`memory_wiki/page-types.json` is the versioned type registry. A migrated wiki
+records its version in `.memory-wiki/schema.json`; a newer manifest is rejected
+instead of guessed at. `hermes memory-wiki migrate --plan` is read-only.
+`--apply` creates managed directories, updates validator/style-guide blocks,
+defaults legacy raw pages without a tier to `private`, and writes the manifest.
+It stops when a managed patch anchor needs manual repair.
+
+`entities/` holds named actors with stable `entity.*` IDs and an `entityKind`.
+Relationships are objects with a one-line `predicate` and a `targetId` that is
+also an `entity.*` ID. Compilation reports duplicate IDs, invalid, orphaned,
+and ambiguous relationships. Existing person or organization dossiers under
+`refs/` are only reported as migration candidates; nothing moves them
+automatically.
 
 ## Dreaming and curation
 
@@ -305,7 +401,7 @@ Each run performs ordered light, REM, and deep phases with safe apply, scheduled
 gates, compilation, and quiet success output. There are never three independent
 phase jobs that could overlap.
 
-## Dashboard
+## Dashboard and Desktop
 
 The plugin contributes a native Hermes dashboard tab at `/memory-wiki`, after
 Analytics. It is a read-only overview of claim health, compiler artifacts,
@@ -313,6 +409,11 @@ reports, dream phases, managed scheduling, pending candidates, and QMD state.
 The bundled UI also has a standalone legacy fallback. Both read the native
 dashboard plugin API and never mutate the wiki. Restart or rescan the Hermes
 dashboard after first enabling the extension.
+
+Hermes Desktop can additionally load `desktop/plugin.js` as a native,
+read-only overview pane. Its chat sessions use the same provider through the
+`cli` platform toolset, so the pane and model-facing memory must both be
+configured. Restart Desktop after changing plugin, skill, or toolset config.
 
 ## Safety and retry behavior
 

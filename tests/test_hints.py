@@ -109,3 +109,24 @@ def test_review_queue_surfaces_hints(fixture_wiki, tmp_path):
     assert item["default_target"] == "profile/agent.md"
     assert item["suggested_target"] == "tastes/tastes.md"
     assert "truncated" in item["warnings"]
+
+
+def test_review_queue_filters_origin_and_session(ready):
+    cfg, idx = ready
+    first = candidates.stage(
+        cfg, idx, "Keep release notes short but specific.", kind="note",
+        origin="tool", session_id="session-a")
+    candidates.stage(
+        cfg, idx, "Keep incident notes chronological and cited.", kind="note",
+        origin="sync_turn", session_id="session-b")
+
+    queue = hints.build_review_queue(
+        cfg, idx, filters={"origin": "tool", "session": "session-a"})
+
+    assert [item["id"] for item in queue["candidates"]] == [first["id"]]
+
+
+def test_review_queue_rejects_unknown_origin(ready):
+    cfg, idx = ready
+    with pytest.raises(ValueError, match="unknown origin"):
+        hints.build_review_queue(cfg, idx, filters={"origin": "mystery"})

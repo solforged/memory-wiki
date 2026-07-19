@@ -11,7 +11,9 @@ import json
 import logging
 from pathlib import Path
 
-from . import candidates, layers, safety, schema, wikifs
+from . import (
+    candidates, claims as claim_model, layers, safety, schema, temporal, wikifs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ ROUTES = {
     "decision": ("journal", schema.JOURNAL_NOTES),
     "claim": ("claims/", None),
     "concept": ("concepts/", None),
+    "entity": ("entities/", None),
 }
 
 
@@ -412,17 +415,31 @@ def _supersede_structured(cfg, cand_id, candidate_fm, content, rel, section,
     created_page = schema.promoted_comment(old_id) in body
     claim_matches = ([index for index, claim in enumerate(structured)
                       if isinstance(claim, dict)
-                      and str(claim.get("id") or "") == generated_id]
+                      and str(claim.get("id") or "") == generated_id
+                      and temporal.is_recallable(claim)]
                      if created_page else [])
+    if created_page and not claim_matches:
+        claim_matches = [
+            index for index, claim in enumerate(structured)
+            if isinstance(claim, dict)
+            and temporal.is_recallable(claim)
+        ]
     if len(claim_matches) > 1:
         raise ValueError(f"claim id {generated_id} is ambiguous in {rel}")
     old_content = old_loaded[2] if old_loaded else ""
     if claim_matches:
         index = claim_matches[0]
-        old_claim = structured[index]
+        old_claim = dict(structured[index])
+        old_claim_id = str(old_claim.get("id") or generated_id)
+        old_claim["status"] = "superseded"
+        old_claim.setdefault("validUntil", wikifs.today())
+        old_claim["updatedAt"] = wikifs.today()
+        version_id = _semantic_version_id(old_claim_id, cand_id)
         replacement = _structured_claim(
-            candidate_fm, content, [f"supersedes {old_id}"], generated_id)
-        structured[index] = replacement
+            candidate_fm, content, [f"supersedes {old_id}"], version_id)
+        replacement.setdefault("validFrom", wikifs.today())
+        replacement["supersedes"] = old_claim_id
+        structured[index:index + 1] = [old_claim, replacement]
         old_text = str(old_claim.get("text") or old_content)
         if old_text and old_text in body:
             body = body.replace(old_text, content, 1)
@@ -521,10 +538,14 @@ def _structured_claim_index(page_fm, candidate_fm, rel):
 
 def _structured_evidence(cand_id, candidate_fm, content):
     origin = str(candidate_fm.get("origin") or "unknown")
+    observed_at = str(candidate_fm.get("created") or wikifs.today())
     item = {
         "kind": origin,
         "note": content,
         "updatedAt": wikifs.today(),
+        "observedAt": observed_at,
+        "excerpt": content,
+        "excerptHash": claim_model.excerpt_hash(content),
     }
     session = str(candidate_fm.get("session") or "").strip()
     item["sourceId"] = (f"session:{candidates.session8(session)}" if session
@@ -673,7 +694,10 @@ def _structured_claim(fm, content, evidence, claim_id):
         if not note or note in seen:
             continue
         seen.add(note)
-        item = {"kind": origin, "note": note, "updatedAt": updated_at}
+        item = {
+            "kind": origin, "note": note, "updatedAt": updated_at,
+            "observedAt": updated_at,
+        }
         if source_id:
             item["sourceId"] = source_id
         entries.append(item)
@@ -682,11 +706,12 @@ def _structured_claim(fm, content, evidence, claim_id):
             "kind": origin,
             "note": f"captured via {origin}",
             "updatedAt": updated_at,
+            "observedAt": updated_at,
             **({"sourceId": source_id} if source_id else {}),
         })
     confidence = _CLAIM_CONFIDENCE.get(
         str(fm.get("confidence") or "").strip().lower(), 0.5)
-    return {
+    claim = {
         "id": claim_id,
         "text": content,
         "status": "supported",
@@ -694,6 +719,19 @@ def _structured_claim(fm, content, evidence, claim_id):
         "evidence": entries,
         "updatedAt": updated_at,
     }
+    fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+    for field in ("validFrom", "validUntil", "supersedes"):
+        if fields.get(field):
+            claim[field] = fields[field]
+    return claim
+
+
+def _semantic_version_id(old_claim_id, cand_id):
+    """Stable claim id for a reviewed semantic successor."""
+    parts = str(old_claim_id).split(".", 2)
+    namespace = parts[1] if len(parts) == 3 else "memory"
+    suffix = wikifs.slugify(str(cand_id)) or "successor"
+    return f"claim.{namespace}.v-{suffix}"
 
 
 def _promote_page_shaped(cfg, cand_id, content, rel, path):

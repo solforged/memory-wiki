@@ -41,7 +41,7 @@ if __name__ == "__main__":
 
 def test_ensure_runtime_creates_and_is_idempotent(cfg):
     made = scaffold.ensure_runtime(cfg)
-    assert "profile/user.md" in made and "_inbox/" in made
+    assert "profile/user.md" in made and "_inbox/" in made and "raw/" in made
     root = Path(cfg.wiki_root)
     for rel in ("profile/user.md", "profile/agent.md"):
         text = wikifs.read_text(root / rel)
@@ -55,7 +55,11 @@ def test_init_wiki_patches_and_is_idempotent(cfg):
     assert report["style_guide"][0] == "applied"
     root = Path(cfg.wiki_root)
     check_text = (root / "_scripts" / "check.py").read_text()
-    assert '"profile": "profile", "journal": "journal"' in check_text
+    assert '"profile": "profile"' in check_text
+    assert '"journal": "journal"' in check_text
+    assert '"raw": "raw"' in check_text
+    assert scaffold.CHECK_TYPES_BEGIN in check_text
+    assert scaffold.CHECK_TYPES_END in check_text
     style = (root / "_meta" / "style-guide.md").read_text()
     assert style.count(schema.STYLE_GUIDE_BEGIN) == 1
     assert style.startswith("# Wiki style guide")  # original preserved
@@ -123,6 +127,27 @@ def test_init_wiki_migrates_legacy_managed_style_section(cfg):
     assert "Legacy text." not in updated
     assert "## Human notes\n\nKeep me." in updated
     assert scaffold.init_wiki(cfg)["style_guide"][0] == "already"
+
+
+def test_init_replaces_older_versioned_type_block(cfg):
+    root = Path(cfg.wiki_root)
+    check = root / "_scripts" / "check.py"
+    original = check.read_text(encoding="utf-8")
+    old = (
+        "    # memory-wiki:types:v1:begin\n"
+        '    "profile": "profile",\n'
+        "    # memory-wiki:types:v1:end\n"
+    )
+    check.write_text(original.replace("}\n", old + "}\n", 1),
+                     encoding="utf-8")
+
+    status, _diff = scaffold._patch_check_py(root, dry_run=False)
+
+    assert status == "applied"
+    updated = check.read_text(encoding="utf-8")
+    assert "types:v1" not in updated
+    assert scaffold.CHECK_TYPES_BEGIN in updated
+    assert '"entities": "entity"' in updated
 
 
 def test_init_dry_run_changes_nothing(cfg):

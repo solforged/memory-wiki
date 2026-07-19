@@ -103,10 +103,12 @@ def test_compile_artifacts_reports_legacy_fallback_and_write_if_changed(fixture_
     assert result["pages"] == sorted(result["pages"], key=lambda page: page["path"])
     assert set(result["updatedFiles"]) == {
         compiler.AGENT_DIGEST_PATH, compiler.CLAIMS_DIGEST_PATH,
+        compiler.ENTITIES_DIGEST_PATH, compiler.RELATIONSHIPS_DIGEST_PATH,
         *(f"reports/{slug}.md" for slug, _ in compiler.REPORT_DEFINITIONS),
     }
 
     digest = json.loads((root / compiler.AGENT_DIGEST_PATH).read_text())
+    assert digest["schemaVersion"] == schema.SCHEMA_VERSION
     assert digest["claimHealth"]["lowConfidence"] == 1
     assert digest["claimHealth"]["missingEvidence"] == 2
     assert {item["kind"] for item in digest["contradictionClusters"]} == {
@@ -149,6 +151,28 @@ def test_report_managed_block_preserves_human_content(fixture_wiki):
     assert schema.validate_page("reports/claim-health.md", rendered) == []
 
 
+def test_raw_archives_are_counted_private_but_not_stale(
+        fixture_wiki, make_page):
+    root = Path(fixture_wiki)
+    path = make_page(
+        root, "raw/archived-conversation.md", "raw", "Archived conversation",
+        topics=("conversation",), body="Private historical dialogue.\n")
+    fm, body = wikifs.parse_frontmatter(path.read_text(encoding="utf-8"))
+    assert fm is not None
+    fm["createdAt"] = "2020-01-01"
+    fm["privacyTier"] = "private"
+    path.write_text(wikifs.render_page(fm, body), encoding="utf-8")
+
+    compiler.compile_wiki(root, now=NOW)
+
+    digest = json.loads((root / compiler.AGENT_DIGEST_PATH).read_text())
+    assert digest["pageCounts"]["raw"] == 1
+    stale = (root / "reports" / "stale-pages.md").read_text()
+    assert "Archived conversation" not in stale
+    privacy = (root / "reports" / "privacy-review.md").read_text()
+    assert "Archived conversation" in privacy
+
+
 def test_report_repairs_managed_frontmatter_without_losing_human_fields(
         fixture_wiki):
     root = Path(fixture_wiki)
@@ -179,7 +203,7 @@ def test_concurrent_compiles_serialize_and_converge(fixture_wiki):
             lambda _unused: compiler.compile_wiki(fixture_wiki, now=NOW),
             range(2)))
     changed_counts = sorted(len(result["updatedFiles"]) for result in results)
-    assert changed_counts == [0, 2 + len(compiler.REPORT_DEFINITIONS)]
+    assert changed_counts == [0, 4 + len(compiler.REPORT_DEFINITIONS)]
     assert compiler.compile_wiki(fixture_wiki, now=NOW)["updatedFiles"] == []
 
 

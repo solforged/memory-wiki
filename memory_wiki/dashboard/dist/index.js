@@ -2,8 +2,8 @@
   "use strict";
 
   const PLUGIN_NAME = "memory-wiki";
-  const NATIVE_API = "/api/plugins/memory-wiki/overview";
-  const LEGACY_API = "http://127.0.0.1:9119/api/plugins/memory-wiki/overview";
+  const NATIVE_BASE = "/api/plugins/memory-wiki";
+  const LEGACY_BASE = "http://127.0.0.1:9119/api/plugins/memory-wiki";
 
   function node(tag, className, text) {
     const element = document.createElement(tag);
@@ -64,6 +64,24 @@
 
   function empty(text) {
     return node("div", "mw-empty", text);
+  }
+
+  function shellQuote(value) {
+    return "'" + String(value || "").replace(/'/g, "'\"'\"'") + "'";
+  }
+
+  function copyButton(label, command) {
+    const button = node("button", "mw-button mw-button-secondary", label);
+    button.type = "button";
+    button.addEventListener("click", function () {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") return;
+      navigator.clipboard.writeText(command).then(function () {
+        const original = button.textContent;
+        button.textContent = "Copied";
+        window.setTimeout(function () { button.textContent = original; }, 1200);
+      });
+    });
+    return button;
   }
 
   function itemList(items, emptyText) {
@@ -258,13 +276,122 @@
     return card("Compiler and recall", content, badge(compiler.available ? "Compiler ready" : "No artifacts", compiler.available ? tone : "warn"));
   }
 
-  function renderOverview(root, data, reload) {
+  function renderReview(review) {
+    if (!review || !review.ok) {
+      return card("Review queue", empty("Candidate details are unavailable. The overview remains read-only and usable."), badge("Unavailable", "warn"));
+    }
+    const candidates = Array.isArray(review.candidates) ? review.candidates : [];
+    if (candidates.length === 0) {
+      return card("Review queue", empty("No pending or approved candidates are waiting."), badge("Clear", "good"));
+    }
+    const grid = node("div", "mw-candidate-grid");
+    candidates.forEach(function (candidate) {
+      const shell = node("article", "mw-candidate");
+      const head = node("div", "mw-candidate-head");
+      const badges = node("div", "mw-candidate-badges");
+      append(
+        badges,
+        badge(candidate.status || "unknown", candidate.status === "approved" ? "good" : "warn"),
+        badge(candidate.kind || "unknown"),
+        badge(candidate.confidence || "unknown"),
+        candidate.stale ? badge("stale", "bad") : null,
+      );
+      append(
+        head,
+        append(node("div"), node("div", "mw-item-title", candidate.title || candidate.id || "Candidate"), node("div", "mw-meta", candidate.id || "No candidate id")),
+        badges,
+      );
+      const content = node("div", "mw-candidate-content", candidate.content || "No candidate content.");
+      const metadata = [];
+      if (candidate.target) metadata.push("Target: " + candidate.target);
+      if (candidate.origin) metadata.push("Origin: " + candidate.origin);
+      if (candidate.created) metadata.push("Created: " + candidate.created);
+      if (candidate.session_hash) metadata.push("Session: " + candidate.session_hash);
+      const actions = node("div", "mw-candidate-actions");
+      if (candidate.id) {
+        append(
+          actions,
+          copyButton("Copy approve command", "hermes memory-wiki review --approve " + shellQuote(candidate.id)),
+          copyButton("Copy reject template", "hermes memory-wiki review --reject " + shellQuote(candidate.id) + " --reason " + shellQuote("not useful")),
+        );
+      }
+      append(
+        shell,
+        head,
+        content,
+        candidate.content_truncated ? node("div", "mw-meta", "Preview truncated.") : null,
+        metadata.length ? node("div", "mw-candidate-meta", metadata.join(" · ")) : null,
+        actions,
+      );
+      grid.appendChild(shell);
+    });
+    const summary = review.summary || {};
+    const trailing = append(
+      node("div", "mw-actions"),
+      badge("Read only"),
+      badge(number(summary.matched) + " waiting", number(summary.stale) ? "warn" : "good"),
+    );
+    return card("Review queue", grid, trailing);
+  }
+
+  function renderMaintenance(data) {
+    const reports = data.reports || {};
+    const categories = [
+      ["open-questions", "Open questions"],
+      ["privacy-review", "Privacy review"],
+      ["claim-health", "Claim health notes"],
+    ];
+    const content = node("div", "mw-maintenance-grid");
+    let total = 0;
+    categories.forEach(function (pair) {
+      const report = reports[pair[0]] || {};
+      const shell = node("section", "mw-maintenance-section");
+      total += number(report.count);
+      append(
+        shell,
+        append(node("div", "mw-row-head"), node("div", "mw-item-title", pair[1]), badge(number(report.count))),
+        itemList(report.items, "Nothing reported."),
+      );
+      content.appendChild(shell);
+    });
+    return card("Maintenance inbox", content, badge(total ? total + " item(s)" : "Clear", total ? "warn" : "good"));
+  }
+
+  function renderHistory(history) {
+    if (!history || !history.ok) {
+      return card("Recent memory activity", empty("Lifecycle history is unavailable."), badge("Unavailable", "warn"));
+    }
+    const events = Array.isArray(history.events) ? history.events : [];
+    if (events.length === 0) {
+      return card("Recent memory activity", empty("No lifecycle events have been recorded."), badge("No events"));
+    }
+    const list = node("div", "mw-history-list");
+    events.slice(0, 16).forEach(function (event) {
+      const row = node("div", "mw-history-item");
+      const identity = event.id || (event.detail && event.detail.ref) || "Direct write";
+      const details = [];
+      if (event.target) details.push(event.target);
+      if (event.actor) details.push("by " + event.actor);
+      if (event.detail && event.detail.reason) details.push(event.detail.reason);
+      append(
+        row,
+        badge(event.action || "event", event.action === "rejected" ? "bad" : event.action === "promoted" ? "good" : ""),
+        append(node("div"), node("div", "mw-item-title", identity), node("div", "mw-item-detail", details.join(" · ") || "No details")),
+        node("time", "mw-meta", formatTime(event.ts)),
+      );
+      list.appendChild(row);
+    });
+    return card("Recent memory activity", list, badge("Read only"));
+  }
+
+  function renderOverview(root, data, reload, extras) {
     clear(root);
     const page = node("div", "mw-dashboard");
     const compiler = data.compiler || {};
     const claims = data.claims || {};
     const candidates = data.candidates || {};
     const dream = data.dream || {};
+    extras = extras || {};
 
     const refresh = node("button", "mw-button", "Refresh");
     refresh.type = "button";
@@ -308,6 +435,9 @@
     const topColumns = node("section", "mw-columns");
     append(topColumns, renderHealth(data), renderRuntime(data));
     page.appendChild(topColumns);
+    page.appendChild(renderReview(extras.review));
+    page.appendChild(renderMaintenance(data));
+    page.appendChild(renderHistory(extras.history));
     page.appendChild(renderPhases(dream));
     page.appendChild(renderRuns(dream));
 
@@ -332,9 +462,18 @@
         function load() {
           if (!rootRef.current) return;
           renderLoading(rootRef.current);
-          SDK.fetchJSON(NATIVE_API)
-            .then(function (data) {
-              if (active && rootRef.current) renderOverview(rootRef.current, data, load);
+          Promise.all([
+            SDK.fetchJSON(NATIVE_BASE + "/overview"),
+            SDK.fetchJSON(NATIVE_BASE + "/review").catch(function () { return null; }),
+            SDK.fetchJSON(NATIVE_BASE + "/history").catch(function () { return null; }),
+          ])
+            .then(function (payload) {
+              if (active && rootRef.current) {
+                renderOverview(rootRef.current, payload[0], load, {
+                  review: payload[1],
+                  history: payload[2],
+                });
+              }
             })
             .catch(function (error) {
               if (active && rootRef.current) renderError(rootRef.current, error && error.message, load, false);
@@ -356,12 +495,24 @@
       if (!root) return;
       function load(showLoading) {
         if (showLoading !== false) renderLoading(root);
-        fetch(LEGACY_API, { credentials: "omit", cache: "no-store" })
+        function request(path) {
+          return fetch(LEGACY_BASE + path, { credentials: "omit", cache: "no-store" })
+            .then(function (response) {
+              if (!response.ok) throw new Error("Native API returned HTTP " + response.status + ".");
+              return response.json();
+            });
+        }
+        Promise.all([
+          request("/overview"),
+          request("/review").catch(function () { return null; }),
+          request("/history").catch(function () { return null; }),
+        ])
           .then(function (response) {
-            if (!response.ok) throw new Error("Native API returned HTTP " + response.status + ".");
-            return response.json();
+            renderOverview(root, response[0], load, {
+              review: response[1],
+              history: response[2],
+            });
           })
-          .then(function (data) { renderOverview(root, data, load); })
           .catch(function (error) { renderError(root, error && error.message, load, true); });
       }
       load(true);

@@ -10,12 +10,23 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 
 from . import candidates, extract, layers, safety, wikifs
 
 logger = logging.getLogger(__name__)
 
 _STAGED_NOTE_BUDGET = 600
+_JOURNAL_HISTORY_REWRITES = (
+    (re.compile(r"(?:(?:/Users/[^/\s]+|~)/\.openclaw)(?:/[^\s\"']+)?"),
+     "[local state path omitted]"),
+    (re.compile(r"(?:/Users/[^/\s]+/\.local/share/wiki|~/\.local/share/wiki)"
+                r"(?:/[^\s\"']+)?"),
+     "[local repository path omitted]"),
+    (re.compile(r"(?i)\bopen\s*claw\b"), "the prior assistant runtime"),
+    (re.compile(r"(?i)\b(?:old|legacy|former|previous) wiki\b"),
+     "the prior repository"),
+)
 
 
 class SessionState:
@@ -37,6 +48,14 @@ def _seen_key(text):
 def _capture_allowed(provider):
     return (provider.cfg is not None and not provider.read_only
             and provider.cfg.auto_capture and provider.index is not None)
+
+
+def _journal_excerpt(text):
+    """Bounded episode excerpt without obsolete runtime/path vocabulary."""
+    excerpt = safety.safe_excerpt(text)
+    for pattern, replacement in _JOURNAL_HISTORY_REWRITES:
+        excerpt = pattern.sub(replacement, excerpt)
+    return excerpt
 
 
 def _stage_extracted(provider, text, origin, turn):
@@ -191,11 +210,11 @@ def on_session_end(provider, messages):
     staged = ", ".join(state.staged_ids[:4]) if state.staged_ids else "none"
     lines.append(f"- turns: {len(user_msgs)}; candidates staged: "
                  f"{len(state.staged_ids)} ({staged})")
-    opened = safety.safe_excerpt(extract.message_text(user_msgs[0]))
+    opened = _journal_excerpt(extract.message_text(user_msgs[0]))
     if opened:
         lines.append(f'- opened: "{opened}"')
     if assistant_msgs:
-        closed = safety.safe_excerpt(extract.message_text(assistant_msgs[-1]))
+        closed = _journal_excerpt(extract.message_text(assistant_msgs[-1]))
         if closed:
             lines.append(f'- closed: "{closed}"')
     try:

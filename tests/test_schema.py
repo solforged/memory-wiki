@@ -16,9 +16,12 @@ def render(ntype, title, relname=None, topics=("t",), extras=None, body="Body.\n
     ("atlas", "atlases/engineering.md", None),
     ("synthesis", "syntheses/big-essay.md", None),
     ("ref", "refs/git-cheatsheet.md", {"url": "https://x.test"}),
+    ("entity", "entities/ada-lovelace.md",
+     {"id": "entity.ada-lovelace", "entityKind": "person"}),
     ("profile", "profile/user.md", None),
     ("journal", "journal/2026-07-05.md", None),
     ("taste", "tastes/tastes.md", None),
+    ("raw", "raw/example-conversation.md", None),
 ])
 def test_valid_pages_per_type(ntype, relpath, extras):
     title = relpath.split("/")[1][:-3].replace("-", " ")
@@ -38,6 +41,60 @@ def test_claim_page_emits_stance():
     fm2 = schema.page_frontmatter("claim", "x", created="2026-07-01",
                                   extras={"stance": "external"})
     assert fm2["stance"] == "external"
+
+
+def test_entity_page_has_stable_identity_and_relationships():
+    fm = schema.page_frontmatter(
+        "entity", "Ada Lovelace", created="2026-07-01",
+        extras={
+            "entityKind": "person",
+            "aliases": ["Augusta Ada King"],
+            "relationships": [{
+                "id": "relationship.ada-worked-with-babbage",
+                "predicate": "workedWith",
+                "targetId": "entity.charles-babbage",
+            }],
+        })
+    assert fm["id"] == "entity.ada-lovelace"
+    assert fm["entityKind"] == "person"
+    assert fm["relationships"][0]["targetId"] == "entity.charles-babbage"
+    assert schema.validate_page(
+        "entities/ada-lovelace.md", wikifs.render_page(fm, "Body.\n")) == []
+
+
+def test_entity_kind_is_validated():
+    fm = schema.page_frontmatter(
+        "entity", "Example", created="2026-07-01",
+        extras={"entityKind": "mystery"})
+    errors = schema.validate_page(
+        "entities/example.md", wikifs.render_page(fm, "Body.\n"))
+    assert any("entityKind" in error for error in errors)
+
+
+def test_entity_id_and_relationship_targets_are_validated():
+    fm = schema.page_frontmatter(
+        "entity", "Ada Lovelace", created="2026-07-01",
+        extras={
+            "id": "Ada Lovelace",
+            "entityKind": "person",
+            "relationships": [{
+                "predicate": "workedWith",
+                "targetId": "Charles Babbage",
+            }],
+        })
+
+    errors = schema.validate_page(
+        "entities/ada-lovelace.md", wikifs.render_page(fm, "Body.\n"))
+
+    assert any("id must be a stable entity.* id" in error for error in errors)
+    assert any("relationships[0].targetId" in error for error in errors)
+
+
+def test_raw_defaults_private():
+    fm = schema.page_frontmatter("raw", "Transcript", created="2026-07-01")
+    assert fm["privacyTier"] == "private"
+    assert schema.validate_page(
+        "raw/transcript.md", wikifs.render_page(fm, "Body.\n")) == []
 
 
 def test_claim_missing_or_bad_stance_fails():

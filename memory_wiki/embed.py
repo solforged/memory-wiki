@@ -58,6 +58,20 @@ def record_key(rec):
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:20]
 
 
+def unit_text(unit):
+    """Canonical embedding text for one derived retrieval unit."""
+    return " | ".join(value for value in (
+        str(getattr(unit, "kind", "") or ""),
+        str(getattr(unit, "search_text", "") or ""),
+    ) if value)
+
+
+def unit_key(unit):
+    """Content-address one stable unit ref and its current content."""
+    payload = f"unit\0{unit.ref}\0{unit_text(unit)}"
+    return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:20]
+
+
 def _pack(vec):
     return struct.pack(f"{len(vec)}f", *vec)
 
@@ -136,6 +150,30 @@ class EmbedIndex:
                 out[rec.rel] = (sim - SIM_FLOOR) / (1.0 - SIM_FLOOR)
         return out
 
+    def unit_scores(self, query, units):
+        """{unit ref: similarity 0..1} or {} while not ready."""
+        if not self.ready or self.failed:
+            return {}
+        try:
+            with self._model_lock:
+                qvec = _normalize(
+                    list(map(float, next(iter(self._model.embed([query]))))))
+        except Exception as e:
+            logger.debug("memory-wiki: query unit embed failed: %s", e)
+            return {}
+        with self._lock:
+            vecs = dict(self._vecs)
+        out = {}
+        for unit in units:
+            vector = vecs.get(unit_key(unit))
+            if vector is None or len(vector) != len(qvec):
+                continue
+            similarity = sum(a * b for a, b in zip(qvec, vector))
+            if similarity > SIM_FLOOR:
+                out[unit.ref] = (
+                    (similarity - SIM_FLOOR) / (1.0 - SIM_FLOOR))
+        return out
+
     # -- worker ---------------------------------------------------------------
 
     def _run(self):
@@ -182,12 +220,17 @@ class EmbedIndex:
         db.commit()
 
     def _sync(self, db):
-        """Embed records whose content is new; drop vectors for gone ones."""
+        """Embed pages and derived units; drop vectors for gone content."""
         wanted = {}
         for rec in self.wiki_index.records("all"):
             text = record_text(rec)
             if text:
                 wanted[record_key(rec)] = (rec.rel, text)
+        for unit in self.wiki_index.units(
+                "all", include_historical=True):
+            text = unit_text(unit)
+            if text:
+                wanted[unit_key(unit)] = (unit.ref, text)
         with self._lock:
             missing = [k for k in wanted if k not in self._vecs]
             gone = [k for k in self._vecs if k not in wanted]

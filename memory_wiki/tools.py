@@ -13,7 +13,7 @@ import re
 import hashlib
 from pathlib import Path
 
-from . import schema, search, wikifs
+from . import chunks, schema, search, type_registry, wikifs
 
 logger = logging.getLogger(__name__)
 
@@ -27,19 +27,35 @@ WIKI_SEARCH_SCHEMA = {
         "Search the memory wiki (lexical, cited). Use before answering "
         "questions about the user's history, projects, preferences, or "
         "anything the wiki may already know. Results carry repo-relative "
-        "refs to open with wiki_get."),
+        "page or derived unit refs to open with wiki_get."),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to look for."},
             "corpus": {
                 "type": "string",
-                "enum": ["pages", "profile", "journal", "candidates", "all"],
-                "description": "pages = knowledge types only (default)."},
+                "enum": ["pages", "raw", "profile", "journal", "candidates", "all"],
+                "description": (
+                    "pages = curated knowledge only (default); raw = archival "
+                    "conversation and source records.")},
             "type": {
                 "type": "string",
-                "enum": list(schema.KNOWLEDGE_TYPES),
-                "description": "Restrict to one page type (corpus=pages)."},
+                "enum": list(schema.KNOWLEDGE_TYPES + schema.ARCHIVE_TYPES),
+                "description": "Restrict to one page type."},
+            "granularity": {
+                "type": "string",
+                "enum": list(chunks.GRANULARITIES),
+                "description": (
+                    "Result unit: auto diversifies the best page, claim, "
+                    "evidence, or heading per page (default).")},
+            "as_of": {
+                "type": "string", "format": "date",
+                "description": "Evaluate temporal claims on this ISO date."},
+            "include_historical": {
+                "type": "boolean",
+                "description": (
+                    "Include future, expired, and superseded claim/evidence "
+                    "units (default false).")},
             "limit": {"type": "integer", "minimum": 1, "maximum": 20},
         },
         "required": ["query"],
@@ -50,12 +66,17 @@ WIKI_GET_SCHEMA = {
     "name": "wiki_get",
     "description": (
         "Read from the memory wiki: a repo-relative page path "
-        "('claims/foo.md', 'journal/2026-07-05.md', '_inbox/<file>.md'), a "
+        "('claims/foo.md', 'raw/example.md', 'journal/2026-07-05.md', "
+        "'_inbox/<file>.md'), a derived '#claim:', '#evidence:', or "
+        "'#heading:' ref returned by wiki_search, a "
         "candidate id, or the specials 'status' (provider health + counts), "
         "'review-queue' (pending and approved candidates), 'dream' "
         "(scored deep-curation plan), 'dream-state' (phase reinforcement), "
-        "'compiler' (claim digest health), "
-        "'decisions' (audit tail)."),
+        "'review' (action-oriented briefing), 'maintenance' (integrity work), "
+        "'semantic-maintenance' (read-only overlap findings), "
+        "'history' (sanitized lifecycle), 'context-pack' (task-scoped cited "
+        "context), 'compiler' (claim digest health), or 'decisions' (raw audit "
+        "tail)."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -80,6 +101,20 @@ WIKI_GET_SCHEMA = {
                 "type": "array", "minItems": 1,
                 "items": {"type": "string"},
                 "description": "review-queue only: match effective targets exactly."},
+            "status": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string",
+                          "enum": list(schema.CANDIDATE_STATUSES)},
+                "description": "review/review-queue: candidate statuses."},
+            "origin": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string",
+                          "enum": list(schema.CANDIDATE_ORIGINS)},
+                "description": "review/review-queue: candidate origins."},
+            "session": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string"},
+                "description": "review/review-queue: session ids."},
             "stale_only": {
                 "type": "boolean",
                 "description": "review-queue only: return stale candidates."},
@@ -88,7 +123,38 @@ WIKI_GET_SCHEMA = {
                 "description": "review-queue only: minimum age in days."},
             "limit": {
                 "type": "integer", "minimum": 1,
-                "description": "review-queue only: maximum returned candidates."},
+                "description": "Maximum returned items for bounded specials."},
+            "include_unrelated": {
+                "type": "boolean",
+                "description": (
+                    "semantic-maintenance: include bounded unrelated pairs.")},
+            "query": {
+                "type": "string",
+                "description": "context-pack: task or question to retrieve."},
+            "corpus": {
+                "type": "string",
+                "enum": ["pages", "raw", "profile", "journal", "candidates",
+                         "prefetch"],
+                "description": "context-pack: explicit primary corpus."},
+            "type_filter": {
+                "type": "string",
+                "enum": list(schema.TYPE_DIR),
+                "description": "context-pack: restrict the primary corpus."},
+            "include_profile": {"type": "boolean"},
+            "include_journal": {"type": "boolean"},
+            "include_candidates": {"type": "boolean"},
+            "char_budget": {"type": "integer", "minimum": 1,
+                            "maximum": 20000},
+            "actions": {
+                "type": "array", "items": {"type": "string"},
+                "description": "history: lifecycle action filters."},
+            "history_target": {
+                "type": "string", "description": "history: exact target."},
+            "history_session": {
+                "type": "string", "description": "history: exact session."},
+            "since": {
+                "type": "string", "format": "date-time",
+                "description": "history: earliest event timestamp."},
         },
         "required": ["ref"],
     },
@@ -197,12 +263,21 @@ def _search(provider, args):
     query = (args.get("query") or "").strip()
     if not query:
         return err("query is required")
-    corpus = args.get("corpus") or "pages"
+    type_filter = args.get("type")
+    corpus = args.get("corpus") or ("raw" if type_filter == "raw" else "pages")
     limit = min(int(args.get("limit") or 5), 20)
-    results = provider.search_results(
-        query, corpus=corpus, type_filter=args.get("type"), limit=limit,
-        source="wiki_search")
+    granularity = str(args.get("granularity") or "auto").strip().lower()
+    as_of = args.get("as_of")
+    include_historical = args.get("include_historical", False)
+    if not isinstance(include_historical, bool):
+        return err("include_historical must be a boolean")
+    results = search.provider_unit_results(
+        provider, query, corpus=corpus, type_filter=type_filter, limit=limit,
+        granularity=granularity, as_of=as_of,
+        include_historical=include_historical, source="wiki_search")
     return ok(query=query, corpus=corpus, backend=provider.last_search_backend,
+              granularity=granularity, as_of=as_of,
+              include_historical=include_historical,
               count=len(results), results=results)
 
 
@@ -216,6 +291,16 @@ def _get(provider, args):
         return _get_status(provider)
     if ref == "review-queue":
         return _get_review_queue(provider, args)
+    if ref == "review":
+        return _get_review(provider, args)
+    if ref == "maintenance":
+        return _get_maintenance(provider, args)
+    if ref == "semantic-maintenance":
+        return _get_semantic_maintenance(provider, args)
+    if ref == "history":
+        return _get_history(provider, args)
+    if ref == "context-pack":
+        return _get_context_pack(provider, args)
     if ref == "dream":
         return _get_dream(provider)
     if ref == "dream-state":
@@ -225,6 +310,21 @@ def _get(provider, args):
     if ref == "decisions":
         return _get_decisions(provider)
     root = provider.cfg.wiki_root
+    if chunks.split_unit_ref(ref):
+        provider.index.refresh()
+        unit = provider.index.unit(ref)
+        if unit is None:
+            return err(f"unit not found: {ref}")
+        payload = chunks.unit_payload(unit)
+        content_lines = payload["content"].splitlines()
+        start = max(int(args.get("start_line") or 1), 1)
+        count = min(int(args.get("max_lines") or _MAX_GET_LINES),
+                    _MAX_GET_LINES)
+        payload["total_lines"] = len(content_lines)
+        payload["content_start_line"] = start
+        payload["content"] = "\n".join(
+            content_lines[start - 1:start - 1 + count])
+        return ok(**payload)
     claim_match = None
     if CANDIDATE_ID.match(ref):
         matches = sorted(Path(root, schema.INBOX_DIR).glob(f"{ref}-*.md"))
@@ -251,9 +351,11 @@ def _get(provider, args):
         if claim_match:
             ref = claim_match["pagePath"]
     if not ref.endswith(".md"):
-        return err("ref must be a .md path, a candidate id, or one of "
+        return err("ref must be a .md path or derived unit ref, a candidate "
+                   "id, or one of "
                    "status | review-queue | dream | dream-state | compiler | "
-                   "decisions")
+                   "review | maintenance | semantic-maintenance | history | "
+                   "context-pack | decisions")
     path = wikifs.safe_wiki_path(root, ref)
     text = wikifs.read_text(path)
     if text is None:
@@ -290,6 +392,9 @@ def _resolve_claim_ref(wiki_root, claim_id):
             if not line.strip():
                 continue
             item = json.loads(line)
+            if isinstance(item, dict) and "schemaVersion" in item:
+                type_registry.require_supported_version(
+                    item["schemaVersion"], "claims digest")
             if isinstance(item, dict) and item.get("id") == claim_id \
                     and isinstance(item.get("pagePath"), str):
                 matches.append(item)
@@ -352,12 +457,84 @@ def _get_review_queue(provider, args=None):
     args = args or {}
     filters = {key: args[key] for key in
                ("kind", "confidence", "target", "effective_target",
-                "stale_only", "min_age")
+                "status", "origin", "session", "stale_only", "min_age")
                if key in args}
     queue = hints.build_review_queue(
         provider.cfg, provider.index, filters=filters,
         limit=args.get("limit"))
     return ok(ref="review-queue", count=len(queue["candidates"]), **queue)
+
+
+def _get_review(provider, args=None):
+    from . import review_briefing
+
+    provider.index.refresh()
+    args = args or {}
+    filters = {key: args[key] for key in (
+        "kind", "confidence", "target", "effective_target", "status",
+        "origin", "session", "stale_only", "min_age") if key in args}
+    briefing = review_briefing.build(
+        provider.cfg, provider.index, filters=filters,
+        limit=args.get("limit") or 10)
+    return ok(ref="review", **briefing)
+
+
+def _get_maintenance(provider, args=None):
+    from . import maintenance
+
+    result = maintenance.build(
+        provider.cfg, limit=(args or {}).get("limit") or 50)
+    return ok(ref="maintenance", **result)
+
+
+def _get_semantic_maintenance(provider, args=None):
+    from . import semantic_maintenance
+
+    args = args or {}
+    include_unrelated = args.get("include_unrelated", False)
+    if not isinstance(include_unrelated, bool):
+        raise ValueError("include_unrelated must be a boolean")
+    findings = semantic_maintenance.generate_findings(
+        provider.index, limit=args.get("limit") or 50,
+        include_unrelated=include_unrelated)
+    by_classification = {}
+    for finding in findings:
+        classification = finding["classification"]
+        by_classification[classification] = (
+            by_classification.get(classification, 0) + 1)
+    return ok(
+        ref="semantic-maintenance",
+        classifier_version=semantic_maintenance.CLASSIFIER_VERSION,
+        count=len(findings),
+        by_classification={
+            key: by_classification[key] for key in sorted(by_classification)},
+        findings=findings)
+
+
+def _get_history(provider, args=None):
+    from . import history
+
+    args = args or {}
+    result = history.build(
+        provider.cfg, limit=args.get("limit") or 50,
+        actions=args.get("actions"), target=args.get("history_target") or "",
+        session=args.get("history_session") or "", since=args.get("since") or "")
+    return ok(ref="history", **result)
+
+
+def _get_context_pack(provider, args=None):
+    from . import context_pack
+
+    args = args or {}
+    result = context_pack.build(
+        provider, args.get("query"), corpus=args.get("corpus") or "pages",
+        type_filter=args.get("type_filter"),
+        include_profile=args.get("include_profile", True),
+        include_journal=args.get("include_journal", False),
+        include_candidates=args.get("include_candidates", False),
+        limit=args.get("limit") or 8,
+        char_budget=args.get("char_budget") or 6_000)
+    return ok(ref="context-pack", **result)
 
 
 def _get_dream(provider):
@@ -400,6 +577,9 @@ def _compiler_status(cfg):
         digest = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(digest, dict):
             raise ValueError("compiler digest was not an object")
+        if "schemaVersion" in digest:
+            type_registry.require_supported_version(
+                digest["schemaVersion"], "compiler digest")
         page_counts = digest.get("pageCounts")
         page_counts = page_counts if isinstance(page_counts, dict) else {}
         clusters = digest.get("contradictionClusters")

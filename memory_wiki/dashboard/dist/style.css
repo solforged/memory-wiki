@@ -85,6 +85,12 @@
   opacity: 0.6;
 }
 
+.mw-button-secondary {
+  background: transparent;
+  border-color: var(--mw-border);
+  color: var(--mw-text);
+}
+
 .mw-card {
   background: var(--mw-card);
   border: 1px solid var(--mw-border);
@@ -293,6 +299,93 @@
   text-transform: capitalize;
 }
 
+.mw-candidate-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.mw-candidate {
+  background: color-mix(in srgb, var(--mw-card) 82%, var(--mw-accent) 3%);
+  border: 1px solid var(--mw-border);
+  border-radius: calc(var(--radius, 0.5rem) * 0.8);
+  display: grid;
+  gap: 0.7rem;
+  min-width: 0;
+  padding: 0.85rem;
+}
+
+.mw-candidate-head {
+  align-items: flex-start;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+}
+
+.mw-candidate-badges,
+.mw-candidate-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.mw-candidate-badges {
+  justify-content: flex-end;
+}
+
+.mw-candidate-content {
+  background: color-mix(in srgb, var(--mw-card) 72%, transparent);
+  border-radius: 0.35rem;
+  font-size: 0.79rem;
+  line-height: 1.5;
+  max-height: 14rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 0.65rem;
+  white-space: pre-wrap;
+}
+
+.mw-candidate-meta {
+  color: var(--mw-muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.mw-maintenance-grid {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.mw-maintenance-section {
+  min-width: 0;
+}
+
+.mw-maintenance-section .mw-list {
+  margin-top: 0.7rem;
+}
+
+.mw-history-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.mw-history-item {
+  align-items: center;
+  border-top: 1px solid var(--mw-border);
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding-top: 0.6rem;
+}
+
+.mw-history-item:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
 .mw-kv {
   display: grid;
   gap: 0.5rem;
@@ -363,6 +456,11 @@
   .mw-columns {
     grid-template-columns: 1fr;
   }
+
+  .mw-candidate-grid,
+  .mw-maintenance-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 44rem) {
@@ -390,6 +488,18 @@
   .mw-run > :last-child {
     grid-column: 2;
     justify-self: start;
+  }
+
+  .mw-candidate-head {
+    display: grid;
+  }
+
+  .mw-candidate-badges {
+    justify-content: flex-start;
+  }
+
+  .mw-history-item {
+    grid-template-columns: 1fr;
   }
 }
 

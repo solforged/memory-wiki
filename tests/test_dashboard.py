@@ -298,3 +298,90 @@ def test_dashboard_surfaces_failed_dream_phase(monkeypatch, tmp_path):
     assert phases["rem"]["status"] == "failed"
     assert any(run["phase"] == "rem" and run["status"] == "failed"
                for run in result["dream"]["recent_runs"])
+
+
+def test_dashboard_rejects_explicit_future_compiler_artifacts(
+        monkeypatch, tmp_path):
+    api = load_api(monkeypatch, tmp_path)
+    home = tmp_path / "home"
+    wiki = tmp_path / "wiki"
+    cache = wiki / ".memory-wiki" / "cache"
+    home.mkdir()
+    cache.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  memory-wiki:\n"
+        f"    wiki_root: '{wiki}'\n",
+        encoding="utf-8",
+    )
+    future = api._SUPPORTED_SCHEMA_VERSION + 1
+    (cache / "agent-digest.json").write_text(json.dumps({
+        "schemaVersion": future, "claimCount": 99,
+    }), encoding="utf-8")
+    (cache / "claims.jsonl").write_text(json.dumps({
+        "schemaVersion": future, "text": "Do not read",
+    }) + "\n", encoding="utf-8")
+
+    result = api.build_overview(home)
+
+    assert result["compiler"]["digest_available"] is False
+    assert result["compiler"]["claims_available"] is False
+    assert result["claims"]["total"] == 0
+    assert any("newer than supported" in issue
+               for issue in result["issues"])
+
+
+def test_review_and_history_feeds_are_bounded_sanitized_and_read_only(
+        monkeypatch, tmp_path):
+    api = load_api(monkeypatch, tmp_path)
+    home = tmp_path / "home"
+    wiki = tmp_path / "wiki"
+    inbox = wiki / "_inbox"
+    home.mkdir()
+    inbox.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  memory-wiki:\n"
+        f"    wiki_root: '{wiki}'\n"
+        "    candidate_stale_days: 10\n",
+        encoding="utf-8",
+    )
+    (inbox / "candidate.md").write_text(
+        "---\n"
+        "id: abc123\n"
+        "status: pending\n"
+        "kind: note\n"
+        "confidence: likely\n"
+        "origin: sync_turn\n"
+        "session: raw-session-secret\n"
+        "created: 2026-01-01\n"
+        "target: profile/agent.md\n"
+        "hash: abcdef\n"
+        "---\n"
+        "Remember the actual runtime verification.\n\n"
+        "## Evidence\n\n> private transcript excerpt\n",
+        encoding="utf-8",
+    )
+    (inbox / "decisions.jsonl").write_text(json.dumps({
+        "ts": "2026-07-01T10:00:00Z", "action": "staged", "id": "abc123",
+        "target": "profile/agent.md", "session": "raw-session-secret",
+        "actor": "hook", "hash": "abcdef",
+        "detail": {"origin": "sync_turn", "secret": "hidden-value"},
+    }) + "\n", encoding="utf-8")
+    before = {path.relative_to(tmp_path): path.read_bytes()
+              for path in tmp_path.rglob("*") if path.is_file()}
+
+    review = api.build_review(home, limit=999)
+    history = api.build_history(home, limit=999)
+
+    assert review["ok"] is True and review["read_only"] is True
+    assert review["summary"]["by_status"] == {"pending": 1}
+    assert review["candidates"][0]["content"] == \
+        "Remember the actual runtime verification."
+    assert review["candidates"][0]["stale"] is True
+    assert "private transcript" not in repr(review)
+    assert history["ok"] is True and history["read_only"] is True
+    assert history["events"][0]["session_hash"]
+    assert "raw-session-secret" not in repr(history)
+    assert "hidden-value" not in repr(history)
+    after = {path.relative_to(tmp_path): path.read_bytes()
+             for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before

@@ -76,6 +76,19 @@ def test_index_keeps_full_body_without_expanding_lexical_cap(
     assert "deepuniqueterm" not in rec.tokens
 
 
+def test_raw_archive_uses_larger_lexical_cap(fixture_wiki, make_page):
+    rel = "raw/long-conversation.md"
+    body = ("padding " * 3_000) + "deeprawconversationterm\n"
+    make_page(fixture_wiki, rel, "raw", "Long conversation", body=body)
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    rec = idx.pages[rel]
+    assert "deeprawconversationterm" in rec.tokens
+    scored = search.score_records(
+        idx, "deeprawconversationterm", corpus="raw")
+    assert scored and scored[0][1].rel == rel
+
+
 def test_index_candidates_and_hashes(fixture_wiki):
     (fixture_wiki / schema.INBOX_DIR).mkdir()
     make_candidate(fixture_wiki, CID1)
@@ -100,6 +113,51 @@ def test_taste_page_indexed_and_searchable(fixture_wiki, make_page):
     assert idx.counts().get("taste") == 1
     scored = search.score_records(idx, "synthwave dark ambient")
     assert scored and scored[0][1].rel == "tastes/tastes.md"
+
+
+def test_raw_page_has_explicit_archive_corpus(fixture_wiki, make_page):
+    make_page(fixture_wiki, "raw/design-conversation.md", "raw",
+              "Design conversation", topics=("conversation", "design"),
+              body="Sol and the assistant discuss a heliotrope protocol.\n")
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+    assert idx.counts().get("raw") == 1
+    assert list(idx.records("pages", type_filter="raw")) == []
+    archived = list(idx.records("raw"))
+    assert [record.rel for record in archived] == ["raw/design-conversation.md"]
+    scored = search.score_records(idx, "heliotrope protocol", corpus="raw")
+    assert scored and scored[0][1].rel == "raw/design-conversation.md"
+    assert any(record.rel == "raw/design-conversation.md"
+               for record in idx.records("all"))
+    assert list(idx.records("prefetch", type_filter="raw")) == []
+
+
+def test_prefetch_corpus_excludes_nonpublic_pages_and_evidence(
+        fixture_wiki, make_page):
+    make_page(
+        fixture_wiki, "concepts/private-page.md", "concept", "Private page",
+        extras={"privacyTier": "private"}, body="privatepagephrase\n")
+    evidence_path = make_page(
+        fixture_wiki, "concepts/private-evidence.md", "concept",
+        "Private evidence", body="privateevidencephrase\n")
+    fm, body = wikifs.parse_frontmatter(evidence_path.read_text(encoding="utf-8"))
+    fm["claims"] = [{
+        "id": "claim.privacy.private-evidence",
+        "text": "A public-looking claim with restricted support.",
+        "evidence": [{"kind": "note", "privacyTier": "local-private"}],
+    }]
+    wikifs.atomic_write(evidence_path, wikifs.render_page(fm, body))
+
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+
+    prefetch_refs = {record.rel for record in idx.records("prefetch")}
+    assert "concepts/private-page.md" not in prefetch_refs
+    assert "concepts/private-evidence.md" not in prefetch_refs
+    assert "concepts/private-page.md" in {
+        record.rel for record in idx.records("pages")}
+    assert "concepts/private-evidence.md" in {
+        record.rel for record in idx.records("pages")}
 
 
 def test_corpus_and_type_filters(fixture_wiki):
@@ -174,6 +232,9 @@ def test_structured_claims_and_evidence_are_searchable(fixture_wiki, make_page):
         "evidence_kinds": ["runbook"],
         "evidence_source_ids": ["source.release-runbook"],
     }
+    assert result["retrieval_trace"]["matched_terms"] == [
+        "quorum", "starlight"]
+    assert result["retrieval_trace"]["matched_fields"] == []
     evidence_hit = search.score_records(index, "operator midnight releases")
     assert evidence_hit[0][1].rel == "concepts/release-policy.md"
 
@@ -191,6 +252,20 @@ def test_prefetch_block_shape_and_budget(fixture_wiki, cfg, make_page):
     assert f"[cand {CID1}] (unreviewed preference)" in block
     assert len(block) <= cfg.prefetch_char_budget
     assert search.prefetch_block(idx, cfg, "zzz nothing matches") == ""
+
+
+def test_prefetch_requires_explicit_raw_search(fixture_wiki, cfg, make_page):
+    make_page(
+        fixture_wiki, "raw/private-conversation.md", "raw",
+        "Private conversation", extras={"privacyTier": "private"},
+        body="A unique heliotrope archive phrase.\n")
+    idx = WikiIndex(fixture_wiki)
+    idx.refresh()
+
+    assert "heliotrope" not in search.prefetch_block(
+        idx, cfg, "heliotrope archive").lower()
+    explicit = search.score_records(idx, "heliotrope archive", corpus="raw")
+    assert explicit and explicit[0][1].rel == "raw/private-conversation.md"
 
 
 def test_prefetch_excludes_profile_and_nonpending(fixture_wiki, cfg):
@@ -227,18 +302,37 @@ def test_tokenize():
     assert "the" not in tokenize("the and of")
 
 
-def test_provider_read_path_end_to_end(fixture_wiki, tmp_path):
+def test_provider_read_path_end_to_end(fixture_wiki, tmp_path, make_page):
     import memory_wiki
+    make_page(fixture_wiki, "raw/private-conversation.md", "raw",
+              "Private conversation", topics=("conversation",),
+              body="A unique heliotrope archive phrase.\n")
     provider = memory_wiki.MemoryWikiProvider(
         overrides={"wiki_root": str(fixture_wiki)})
     provider.initialize("sess-1", hermes_home=str(tmp_path), platform="cli",
                         agent_context="primary")
     names = [s["name"] for s in provider.get_tool_schemas()]
     assert names == ["wiki_search", "wiki_get", "wiki_apply"]
+    search_schema = next(
+        schema for schema in provider.get_tool_schemas()
+        if schema["name"] == "wiki_search")
+    assert "raw" in search_schema["parameters"]["properties"]["corpus"]["enum"]
+    assert "raw" in search_schema["parameters"]["properties"]["type"]["enum"]
 
     out = json.loads(provider.handle_tool_call(
         "wiki_search", {"query": "zettelkasten"}))
     assert out["ok"] and out["results"][0]["ref"] == "concepts/zettelkasten.md"
+    raw = json.loads(provider.handle_tool_call(
+        "wiki_search", {"query": "heliotrope archive", "corpus": "raw"}))
+    assert raw["ok"] and raw["results"][0]["ref"] == \
+        "raw/private-conversation.md"
+    raw_by_type = json.loads(provider.handle_tool_call(
+        "wiki_search", {"query": "heliotrope archive", "type": "raw"}))
+    assert raw_by_type["ok"] and raw_by_type["corpus"] == "raw"
+    assert raw_by_type["results"][0]["ref"] == "raw/private-conversation.md"
+    curated = json.loads(provider.handle_tool_call(
+        "wiki_search", {"query": "heliotrope archive", "corpus": "pages"}))
+    assert curated["ok"] and curated["results"] == []
 
     got = json.loads(provider.handle_tool_call(
         "wiki_get", {"ref": "concepts/zettelkasten.md"}))

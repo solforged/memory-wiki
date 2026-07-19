@@ -31,10 +31,11 @@ def build_review_queue(cfg, index, filters=None, limit=None):
     """Build the shared pending-candidate review read model.
 
     ``filters`` accepts scalar values or sequences for ``kind``,
-    ``confidence``, ``target`` (explicit or effective target),
-    ``explicit_target``, and ``effective_target``. ``stale_only`` and
-    ``min_age`` are scalar predicates. The optional limit is applied after
-    filtering, preserving the inbox's deterministic filename order.
+    ``confidence``, ``status``, ``origin``, ``session``, ``target`` (explicit
+    or effective target), ``explicit_target``, and ``effective_target``.
+    ``stale_only`` and ``min_age`` are scalar predicates. The optional limit
+    is applied after filtering, preserving the inbox's deterministic filename
+    order.
     """
     filters = dict(filters or {})
     _validate_filters(filters)
@@ -111,7 +112,9 @@ def _review_item(cfg, index, cand, pending, stale_days):
 
 def _validate_filters(filters):
     for name, allowed in (("kind", schema.CANDIDATE_KINDS),
-                          ("confidence", schema.CONFIDENCE)):
+                          ("confidence", schema.CONFIDENCE),
+                          ("status", ("pending", "approved")),
+                          ("origin", schema.CANDIDATE_ORIGINS)):
         invalid = _filter_values(filters.get(name)) - set(allowed)
         if invalid:
             values = ", ".join(sorted(invalid))
@@ -131,8 +134,8 @@ def _validate_filters(filters):
 
 
 def _matches_filters(item, filters):
-    for name in ("kind", "confidence", "explicit_target",
-                 "effective_target"):
+    for name in ("kind", "confidence", "status", "origin", "session",
+                 "explicit_target", "effective_target"):
         values = _filter_values(filters.get(name))
         if values and item.get(name) not in values:
             return False

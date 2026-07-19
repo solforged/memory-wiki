@@ -10,36 +10,24 @@ from __future__ import annotations
 
 import re
 
-from . import claims, wikifs
+from . import claims, entities, type_registry, wikifs
 
 # -- page types (check.py mirror + memory extensions) ---------------------
 
-DIR_TYPE = {
-    "claims": "claim", "concepts": "concept", "sources": "source",
-    "atlases": "atlas", "syntheses": "synthesis", "refs": "ref",
-    "profile": "profile", "journal": "journal", "tastes": "taste",
-    "reports": "report",
-}
+SCHEMA_VERSION = type_registry.SCHEMA_VERSION
+DIR_TYPE = {spec.directory: spec.ntype for spec in type_registry.PAGE_TYPES}
 TYPE_DIR = {v: k for k, v in DIR_TYPE.items()}
-KNOWLEDGE_TYPES = ("concept", "claim", "source", "atlas", "synthesis", "ref",
-                   "taste", "report")
-MEMORY_TYPES = ("profile", "journal")
+KNOWLEDGE_TYPES = type_registry.types_for_layer("knowledge")
+DERIVED_TYPES = type_registry.types_for_layer("derived")
+ARCHIVE_TYPES = type_registry.types_for_layer("archive")
+MEMORY_TYPES = type_registry.types_for_layer("memory")
 
 REQUIRED = ["type", "title", "topics"]
 EXTRA_REQUIRED = {
-    "claim": ["stance", "confidence", "maturity"],
-    "source": ["author", "medium"],
-    "synthesis": ["status"],
+    spec.ntype: list(spec.required) for spec in type_registry.PAGE_TYPES
+    if spec.required
 }
-ENUMS = {
-    "stance": {"external", "candidate", "model"},
-    "confidence": {"unassessed", "speculative", "plausible", "likely",
-                   "confident"},
-    "maturity": {"seedling", "budding", "evergreen"},
-    "status": {"draft", "published"},
-    "medium": {"book", "textbook", "paper", "course", "video", "post",
-               "podcast", "game", "thread", "wiki"},
-}
+ENUMS = {field: set(values) for field, values in type_registry.ENUMS.items()}
 KEBAB = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*\.md$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -48,15 +36,13 @@ DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONFIDENCE = ("speculative", "plausible", "likely", "confident")
 CANDIDATE_STATUSES = ("pending", "approved", "rejected", "promoted", "superseded")
 CANDIDATE_KINDS = ("preference", "fact", "decision", "correction",
-                   "claim", "concept", "note")
+                   "claim", "concept", "entity", "note")
 CANDIDATE_ORIGINS = ("sync_turn", "pre_compress", "session_end",
                      "tool", "memory_write", "llm")
 EVIDENCE_HEADING = "## Evidence"
 
 # extra frontmatter keys allowed in candidate `fields` for new-page promotion
-FIELDS_ALLOWLIST = ("author", "medium", "year", "url", "aliases", "ref",
-                    "supports", "contradicts", "stance", "maturity", "status",
-                    "claim_id")
+FIELDS_ALLOWLIST = type_registry.CANDIDATE_FIELDS
 
 INBOX_DIR = "_inbox"
 DECISIONS_FILE = "_inbox/decisions.jsonl"
@@ -146,15 +132,32 @@ def page_frontmatter(ntype, title, topics=None, created=None, extras=None):
         if extras.get("url"):
             fm["url"] = extras["url"]
         fm["topics"] = topics
+    elif ntype == "entity":
+        fm["id"] = extras.get("id") or f"entity.{wikifs.slugify(title)}"
+        fm["entityKind"] = extras.get("entityKind", "other")
+        if extras.get("aliases"):
+            fm["aliases"] = extras["aliases"]
+        if extras.get("relationships"):
+            fm["relationships"] = extras["relationships"]
+        fm["topics"] = topics
     elif ntype == "synthesis":
         fm["status"] = extras.get("status", "draft")
         fm["claims"] = extras.get("claims", [])
         fm["topics"] = topics
+    elif ntype == "raw":
+        fm["topics"] = topics
+        fm["privacyTier"] = extras.get("privacyTier", "private")
+        if extras.get("recordFormat"):
+            fm["recordFormat"] = extras["recordFormat"]
     elif ntype == "report":
         fm["topics"] = topics
         fm["status"] = extras.get("status", "published")
     else:  # atlas, profile, journal, taste
         fm["topics"] = topics
+    for field in ("privacyTier", "recordFormat", "validFrom", "validUntil",
+                  "supersedes"):
+        if extras.get(field):
+            fm[field] = extras[field]
     fm["createdAt"] = created
     if ntype == "profile":
         fm["updated"] = extras.get("updated", created)
@@ -202,6 +205,14 @@ def validate_page(relpath, text):
     if "claims" in fm and not legacy_synthesis_refs:
         errors.extend(f"{relpath}: {error}"
                       for error in claims.validate_claims(structured_claims))
+    if ntype == "entity":
+        if not entities.valid_entity_id(fm.get("id")):
+            errors.append(
+                f"{relpath}: id must be a stable entity.* id")
+        errors.extend(
+            f"{relpath}: {error}"
+            for error in entities.validate_relationships(
+                fm.get("relationships")))
     return errors
 
 

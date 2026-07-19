@@ -191,6 +191,19 @@ class MemoryWikiProvider(MemoryProvider):
             self.last_search_backend = "local"
         else:
             self.last_search_backend = "qmd"
+            from .index import tokenize
+            query_terms = sorted(set(tokenize(query)))
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                item.setdefault("retrieval_trace", {
+                    "backend": "qmd",
+                    "unit_backend": "page",
+                    "unit_kind": "page",
+                    "query_terms": query_terms,
+                    "ranking_score": item.get(
+                        "relevance", item.get("score", 0.0)),
+                })
         if record_recall and not self.read_only and results:
             self._record_recall(
                 results, query, session_id=session_id or self._session_id,
@@ -229,8 +242,9 @@ class MemoryWikiProvider(MemoryProvider):
             return cached
         try:
             from . import search
-            results = self.search_results(
-                query, corpus="all", limit=max(self.cfg.prefetch_limit * 3, 10),
+            results = search.provider_unit_results(
+                self, query, corpus="prefetch", granularity="auto",
+                limit=max(self.cfg.prefetch_limit * 3, 10),
                 source="prefetch", session_id=session_id,
                 record_recall=False)
             visible = []

@@ -10,7 +10,9 @@ import types
 import pytest
 
 from memory_wiki import search
-from memory_wiki.embed import EmbedIndex, record_key, record_text
+from memory_wiki.embed import (
+    EmbedIndex, record_key, record_text, unit_key, unit_text,
+)
 from memory_wiki.index import WikiIndex
 
 SYNONYMS = {"automobile": "car", "auto": "car"}
@@ -194,3 +196,39 @@ def test_provider_respects_embeddings_flag(fixture_wiki, tmp_path):
     ro.initialize("sub", hermes_home=str(tmp_path), platform="cli",
                   agent_context="subagent")
     assert ro.embed is None  # read-only contexts stay lexical
+
+
+def test_embedding_cache_indexes_claim_units(
+        fake_fastembed, fixture_wiki, make_page, tmp_path):
+    path = make_page(
+        fixture_wiki, "concepts/unit-car.md", "concept", "Vehicle guidance",
+        body="A short summary.\n")
+    from memory_wiki import wikifs
+    fm, body = wikifs.parse_frontmatter(path.read_text(encoding="utf-8"))
+    fm["claims"] = [{
+        "id": "claim.vehicle.care",
+        "text": "car car car car car car car car car car maintenance",
+        "evidence": [],
+    }]
+    wikifs.atomic_write(path, wikifs.render_page(fm, body))
+    index = WikiIndex(fixture_wiki)
+    index.refresh()
+    unit = next(
+        unit for unit in index.units("pages", granularity="claim")
+        if unit.page_ref == "concepts/unit-car.md")
+    assert "maintenance" in unit_text(unit)
+
+    embed = EmbedIndex(index, cache_path=tmp_path / "unit-emb.db")
+    embed.start()
+    wait_for(lambda: embed.ready or embed.failed, what="unit worker start")
+    assert not embed.failed
+
+    def synced():
+        with embed._lock:
+            return unit_key(unit) in embed._vecs
+
+    wait_for(synced, what="unit vector sync")
+    scored = search.hybrid_unit_scores(
+        index, embed, "automobile", granularity="claim")
+    assert scored and scored[0][1].ref == unit.ref
+    embed.shutdown()

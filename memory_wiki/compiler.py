@@ -9,11 +9,14 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import claims as claim_model
-from . import schema, wikifs
+from . import entities as entity_model
+from . import schema, temporal, wikifs
 
 
 AGENT_DIGEST_PATH = ".memory-wiki/cache/agent-digest.json"
 CLAIMS_DIGEST_PATH = ".memory-wiki/cache/claims.jsonl"
+ENTITIES_DIGEST_PATH = ".memory-wiki/cache/entities.jsonl"
+RELATIONSHIPS_DIGEST_PATH = ".memory-wiki/cache/relationships.jsonl"
 REPORT_DEFINITIONS = (
     ("open-questions", "Open Questions"),
     ("contradictions", "Contradictions"),
@@ -22,6 +25,9 @@ REPORT_DEFINITIONS = (
     ("stale-pages", "Stale Pages"),
     ("provenance-coverage", "Provenance Coverage"),
     ("privacy-review", "Privacy Review"),
+    ("temporal-integrity", "Temporal integrity"),
+    ("entity-relationships", "Entity relationships"),
+    ("entity-migration-candidates", "Entity migration candidates"),
 )
 _LEGACY_CONFIDENCE = {
     "speculative": 0.25,
@@ -135,6 +141,10 @@ def _page_from_file(root, relpath):
         value = _string(fm.get(field))
         if value:
             page[field] = value
+    if "entityKind" in fm:
+        page["entityKind"] = fm["entityKind"]
+    if "relationships" in fm:
+        page["relationships"] = fm["relationships"]
     updated_at = _effective_updated_at(fm)
     if updated_at:
         page["updatedAt"] = updated_at
@@ -166,13 +176,17 @@ def _freshness_rank(level):
     return {"fresh": 3, "aging": 2, "stale": 1, "unknown": 0}[level]
 
 
-def _sorted_claims(page, now=None):
+def _sorted_claims(page, now=None, include_historical=True):
     def key(claim):
         confidence = claim.get("confidence")
         confidence = confidence if isinstance(confidence, (int, float)) else -1
         freshness = claim_model.assess_claim_freshness(page, claim, now)
         return (-confidence, -_freshness_rank(freshness["level"]), claim["text"])
-    return sorted(page.get("claims", []), key=key)
+    claims = page.get("claims", [])
+    if not include_historical:
+        claims = [claim for claim in claims
+                  if temporal.is_recallable(claim, now)]
+    return sorted(claims, key=key)
 
 
 def _explicit_contradictions(pages):
@@ -202,9 +216,11 @@ def _explicit_contradictions(pages):
 
 def _claim_health_summary(pages, now=None):
     freshness = {"fresh": 0, "aging": 0, "stale": 0, "unknown": 0}
+    temporal_states = {state: 0 for state in sorted(temporal.TEMPORAL_STATES)}
     contested = low = missing = 0
     for item in claim_model.collect_health(pages, now):
         freshness[item["freshness"]["level"]] += 1
+        temporal_states[item["temporalState"]] += 1
         contested += int(claim_model.is_contested(item["status"]))
         low += int(isinstance(item.get("confidence"), (int, float))
                    and item["confidence"] < 0.5)
@@ -214,6 +230,8 @@ def _claim_health_summary(pages, now=None):
         "contested": contested,
         "lowConfidence": low,
         "missingEvidence": missing,
+        "temporalStates": temporal_states,
+        "lineageIssueCount": len(claim_model.lineage_issues(pages)),
     }
 
 
@@ -226,8 +244,9 @@ def _digest_claim(page, claim, now=None):
         "missingEvidence": not claim.get("evidence"),
         "evidence": list(claim.get("evidence", [])),
         "freshnessLevel": fresh["level"],
+        "temporalState": temporal.claim_state(claim, now),
     }
-    for field in ("id", "confidence"):
+    for field in ("id", "confidence", "validFrom", "validUntil", "supersedes"):
         if field in claim:
             item[field] = claim[field]
     if fresh.get("lastTouchedAt"):
@@ -235,7 +254,7 @@ def _digest_claim(page, claim, now=None):
     return item
 
 
-def build_agent_digest(pages, now=None):
+def build_agent_digest(pages, now=None, entity_graph=None):
     page_types = sorted(set(schema.TYPE_DIR) - {"report"})
     counts = {ntype: sum(page["kind"] == ntype for page in pages)
               for ntype in page_types}
@@ -265,7 +284,8 @@ def build_agent_digest(pages, now=None):
             "freshnessLevel": fresh["level"],
             "claimCount": len(page.get("claims", [])),
             "topClaims": [_digest_claim(page, claim, now)
-                          for claim in _sorted_claims(page, now)[:5]],
+                          for claim in _sorted_claims(
+                              page, now, include_historical=False)[:5]],
         }
         for field in ("id", "confidence", "privacyTier"):
             if field in page:
@@ -273,10 +293,14 @@ def build_agent_digest(pages, now=None):
         if fresh.get("lastTouchedAt"):
             item["lastTouchedAt"] = fresh["lastTouchedAt"]
         digest_pages.append(item)
+    entity_graph = entity_graph or entity_model.analyze_graph(
+        pages, schema.SCHEMA_VERSION)
     return {
+        "schemaVersion": schema.SCHEMA_VERSION,
         "pageCounts": counts,
         "claimCount": sum(len(page.get("claims", [])) for page in pages),
         "claimHealth": _claim_health_summary(pages, now),
+        "entityGraph": entity_graph["summary"],
         "contradictionClusters": sorted(
             clusters, key=lambda item: (item["label"].lower(), item["kind"])),
         "pages": digest_pages,
@@ -290,6 +314,7 @@ def build_claims_jsonl(pages, now=None):
             fresh = claim_model.assess_claim_freshness(page, claim, now)
             evidence = list(claim.get("evidence", []))
             item = {
+                "schemaVersion": schema.SCHEMA_VERSION,
                 "pageTitle": page["title"],
                 "pageKind": page["kind"],
                 "pagePath": page["path"],
@@ -306,10 +331,13 @@ def build_claims_jsonl(pages, now=None):
                 "missingEvidence": not evidence,
                 "evidence": evidence,
                 "freshnessLevel": fresh["level"],
+                "temporalState": temporal.claim_state(claim, now),
             }
             if page.get("id"):
                 item["pageId"] = page["id"]
-            for field in ("id", "confidence"):
+            for field in (
+                    "id", "confidence", "validFrom", "validUntil",
+                    "supersedes"):
                 if field in claim:
                     item[field] = claim[field]
             if fresh.get("lastTouchedAt"):
@@ -338,6 +366,7 @@ def _health_line(item, page_by_path):
     details.append("missing evidence" if item["missingEvidence"]
                    else f"{item['evidenceCount']} evidence")
     details.append(_freshness_label(item["freshness"]))
+    details.append(f"temporal {item['temporalState']}")
     return f"- {_link(page)}: {identity}{_one_line(item['text'])} ({', '.join(details)})"
 
 
@@ -429,7 +458,7 @@ def _claim_health_report(pages, now):
 def _stale_pages_report(pages, now):
     matches = []
     for page in pages:
-        if page["kind"] in ("concept", "synthesis"):
+        if page["kind"] in ("concept", "synthesis", "raw"):
             continue
         fresh = claim_model.assess_page_freshness(page, now)
         if fresh["level"] != "fresh":
@@ -463,8 +492,20 @@ def _provenance_report(pages, now):
     kinds = Counter(item.get("kind") or "unspecified" for item in evidence_entries)
     sources = Counter(item.get("sourceId") or item.get("path") or "inline"
                       for item in evidence_entries)
+    exact = sum(bool(item.get("excerpt") and item.get("excerptHash"))
+                for item in evidence_entries)
+    located = sum(bool(item.get("path") and item.get("lines"))
+                  for item in evidence_entries)
+    observed = sum(bool(item.get("observedAt")) for item in evidence_entries)
+    unanchored = sum(not any((item.get("sourceId"), item.get("path"),
+                              item.get("excerptHash")))
+                     for item in evidence_entries)
     lines = [f"- Evidence entries: {len(evidence_entries)}",
              f"- Claims missing evidence: {len(missing)}", "",
+             f"- Exact excerpt anchors: {exact}",
+             f"- Path and line anchors: {located}",
+             f"- Observation timestamps: {observed}",
+             f"- Unanchored evidence: {unanchored}", "",
              "### Evidence Classes", *_count_lines(kinds), "",
              "### Top Evidence Sources", *_count_lines(sources)[:20]]
     if missing:
@@ -472,6 +513,40 @@ def _provenance_report(pages, now):
         for page, claim in missing:
             identity = f"`{claim['id']}`: " if claim.get("id") else ""
             lines.append(f"- {_link(page)}: {identity}{_one_line(claim['text'])}")
+    return "\n".join(lines)
+
+
+def _temporal_integrity_report(pages, now):
+    health = claim_model.collect_health(pages, now)
+    counts = Counter(item["temporalState"] for item in health)
+    issues = claim_model.lineage_issues(pages)
+    invalid = [item for item in health if item["temporalState"] == "invalid"]
+    lines = [
+        f"- Claims: {len(health)}",
+        *(f"- {state}: {counts.get(state, 0)}"
+          for state in sorted(temporal.TEMPORAL_STATES)),
+        f"- Lineage issues: {len(issues)}",
+    ]
+    if invalid:
+        lines += ["", "### Invalid intervals"]
+        lines.extend(
+            f"- `{item['key']}`: {_one_line(item['text'])}"
+            for item in invalid)
+    if issues:
+        lines += ["", "### Supersession lineage"]
+        for issue in issues:
+            if issue["kind"] == "missing-predecessor":
+                detail = (f"`{issue['claimId']}` references missing "
+                          f"`{issue['predecessorId']}`")
+            elif issue["kind"] == "duplicate-id":
+                detail = f"duplicate `{issue['claimId']}` in " + " | ".join(
+                    f"`{path}`" for path in issue["paths"])
+            else:
+                detail = "cycle: " + " -> ".join(
+                    f"`{claim_id}`" for claim_id in issue["claimIds"])
+            lines.append(f"- {detail}")
+    if not invalid and not issues:
+        lines += ["", "- No temporal or lineage integrity issues right now."]
     return "\n".join(lines)
 
 
@@ -500,6 +575,72 @@ def _privacy_report(pages, now):
     return "\n".join(lines)
 
 
+def _entity_relationships_report(pages, now):
+    del now
+    graph = entity_model.analyze_graph(pages, schema.SCHEMA_VERSION)
+    summary = graph["summary"]
+    lines = [
+        f"- Entities: {summary['entityCount']}",
+        f"- Relationships: {summary['relationshipCount']}",
+        f"- Orphan relationships: {summary['orphanRelationshipCount']}",
+        f"- Ambiguous relationships: {summary['ambiguousRelationshipCount']}",
+        f"- Invalid entity issues: {summary['invalidEntityCount']}",
+        f"- Invalid relationship issues: {summary['invalidRelationshipCount']}",
+    ]
+    duplicate_ids = graph["duplicateIds"]
+    if duplicate_ids:
+        lines += ["", "### Duplicate entity IDs"]
+        for entity_id, paths in sorted(duplicate_ids.items()):
+            lines.append(f"- `{entity_id}`: " + " | ".join(
+                f"`{path}`" for path in paths))
+    if graph["orphanRelationships"]:
+        lines += ["", "### Orphan relationships"]
+        for item in graph["orphanRelationships"]:
+            lines.append(
+                f"- `{item['sourceId']}` `{item['predicate']}` "
+                f"`{item['targetId']}` from `{item['sourcePath']}`")
+    if graph["ambiguousRelationships"]:
+        lines += ["", "### Ambiguous relationships"]
+        for item in graph["ambiguousRelationships"]:
+            paths = " | ".join(f"`{path}`" for path in item["targetPaths"])
+            lines.append(
+                f"- `{item['sourceId']}` `{item['predicate']}` "
+                f"`{item['targetId']}` from `{item['sourcePath']}`: {paths}")
+    issues = graph["invalidEntities"] + graph["invalidRelationships"]
+    if issues:
+        lines += ["", "### Invalid graph data"]
+        lines.extend(f"- {_one_line(issue)}" for issue in issues)
+    if not any((duplicate_ids, graph["orphanRelationships"],
+                graph["ambiguousRelationships"], issues)):
+        lines += ["", "- No entity graph integrity issues right now."]
+    return "\n".join(lines)
+
+
+def _entity_migration_report(pages, now):
+    del now
+    graph = entity_model.analyze_graph(pages, schema.SCHEMA_VERSION)
+    candidates = graph["migrationCandidates"]
+    lines = [
+        "- Review only: this report never moves or rewrites pages.",
+        f"- Refs migration candidates: {len(candidates)}",
+    ]
+    if not candidates:
+        return "\n".join(lines + ["", "- No refs/ pages need entity review."])
+    page_by_path = {page["path"]: page for page in pages}
+    lines += ["", "### Candidates"]
+    for item in candidates:
+        existing = ""
+        if item["existingEntityPaths"]:
+            existing = "; existing entities: " + " | ".join(
+                f"`{path}`" for path in item["existingEntityPaths"])
+        reason = ", ".join(item["reasons"])
+        lines.append(
+            f"- {_link(page_by_path[item['path']])}: suggest "
+            f"`{item['suggestedPath']}` with `{item['suggestedId']}` "
+            f"({item['entityKind']}; {reason}){existing}")
+    return "\n".join(lines)
+
+
 _REPORT_BUILDERS = {
     "open-questions": _open_questions_report,
     "contradictions": _contradictions_report,
@@ -508,6 +649,9 @@ _REPORT_BUILDERS = {
     "stale-pages": _stale_pages_report,
     "provenance-coverage": _provenance_report,
     "privacy-review": _privacy_report,
+    "temporal-integrity": _temporal_integrity_report,
+    "entity-relationships": _entity_relationships_report,
+    "entity-migration-candidates": _entity_migration_report,
 }
 
 
@@ -549,7 +693,8 @@ def _render_report(root, slug, title, body, now=None):
 def _compile_unlocked(wiki_root, now=None):
     root = Path(wiki_root)
     pages = scan_pages(root)
-    digest = build_agent_digest(pages, now)
+    entity_graph = entity_model.analyze_graph(pages, schema.SCHEMA_VERSION)
+    digest = build_agent_digest(pages, now, entity_graph)
     updated = []
     for slug, title in REPORT_DEFINITIONS:
         rendered = _render_report(
@@ -560,14 +705,19 @@ def _compile_unlocked(wiki_root, now=None):
     digest_text = json.dumps(
         digest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     claims_text = build_claims_jsonl(pages, now)
+    entities_text = entity_model.jsonl(entity_graph["entities"])
+    relationships_text = entity_model.jsonl(entity_graph["relationships"])
     for relpath, content in ((AGENT_DIGEST_PATH, digest_text),
-                             (CLAIMS_DIGEST_PATH, claims_text)):
+                             (CLAIMS_DIGEST_PATH, claims_text),
+                             (ENTITIES_DIGEST_PATH, entities_text),
+                             (RELATIONSHIPS_DIGEST_PATH, relationships_text)):
         if wikifs.write_if_changed(root / relpath, content):
             updated.append(relpath)
     return {
         "wikiRoot": str(root),
         "pageCounts": digest["pageCounts"],
         "claimCount": digest["claimCount"],
+        "entityGraph": entity_graph["summary"],
         "pages": pages,
         "updatedFiles": sorted(updated),
     }

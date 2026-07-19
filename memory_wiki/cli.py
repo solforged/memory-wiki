@@ -14,7 +14,8 @@ from pathlib import Path
 def register_cli(subparser):
     """Build the ``hermes memory-wiki`` argparse subcommand tree."""
     subparser.description = (
-        "Wiki-native memory: status, init, review, compile, dream, schedule, lint")
+        "Wiki-native memory: status, init, review, compile, dream, schedule, "
+        "maintain, eval, migrate, lint")
     subs = subparser.add_subparsers(dest="mw_command")
 
     p_init = subs.add_parser(
@@ -99,6 +100,48 @@ def register_cli(subparser):
 
     subs.add_parser("compile", help="Compile claim digests and health reports")
 
+    p_maintain = subs.add_parser(
+        "maintain", help="Find semantic overlaps without changing knowledge")
+    p_maintain.add_argument("--limit", type=int, default=50, metavar="N",
+                            help="Maximum findings to list (default: 50)")
+    p_maintain.add_argument("--include-unrelated", action="store_true",
+                            help="Include bounded unrelated comparisons")
+    p_maintain.add_argument("--json", action="store_true",
+                            help="Print machine-readable JSON")
+    p_maintain.add_argument("--accept", default="", metavar="ID",
+                            help="Regenerate and stage one finding for review")
+    p_maintain.add_argument("--yes", action="store_true",
+                            help="Confirm --accept staging")
+    p_maintain.add_argument("--wiki-root", default=None, metavar="PATH",
+                            help="Wiki repository root")
+
+    p_eval = subs.add_parser(
+        "eval", help="Evaluate retrieval against a JSONL query set")
+    p_eval.add_argument("--queries", required=True, metavar="PATH",
+                        help="JSONL query set")
+    p_eval.add_argument("--backend", choices=("local", "qmd", "all"),
+                        default="local", help="Retrieval backend (default: local)")
+    p_eval.add_argument("--baseline", default=None, metavar="PATH",
+                        help="Previous JSON evaluation output to compare")
+    p_eval.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="Results per query, 1-20 (metrics always inspect 5)")
+    p_eval.add_argument("--wiki-root", default=None, metavar="PATH",
+                        help="Wiki repository root (default: configured wiki_root)")
+    p_eval.add_argument("--json", action="store_true",
+                        help="Print machine-readable JSON")
+    p_eval.add_argument("--fail-on-regression", action="store_true",
+                        help="Exit nonzero when baseline quality regresses")
+
+    p_migrate = subs.add_parser(
+        "migrate", help="Plan or apply a versioned wiki schema migration")
+    migrate_mode = p_migrate.add_mutually_exclusive_group()
+    migrate_mode.add_argument("--plan", action="store_true",
+                              help="Show changes without writing (default)")
+    migrate_mode.add_argument("--apply", action="store_true",
+                              help="Apply safe migration steps")
+    p_migrate.add_argument("--wiki-root", default=None, metavar="PATH",
+                           help="Wiki repository root")
+
     p_schedule = subs.add_parser(
         "schedule", help="Manage the opt-in dream sweep schedule")
     schedule_mode = p_schedule.add_mutually_exclusive_group()
@@ -170,10 +213,16 @@ def memory_wiki_command(args):
         return _cmd_dream(args)
     if cmd == "schedule":
         return _cmd_schedule(args)
+    if cmd == "maintain":
+        return _cmd_maintain(args)
+    if cmd == "eval":
+        return _cmd_eval(args)
+    if cmd == "migrate":
+        return _cmd_migrate(args)
     if cmd == "lint":
         return _cmd_lint(args)
     print("usage: hermes memory-wiki "
-          "{init|status|review|compile|dream|schedule|lint}")
+          "{init|status|review|compile|dream|schedule|maintain|eval|migrate|lint}")
     return 1
 
 
@@ -285,6 +334,186 @@ def _cmd_compile(args):
         print(f"wiki root does not exist: {root}")
         return 1
     return _compile_if_enabled(cfg, force=True, quiet=False)
+
+
+def _cmd_maintain(args):
+    """List semantic findings, or explicitly stage one pending candidate."""
+    import json
+    from . import schema, semantic_maintenance
+    from .index import WikiIndex
+
+    json_mode = bool(getattr(args, "json", False))
+
+    def emit(payload):
+        if json_mode:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        if not payload.get("ok"):
+            print(f"semantic maintenance error: {payload['error']}")
+            return
+        if payload.get("staged"):
+            print(f"staged {payload['candidate_id']} from "
+                  f"{payload['finding_id']} (pending review)")
+            return
+        findings = payload["findings"]
+        print(f"semantic findings: {len(findings)}")
+        for finding in findings:
+            print(f"{finding['id']} {finding['classification']} "
+                  f"{finding['confidence']:.3f}")
+            print(f"  {finding['left']['ref']} <-> {finding['right']['ref']}")
+            print(f"  {finding['rationale']}")
+
+    accept_id = str(getattr(args, "accept", "") or "").strip()
+    confirmed = bool(getattr(args, "yes", False))
+    if accept_id and not confirmed:
+        emit({"ok": False, "error": "--accept requires --yes"})
+        return 1
+    if confirmed and not accept_id:
+        emit({"ok": False, "error": "--yes requires --accept ID"})
+        return 1
+    cfg = _load_cfg(getattr(args, "wiki_root", None))
+    root = Path(cfg.wiki_root)
+    if not root.is_dir():
+        emit({"ok": False, "error": f"wiki root does not exist: {root}"})
+        return 1
+    index = WikiIndex(root)
+    try:
+        findings = semantic_maintenance.generate_findings(
+            index, limit=(1000 if accept_id else getattr(args, "limit", 50)),
+            include_unrelated=bool(
+                getattr(args, "include_unrelated", False)))
+    except (OSError, TypeError, ValueError) as exc:
+        emit({"ok": False, "error": str(exc)})
+        return 1
+    if not accept_id:
+        emit({
+            "ok": True,
+            "classifier_version": semantic_maintenance.CLASSIFIER_VERSION,
+            "count": len(findings),
+            "findings": findings,
+        })
+        return 0
+    finding = next((item for item in findings
+                    if item["id"] == accept_id), None)
+    if finding is None:
+        emit({"ok": False, "error": (
+            f"finding not found after regeneration: {accept_id}")})
+        return 1
+    if not (root / schema.INBOX_DIR).is_dir():
+        emit({"ok": False, "error": (
+            "candidate inbox is missing; run hermes memory-wiki init")})
+        return 1
+    result = semantic_maintenance.stage_accepted_finding(
+        cfg, index, finding, accept=True, actor="cli")
+    if not result.get("staged"):
+        emit({"ok": False, "error": result.get("reason") or "staging failed",
+              "finding_id": accept_id})
+        return 1
+    emit({
+        "ok": True, "staged": True, "finding_id": accept_id,
+        "candidate_id": result["id"], "candidate_ref": result["ref"],
+        "status": "pending", "classification": result["classification"],
+    })
+    return 0
+
+
+def _cmd_eval(args):
+    import json
+    from . import evaluation
+
+    json_mode = bool(getattr(args, "json", False))
+
+    def fail(message):
+        if json_mode:
+            print(json.dumps({"version": 1, "error": message},
+                             indent=2, sort_keys=True))
+        else:
+            print(f"evaluation error: {message}")
+        return 1
+
+    if getattr(args, "fail_on_regression", False) and not getattr(
+            args, "baseline", None):
+        return fail("--fail-on-regression requires --baseline")
+    cfg = _load_cfg(getattr(args, "wiki_root", None))
+    root = Path(cfg.wiki_root)
+    if not root.is_dir():
+        return fail(f"wiki root does not exist: {root}")
+    try:
+        query_set = evaluation.load_query_set(args.queries)
+        result = evaluation.evaluate(
+            cfg, query_set, backend=getattr(args, "backend", "local"),
+            limit=getattr(args, "limit", None))
+        if getattr(args, "baseline", None):
+            baseline = evaluation.load_baseline(args.baseline)
+            result["comparison"] = evaluation.compare_results(result, baseline)
+    except (OSError, TypeError, ValueError) as exc:
+        return fail(str(exc))
+
+    if json_mode:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        _print_eval_summary(result)
+    succeeded = any(
+        item.get("ok") is True for item in result["backends"].values())
+    comparison = result.get("comparison") or {}
+    comparison_failed = (
+        getattr(args, "fail_on_regression", False)
+        and (comparison.get("comparable") is False
+             or bool(comparison.get("regressions"))))
+    return 0 if succeeded and not comparison_failed else 1
+
+
+def _cmd_migrate(args):
+    from . import migrations
+
+    cfg = _load_cfg(getattr(args, "wiki_root", None))
+    root = Path(cfg.wiki_root)
+    if not root.is_dir():
+        print(f"wiki root does not exist: {root}")
+        return 1
+    try:
+        if getattr(args, "apply", False):
+            result = migrations.apply_migration(cfg)
+            print(f"migrated schema {result['fromVersion']} -> "
+                  f"{result['toVersion']}")
+            updated = result.get("updatedFiles") or []
+            print("updated: " + (", ".join(updated) if updated else "none"))
+            return _compile_if_enabled(cfg)
+        result = migrations.plan_migration(root)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"migration error: {exc}")
+        return 1
+    print(f"schema {result['fromVersion']} -> {result['toVersion']}")
+    if not result["operations"]:
+        print("no migration changes needed")
+        return 0
+    for item in result["operations"]:
+        mode = "automatic" if item["automatic"] else "manual"
+        print(f"- {item['kind']}: {item['path']} ({mode})")
+    return 1 if result["blocked"] else 0
+
+
+def _print_eval_summary(result):
+    query_set = result["query_set"]
+    print(f"query set: {query_set['count']} case(s), {query_set['sha256'][:12]}")
+    for name, backend in result["backends"].items():
+        if not backend.get("ok"):
+            print(f"{name}: unavailable, {backend.get('error', 'unknown error')}")
+            continue
+        metrics = backend["metrics"]
+        print(f"{name}: recall@1 {metrics['recall_at_1']:.3f}, "
+              f"@3 {metrics['recall_at_3']:.3f}, "
+              f"@5 {metrics['recall_at_5']:.3f}, "
+              f"MRR {metrics['mrr']:.3f}, "
+              f"zero-hit {metrics['zero_hit_rate']:.3f}, "
+              f"mean {metrics['latency_ms']['mean']:.3f} ms")
+    comparison = result.get("comparison")
+    if comparison:
+        if not comparison.get("comparable", True):
+            print(f"baseline: not comparable, {comparison.get('reason', '')}")
+        else:
+            count = len(comparison.get("regressions") or [])
+            print(f"baseline: {count} quality regression(s)")
 
 
 def _cmd_schedule(args):

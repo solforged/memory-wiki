@@ -130,6 +130,7 @@ def test_claim_new_page(ready):
             "sourceId": "session:8f3e9c12",
             "note": "proposed via tool",
             "updatedAt": fm["createdAt"],
+            "observedAt": fm["createdAt"],
         }],
         "updatedAt": fm["createdAt"],
     }]
@@ -259,9 +260,15 @@ def test_structured_claim_supersession_updates_canonical_claim(ready):
     text = read(cfg, rel)
     fm, body = wikifs.parse_frontmatter(text)
     canonical_claim_id = f"claim.{Path(rel).stem}.primary"
-    assert fm["claims"][0]["id"] == canonical_claim_id
-    assert fm["claims"][0]["text"] == "Alpha is false."
-    assert fm["claims"][0]["status"] == "supported"
+    previous, current = fm["claims"]
+    assert previous["id"] == canonical_claim_id
+    assert previous["text"] == "Alpha is true."
+    assert previous["status"] == "superseded"
+    assert previous["validUntil"] == wikifs.today()
+    assert current["text"] == "Alpha is false."
+    assert current["status"] == "supported"
+    assert current["validFrom"] == wikifs.today()
+    assert current["supersedes"] == canonical_claim_id
     assert fm["updatedAt"] == wikifs.today()
     assert "Alpha is true." not in body
     assert schema.promoted_comment(replacement["id"]) in body
@@ -271,7 +278,7 @@ def test_structured_claim_supersession_updates_canonical_claim(ready):
     claims = [json.loads(line) for line in read(
         cfg, compiler.CLAIMS_DIGEST_PATH).splitlines()]
     canonical = next(item for item in claims
-                     if item.get("id") == canonical_claim_id)
+                     if item.get("id") == current["id"])
     assert canonical["text"] == "Alpha is false."
 
 

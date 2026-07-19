@@ -13,7 +13,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-HERMES_SRC = Path(os.environ.get("HERMES_AGENT_SRC", "/Users/admin/src/hermes-agent"))
+HERMES_SRC = Path(
+    os.environ.get("HERMES_AGENT_SRC", "~/.hermes/hermes-agent")
+).expanduser()
 
 
 def _ensure_memory_provider_module():
@@ -100,7 +102,7 @@ def fixture_wiki(tmp_path):
     """A miniature ~/wiki with every type folder, check.py, style guide."""
     root = tmp_path / "wiki"
     for d in schema.DIR_TYPE:
-        if d not in ("profile", "journal"):
+        if d not in ("profile", "journal", "raw"):
             (root / d).mkdir(parents=True)
     (root / "_scripts").mkdir()
     (root / "_meta").mkdir()

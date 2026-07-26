@@ -29,10 +29,16 @@ claims, digests, and dashboards. See
   Markdown reports. A read-only Hermes dashboard presents compiler, dream,
   queue, scheduler, and QMD state.
 
-## Install
+This README is the documentation index for the current `0.1.0` implementation.
+
+## Quick start
+
+From the repository root, first link the plugin into Hermes:
 
 ```bash
-ln -s /Users/admin/src/memory-wiki/memory_wiki "$HERMES_HOME/plugins/memory-wiki"
+HERMES_DIR="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_DIR/plugins"
+ln -s "$PWD/memory_wiki" "$HERMES_DIR/plugins/memory-wiki"
 ```
 
 In `$HERMES_HOME/config.yaml`:
@@ -241,7 +247,7 @@ assembles task-scoped cited context within a character budget. Context packs
 use an explicit primary corpus and optional profile, journal, or candidate
 layers; they do not expose recall telemetry or accept the broad `all` corpus.
 
-## Config reference (`plugins.memory-wiki`)
+## Documentation
 
 | key                               | default                  | meaning                                                    |
 | --------------------------------- | ------------------------ | ---------------------------------------------------------- |
@@ -426,7 +432,8 @@ Any successful mutation refreshes compiler output before the active search
 backend, then clears prefetch state. This makes generated reports immediately
 searchable and invalidates QMD maintenance state.
 
-## Concurrency model
+There is no formal roadmap in this repository. A concise synthesis of the
+direction expressed by the implementation and its history is:
 
 Candidate files are created `O_EXCL` with unique ids (no contention); page
 writes are atomic tmp+rename; read-modify-write of shared files (profile,
@@ -437,8 +444,8 @@ multi-host git sync (git is the recovery story), file watching, NFS, Windows.
 ## Development
 
 ```bash
-uv run --group dev pytest        # tests live in ../tests
+uv run --group dev pytest -q
 ```
 
-Repo layout: this directory is the plugin (symlink target); tests and tooling
-live one level up.
+See [Development](docs/development.md) for Hermes contract testing and the
+module map.

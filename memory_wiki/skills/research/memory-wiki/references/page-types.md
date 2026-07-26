@@ -10,7 +10,8 @@ and validator with `hermes memory-wiki migrate` if they differ.
 - Use lowercase kebab-case filenames: `^[a-z0-9]+(-[a-z0-9]+)*\.md$`.
 - Start frontmatter at byte zero with `---`.
 - Every typed page uses `type`, `title`, `topics`, and `createdAt`.
-- Use an ISO `createdAt` date: `YYYY-MM-DD`.
+- Use an ISO `createdAt` date: `YYYY-MM-DD`, always double-quoted as a string (`createdAt: "YYYY-MM-DD"`) so Obsidian Properties does not coerce it to a date object.
+- Frontmatter house style: double-quote all string scalars; render simple lists as block sequences with two-space-indented dashes (`topics:` / `  - "example"`); keep empty collections as `[]` / `{}`.
 - Existing pages with legacy `created` remain valid; new pages use `createdAt`.
 - `topics` is currently warning-only in the plugin mirror but remains a repository convention.
 - Use `[[wikilinks]]` internally and ordinary Markdown links externally.
@@ -75,10 +76,11 @@ speculative | plausible | likely | confident
 
 ```markdown
 ---
-type: concept
-title: Example concept
-topics: [example]
-createdAt: YYYY-MM-DD
+type: "concept"
+title: "Example concept"
+topics:
+  - "example"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Example concept
@@ -98,15 +100,16 @@ createdAt: YYYY-MM-DD
 
 ```markdown
 ---
-type: claim
-title: Example proposition
-stance: candidate
-confidence: plausible
-maturity: seedling
-topics: [example]
+type: "claim"
+title: "Example proposition"
+stance: "candidate"
+confidence: "plausible"
+maturity: "seedling"
+topics:
+  - "example"
 supports: []
 contradicts: []
-createdAt: YYYY-MM-DD
+createdAt: "YYYY-MM-DD"
 ---
 
 # Example proposition
@@ -130,14 +133,15 @@ Use `stance: external` for a proposition attributed to a source or actor. Use `s
 
 ```markdown
 ---
-type: source
-title: Source title
-author: Author or attributed creator
-medium: book
+type: "source"
+title: "Source title"
+author: "Author or attributed creator"
+medium: "book"
 year: 0000
-url: https://example.com
-topics: [example]
-createdAt: YYYY-MM-DD
+url: "https://example.com"
+topics:
+  - "example"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Source title
@@ -161,10 +165,11 @@ Keep quotation, paraphrase, and interpretation visibly distinct.
 
 ```markdown
 ---
-type: atlas
-title: Topic atlas
-topics: [example]
-createdAt: YYYY-MM-DD
+type: "atlas"
+title: "Topic atlas"
+topics:
+  - "example"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Topic atlas
@@ -184,12 +189,13 @@ Create an atlas only after a page cluster exists. An atlas navigates; it shouldn
 
 ```markdown
 ---
-type: synthesis
-title: Integrated question or argument
-status: draft
+type: "synthesis"
+title: "Integrated question or argument"
+status: "draft"
 claims: []
-topics: [example]
-createdAt: YYYY-MM-DD
+topics:
+  - "example"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Integrated question or argument
@@ -213,10 +219,11 @@ Use `status: draft` until the argument and provenance have been reviewed. `claim
 
 ```markdown
 ---
-type: ref
-title: Reference title
-topics: [example]
-createdAt: YYYY-MM-DD
+type: "ref"
+title: "Reference title"
+topics:
+  - "example"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Reference title
@@ -237,16 +244,17 @@ lookup material, not named actors or argumentative synthesis.
 
 ```markdown
 ---
-type: entity
-title: Example actor
-id: entity.example-actor
-entityKind: person
+type: "entity"
+title: "Example actor"
+id: "entity.example-actor"
+entityKind: "person"
 aliases: []
 relationships:
-  - predicate: member-of
-    targetId: entity.example-organization
-topics: [example]
-createdAt: YYYY-MM-DD
+  - predicate: "member-of"
+    targetId: "entity.example-organization"
+topics:
+  - "example"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Example actor
@@ -288,10 +296,11 @@ records `.memory-wiki/schema.json`. Preview structural changes with
 
 ```markdown
 ---
-type: taste
-title: Stable preference domain
-topics: [collaboration]
-createdAt: YYYY-MM-DD
+type: "taste"
+title: "Stable preference domain"
+topics:
+  - "collaboration"
+createdAt: "YYYY-MM-DD"
 ---
 
 # Stable preference domain
@@ -309,12 +318,14 @@ Use a taste page when a coherent preference domain needs explanation and example
 
 ```markdown
 ---
-type: raw
-title: Conversation title
-topics: [conversation, example]
-createdAt: YYYY-MM-DD
-privacyTier: private
-recordFormat: edited-transcript
+type: "raw"
+title: "Conversation title"
+topics:
+  - "conversation"
+  - "example"
+createdAt: "YYYY-MM-DD"
+privacyTier: "private"
+recordFormat: "edited-transcript"
 ---
 
 # Conversation title

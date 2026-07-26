@@ -142,8 +142,19 @@ def test_page_shaped_stage_validates(ready):
             "Body argument.\n\n## Evidence\n\n- some\n")
     r = candidates.stage(cfg, idx, good, kind="claim")
     assert r["staged"], r
-    _, _, loaded, _ = candidates.load(cfg, r["id"])
-    assert loaded == good.strip()
+    path, fm, loaded, _ = candidates.load(cfg, r["id"])
+    assert candidates.page_shaped(loaded)
+    loaded_fm, loaded_body = wikifs.parse_frontmatter(loaded)
+    assert loaded_fm is not None
+    assert loaded_fm["title"] == "staged claims work"
+    assert "Body argument." in loaded_body
+    assert fm.get("title") == "staged claims work"
+    # Inbox file has a single leading Properties block; page FM is hidden.
+    raw = path.read_text(encoding="utf-8")
+    env_fm, env_body = wikifs.parse_frontmatter(raw)
+    assert env_fm is not None
+    assert not env_body.lstrip().startswith("---")
+    assert "<!-- memory-wiki:page-fm" in env_body
     assert "staged-claims-work" in r["ref"]  # slug from page title
 
     bad = "---\ntype: claim\ntitle: no stance\ntopics: [x]\ncreatedAt: 2026-07-06\n---\nb\n"
@@ -154,6 +165,24 @@ def test_page_shaped_stage_validates(ready):
     r3 = candidates.stage(cfg, idx, existing,
                           target="claims/small-tools-beat-frameworks.md")
     assert not r3["staged"] and "new-page target" in r3["reason"]
+
+
+def test_pack_materialize_roundtrip_preserves_page():
+    page = (
+        "---\ntype: \"concept\"\ntitle: \"Example\"\ntopics:\n"
+        "  - \"philosophy\"\ncreatedAt: \"2026-07-20\"\n---\n"
+        "# Example\n\nHello.\n"
+    )
+    stored, title = candidates.pack_content_for_storage(page)
+    assert title == "Example"
+    assert stored.startswith("# Example\n")
+    assert "<!-- memory-wiki:page-fm" in stored
+    assert not stored.lstrip().startswith("---")
+    full = candidates.materialize_content(stored)
+    fm, body = wikifs.parse_frontmatter(full)
+    assert fm["type"] == "concept"
+    assert fm["title"] == "Example"
+    assert body.lstrip().startswith("# Example")
 
 
 def test_list_load_and_prune(ready):

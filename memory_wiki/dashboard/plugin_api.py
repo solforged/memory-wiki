@@ -544,12 +544,19 @@ def _read_candidate(path: Path, root: Path,
         return None, f"Candidate {path.name} has invalid frontmatter."
     content = re.split(
         r"(?m)^##\s+Evidence\s*$", body, maxsplit=1)[0].strip()
+    content = re.sub(
+        r"<!--\s*memory-wiki:page-fm\n.*?\n-->",
+        "",
+        content,
+        flags=re.S,
+    ).strip()
     clean_content = _clean_content(content, 2_000)
     created = _clean_text(frontmatter.get("created"), 40)
     age_days = _days_since(created)
     session = str(frontmatter.get("session") or "")
     rel = path.relative_to(root).as_posix()
-    title = _candidate_title(content, frontmatter.get("id") or path.stem)
+    title = _clean_text(frontmatter.get("title"), 240) or _candidate_title(
+        content, frontmatter.get("id") or path.stem)
     return {
         "id": _clean_text(frontmatter.get("id"), 160),
         "title": title,

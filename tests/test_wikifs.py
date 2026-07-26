@@ -47,7 +47,7 @@ def test_nested_fields_dict_roundtrip():
     fm = {"id": "c1", "fields": {"author": "Jane Doe", "medium": "post"},
           "hash": "abc"}
     text, fm2, _ = roundtrip(fm)
-    assert "fields:\n  author: Jane Doe\n  medium: post" in text
+    assert 'fields:\n  author: "Jane Doe"\n  medium: "post"' in text
     assert fm2["fields"] == {"author": "Jane Doe", "medium": "post"}
     assert fm2["hash"] == "abc"
 
@@ -69,7 +69,17 @@ def test_dash_list_parsing():
 def test_scalar_list_with_commas_roundtrip():
     fm = {"questions": ["Who, what, and where?", "Why?"]}
     text, fm2, _ = roundtrip(fm)
-    assert "questions:\n- Who, what, and where?\n- Why?" in text
+    assert 'questions:\n  - "Who, what, and where?"\n  - "Why?"' in text
+    assert fm2 == fm
+
+
+def test_house_style_quotes_strings_and_block_lists():
+    fm = {"type": "concept", "title": "Example", "topics": ["philosophy"],
+          "createdAt": "2026-07-20"}
+    text, fm2, _ = roundtrip(fm)
+    assert 'type: "concept"' in text
+    assert 'createdAt: "2026-07-20"' in text
+    assert 'topics:\n  - "philosophy"' in text
     assert fm2 == fm
 
 

@@ -24,10 +24,81 @@ _FINAL_BULLET_MARKER = re.compile(
 _PROMOTED_MARKER = re.compile(
     r"<!-- memory-wiki: promoted ([^\s>]+) -->")
 
+# Page-shaped candidates used to embed a second YAML document in the body,
+# which Obsidian treats as broken Properties. Store page frontmatter in a
+# trailing HTML comment instead; reading view hides it, and load/promote
+# rehydrate a normal page document.
+PAGE_FM_BEGIN = "<!-- memory-wiki:page-fm"
+PAGE_FM_END = "-->"
+_PAGE_FM_BLOCK = re.compile(
+    r"\n*" + re.escape(PAGE_FM_BEGIN) + r"\n"
+    r"(---\n.*?\n---)\n"
+    + re.escape(PAGE_FM_END) + r"\s*\Z",
+    re.S,
+)
+
 
 def content_hash(text):
     norm = " ".join((text or "").lower().split())
     return hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def page_shaped(content):
+    """True if staged content is a full page (leading frontmatter)."""
+    return (content or "").startswith("---\n")
+
+
+def pack_content_for_storage(content):
+    """Store page-shaped content as markdown body + hidden page FM comment.
+
+    Returns ``(stored_body, page_title)``. Plain non-page content is unchanged.
+    Bodies that are already packed are left intact.
+    """
+    raw = (content or "").strip()
+    if not raw:
+        return "", ""
+    text = raw if raw.endswith("\n") else raw + "\n"
+    packed = _PAGE_FM_BLOCK.search(text)
+    if packed:
+        page_fm, _ = wikifs.parse_frontmatter(packed.group(1) + "\n")
+        title = str((page_fm or {}).get("title") or "")
+        return text, title
+    if not page_shaped(text):
+        return text, ""
+    page_fm, page_body = wikifs.parse_frontmatter(text)
+    if page_fm is None:
+        return text, ""
+    body = page_body.lstrip("\n")
+    if body and not body.endswith("\n"):
+        body += "\n"
+    fm_block = wikifs.render_frontmatter(page_fm).rstrip("\n")
+    stored = (
+        body.rstrip() + "\n\n"
+        + PAGE_FM_BEGIN + "\n"
+        + fm_block + "\n"
+        + PAGE_FM_END + "\n"
+    )
+    return stored, str(page_fm.get("title") or "")
+
+
+def materialize_content(content):
+    """Rehydrate staged content to the promote/API form.
+
+    New storage: markdown body + ``<!-- memory-wiki:page-fm -->`` block.
+    Legacy storage: a second YAML document still starting with ``---``.
+    """
+    text = content or ""
+    packed = _PAGE_FM_BLOCK.search(text)
+    if packed:
+        page_fm, _ = wikifs.parse_frontmatter(packed.group(1) + "\n")
+        body = text[:packed.start()].rstrip() + "\n"
+        if page_fm is not None:
+            return wikifs.render_page(page_fm, body).rstrip() + "\n"
+        return body
+    stripped = text.strip()
+    if page_shaped(stripped):
+        return stripped + "\n"
+    return text
 
 
 def session8(session_id):
@@ -190,18 +261,35 @@ def stage(cfg, index, content, kind="fact", origin="tool", session_id="",
         if dup:
             return {"staged": False, "reason": dup, "hash": chash}
 
+    stored_body, page_title = pack_content_for_storage(content)
     fm = {
         "id": "",  # filled below once the filename seq is known
-        "status": "pending", "kind": kind,
-        "target": target or "", "section": section or "",
-        "confidence": confidence, "origin": origin,
-        "session": session_id or "", "turn": int(turn or 0),
-        "created": wikifs.today(), "reviewed": "", "promoted_to": "",
-        "topics": topics, "fields": fields, "hash": chash,
+        "status": "pending",
+        "kind": kind,
+        "target": target or "",
+        "section": section or "",
+        "confidence": confidence,
+        "origin": origin,
+        "session": session_id or "",
+        "turn": int(turn or 0),
+        "created": wikifs.today(),
+        "reviewed": "",
+        "promoted_to": "",
+        "topics": topics,
+        "fields": fields,
+        "hash": chash,
     }
+    if page_title:
+        # Insert display title after kind for Obsidian Properties / review UIs.
+        ordered = {}
+        for key, value in fm.items():
+            ordered[key] = value
+            if key == "kind":
+                ordered["title"] = page_title
+        fm = ordered
     if supersedes:
         fm["supersedes"] = supersedes
-    body_parts = [content, "", schema.EVIDENCE_HEADING, ""]
+    body_parts = [stored_body.rstrip("\n"), "", schema.EVIDENCE_HEADING, ""]
     for line in _clean_evidence(evidence or [f"proposed via {origin}"]):
         body_parts.append(line if line.startswith(("- ", "> ")) else f"> {line}")
     body = "\n".join(body_parts) + "\n"
@@ -260,16 +348,12 @@ def _active_hash_duplicate_unlocked(inbox, chash, exclude_id=""):
     return ""
 
 
-def page_shaped(content):
-    """True if staged content is a full page (leading frontmatter)."""
-    return (content or "").startswith("---\n")
-
-
 def validate_page_candidate(content, target=""):
     """Schema errors for page-shaped staged content, checked against its
     eventual rel so staging fails fast; promotion revalidates against
     the real target."""
-    fm, _ = wikifs.parse_frontmatter(content)
+    full = materialize_content(content)
+    fm, _ = wikifs.parse_frontmatter(full)
     if fm is None:
         return ["page-shaped content has unparsable frontmatter"]
     ntype = fm.get("type")
@@ -277,12 +361,13 @@ def validate_page_candidate(content, target=""):
     if d is None:
         return [f"page-shaped content has unknown type '{ntype}'"]
     rel = target or f"{d}/{wikifs.slugify(str(fm.get('title') or ''))}.md"
-    return schema.validate_page(rel, content)
+    return schema.validate_page(rel, full)
 
 
 def _slug_source(content):
-    if page_shaped(content):
-        fm, _ = wikifs.parse_frontmatter(content)
+    full = materialize_content(content) if content else ""
+    if page_shaped(full):
+        fm, _ = wikifs.parse_frontmatter(full)
         title = str((fm or {}).get("title") or "")
         if title:
             return title
@@ -347,7 +432,8 @@ def find_path(cfg, cand_id):
 
 def load(cfg, cand_id):
     """(path, fm, content, evidence_lines) or None. content is the text
-    that promotion writes (body above ## Evidence)."""
+    that promotion writes (body above ## Evidence), rehydrated to a full
+    page document when page frontmatter is stored in the hidden comment."""
     path = find_path(cfg, cand_id)
     if path is None:
         return None
@@ -358,7 +444,7 @@ def load(cfg, cand_id):
     if fm is None:
         return None
     content, evidence = split_evidence(body)
-    return path, fm, content, evidence
+    return path, fm, materialize_content(content), evidence
 
 
 def set_status_unlocked(cfg, path, fm, body_content, evidence, status,
@@ -371,8 +457,15 @@ def set_status_unlocked(cfg, path, fm, body_content, evidence, status,
         fm["reviewed"] = reviewed_note
     if promoted_to:
         fm["promoted_to"] = promoted_to
+    stored_body, page_title = pack_content_for_storage(body_content)
+    if page_title:
+        fm["title"] = page_title
+    elif "title" in fm and not page_shaped(materialize_content(body_content)):
+        # keep an existing display title on plain candidates; drop stale
+        # page titles only when content is no longer page-shaped
+        pass
     evidence = _clean_evidence(evidence)
-    body = body_content.strip() + "\n\n" + schema.EVIDENCE_HEADING + "\n\n" \
+    body = stored_body.rstrip("\n") + "\n\n" + schema.EVIDENCE_HEADING + "\n\n" \
         + "\n".join(evidence) + ("\n" if evidence else "")
     wikifs.atomic_write(path, wikifs.render_page(fm, body))
     return fm
@@ -390,7 +483,7 @@ def list_candidates(cfg, statuses=("pending",)):
             continue
         if statuses and fm.get("status") not in statuses:
             continue
-        head = split_evidence(body)[0]
+        head = materialize_content(split_evidence(body)[0])
         turn = fm.get("turn", 0)
         try:
             turn = int(turn or 0)
@@ -398,6 +491,7 @@ def list_candidates(cfg, statuses=("pending",)):
             turn = 0
         out.append({"id": fm.get("id", ""), "status": fm.get("status", ""),
                     "kind": fm.get("kind", ""),
+                    "title": fm.get("title", ""),
                     "confidence": fm.get("confidence", ""),
                     "target": fm.get("target", ""),
                     "section": fm.get("section", ""),

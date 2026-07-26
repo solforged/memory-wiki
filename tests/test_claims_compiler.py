@@ -26,8 +26,8 @@ def test_nested_claim_json_roundtrip_preserves_legacy_shapes():
     text = wikifs.render_frontmatter(fm)
     parsed, _ = wikifs.parse_frontmatter(text)
     assert parsed == fm
-    assert "topics: [alpha, beta]" in text
-    assert "fields:\n  author: Jane" in text
+    assert 'topics:\n  - "alpha"\n  - "beta"' in text
+    assert 'fields:\n  author: "Jane"' in text
     assert "claims: [{" in text
 
 

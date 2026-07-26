@@ -306,6 +306,7 @@ Compiler-owned `reports/` and `.memory-wiki/cache/` are derived. Don’t manuall
 8. **Creating duplicate entity pages.** Search aliases and refs before choosing a slug.
 9. **Flattening disagreement.** Preserve attribution, uncertainty, and rival interpretations.
 10. **Ignoring a dirty worktree.** Verification and commits must account for pre-existing user changes.
+11. **False title-overlap deduplication on long page candidates.** The staging advisory currently compares the candidate’s full token set with every existing page title and may report an unrelated page as “already covered” when a long candidate merely contains all words of that title, especially through a wikilink. Diagnose repeated cross-type false matches in `memory_wiki/candidates.py:duplicate_reason` before changing the note’s epistemic destination. If the overlap is demonstrably false and ordinary `wiki_apply(stage)` remains blocked, call the plugin’s validated `candidates.stage` from the Hermes runtime with `index=None`; preserve schema validation, safety checks, locking, active-candidate hash checks, explicit target, pending status, and evidence explaining the bypass. Then open the candidate, confirm it in `review-queue`, run `hermes memory-wiki lint`, and remove any temporary draft. Never misuse `supersedes` to bypass deduplication.
 
 ## Verification checklist
 

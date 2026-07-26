@@ -113,26 +113,34 @@ def _parse_scalar(val):
     return val
 
 
-_NEEDS_QUOTES = re.compile(r'^[\[\{\'"#&*!|>%@`-]|: |:$|\s#|^\s|\s$')
-
-
 def _render_scalar(v):
+    """Render one scalar in Obsidian-friendly house style.
+
+    String scalars are always double-quoted so YAML 1.1 consumers
+    (including Obsidian Properties) keep ISO dates as strings, and so
+    the vault matches the quoted corpus majority. Booleans and numbers
+    stay bare.
+    """
     if isinstance(v, bool):
         return "true" if v else "false"
-    if isinstance(v, (int, float)):
+    if isinstance(v, int) and not isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float):
         return str(v)
     s = str(v)
     if "\n" in s or "\r" in s:
         raise ValueError("frontmatter scalars cannot contain newlines")
-    if s == "":
-        return '""'
-    if _NEEDS_QUOTES.search(s):
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return s
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def render_frontmatter(fm):
-    """Render a frontmatter dict in the wiki's house style."""
+    """Render a frontmatter dict in the wiki's house style.
+
+    House style matches the Obsidian-friendly corpus majority:
+    always-quoted string scalars, block lists with two-space-indented
+    dashes, and empty collections as ``[]`` / ``{}``. Nested structured
+    values (claim objects, etc.) still use compact JSON.
+    """
     out = ["---"]
     for k, v in fm.items():
         validate_frontmatter_value(k)
@@ -147,11 +155,11 @@ def render_frontmatter(fm):
         elif isinstance(v, (list, tuple)):
             if any(isinstance(item, (dict, list, tuple)) for item in v):
                 out.append(f"{k}: {_render_json(v)}")
-            elif any("," in str(item) for item in v):
-                out.append(f"{k}:")
-                out.extend(f"- {_render_scalar(item)}" for item in v)
+            elif not v:
+                out.append(f"{k}: []")
             else:
-                out.append(f"{k}: [" + ", ".join(_render_scalar(i) for i in v) + "]")
+                out.append(f"{k}:")
+                out.extend(f"  - {_render_scalar(item)}" for item in v)
         elif isinstance(v, dict):
             out.append(f"{k}: {_render_json(v)}")
         else:

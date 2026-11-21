@@ -1,0 +1,373 @@
+// Changes to the wiki: capture a draft, verify it, keep index.md and log.md
+// current, and record each change as one git commit.
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { ALIASES_KEY, concepts, describe, findConcept, forget, resolveAreas } from "./bundle.js";
+import { TYPE_DIRS } from "./config.js";
+import { append, compose, edit, flowList, quoted, split, stamp } from "./frontmatter.js";
+import { gitIn } from "./git.js";
+import { normalizeKey } from "./lookup.js";
+import { isActor, timestamp } from "./okf.js";
+
+export const ROOT_INDEX = `---
+okf_version: "0.3"
+title: llm-wiki
+description: Personal knowledge base for agents and their human. Look names, projects and jargon up here before guessing.
+---
+`;
+
+export const areaDir = (root, area) => (area === "default" ? root : path.join(root, area));
+
+const utc = (now) => now.toISOString().replace(/\.\d{3}Z$/, "Z");
+const localDate = (now) =>
+  [now.getFullYear(), now.getMonth() + 1, now.getDate()]
+    .map((part) => String(part).padStart(2, "0"))
+    .join("-");
+
+function read(abs) {
+  try {
+    return fs.readFileSync(abs, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** Files written by one change, with what they held before, so a refused commit undoes all of them. */
+class Changes {
+  #before = new Map();
+
+  write(abs, text) {
+    const previous = read(abs);
+    if (previous === text) return;
+    if (!this.#before.has(abs)) this.#before.set(abs, previous);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text);
+    forget(abs);
+  }
+
+  get paths() {
+    return [...this.#before.keys()];
+  }
+
+  rollback() {
+    for (const [abs, previous] of this.#before) {
+      if (previous === null) fs.rmSync(abs, { force: true });
+      else fs.writeFileSync(abs, previous);
+      forget(abs);
+    }
+  }
+}
+
+function isRepo(dir) {
+  const top = spawnSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  return top.status === 0 && fs.realpathSync(top.stdout.trim()) === fs.realpathSync(dir);
+}
+
+/** One commit of exactly the changed files. A refusal (a hook, say) restores them. */
+function commit(dir, changes, message) {
+  const paths = changes.paths;
+  if (paths.length === 0 || !isRepo(dir)) return false;
+  const git = (...args) => spawnSync("git", [...gitIn(dir), ...args], { encoding: "utf8" });
+  let result = git("add", "--", ...paths);
+  if (result.status === 0) result = git("commit", "--quiet", "-m", message, "--", ...paths);
+  if (result.status !== 0) {
+    git("reset", "--quiet", "--", ...paths);
+    changes.rollback();
+    const why = (result.stderr || result.stdout || "").trim();
+    throw new Error(`git refused the change, so nothing was kept:\n${why}`);
+  }
+  return true;
+}
+
+function logText(existing, date, entry) {
+  const heading = `## ${date}`;
+  if (existing === null) return `# Update Log\n\n${heading}\n\n* ${entry}\n`;
+  const lines = existing.split("\n");
+  const first = lines.findIndex((line) => line.startsWith("## "));
+  if (first !== -1 && lines[first].trim() === heading) {
+    let at = first + 1;
+    while (at < lines.length && lines[at].trim() === "") at++;
+    lines.splice(at, 0, `* ${entry}`);
+  } else if (first !== -1) {
+    lines.splice(first, 0, heading, "", `* ${entry}`, "");
+  } else {
+    while (lines.length > 0 && lines.at(-1).trim() === "") lines.pop();
+    lines.push("", heading, "", `* ${entry}`, "");
+  }
+  return lines.join("\n");
+}
+
+const linkText = (text) => text.replace(/([[\]\\])/g, "\\$1");
+const oneLine = (text) => text.replace(/\s+/g, " ").trim();
+
+/**
+ * index.md of every directory of an area that holds concepts (§8), by path.
+ * The bundle-root index keeps its frontmatter (§8.1) and lists the default
+ * space only: a private area has its own index inside it.
+ * @returns {Map<string, string>}
+ */
+export function renderIndexes(root, config, area) {
+  const base = area === "default" ? "" : area;
+  const parentOf = (dir) => (dir.includes("/") ? path.posix.dirname(dir) : "");
+  const dirs = new Map();
+  const node = (dir) => {
+    if (!dirs.has(dir)) dirs.set(dir, { files: [], subdirs: new Map() });
+    return dirs.get(dir);
+  };
+  node(base);
+  for (const file of concepts(root, config, { areas: [area] })) {
+    let dir = parentOf(file.rel);
+    node(dir).files.push(file);
+    while (dir !== base) {
+      const parent = node(parentOf(dir));
+      const name = path.posix.basename(dir);
+      parent.subdirs.set(name, (parent.subdirs.get(name) ?? 0) + 1);
+      dir = parentOf(dir);
+    }
+  }
+  const indexes = new Map();
+  for (const [dir, entry] of dirs) {
+    const sections = [];
+    if (entry.subdirs.size > 0) {
+      const lines = [...entry.subdirs]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, total]) => {
+          const noun = total === 1 ? "document" : "documents";
+          return `* [${linkText(name)}](${encodeURI(name)}/) - ${total} ${noun}`;
+        });
+      sections.push(`# Directories\n\n${lines.join("\n")}`);
+    }
+    const types = [...new Set(entry.files.map((file) => file.type))].sort();
+    for (const type of types) {
+      const lines = entry.files
+        .filter((file) => file.type === type)
+        .sort((a, b) => a.title.localeCompare(b.title))
+        .map((file) => {
+          const target = encodeURI(path.posix.basename(file.rel));
+          const about = file.description ? ` - ${oneLine(file.description)}` : "";
+          return `* [${linkText(file.title)}](${target})${about}`;
+        });
+      sections.push(`# ${type}\n\n${lines.join("\n")}`);
+    }
+    const abs = path.join(root, dir, "index.md");
+    const body = sections.join("\n\n");
+    if (dir === "") {
+      const parts = split(read(abs) ?? ROOT_INDEX);
+      const head = parts.yaml === null ? ROOT_INDEX : `---\n${parts.yaml}---\n`;
+      indexes.set(abs, body ? `${head}\n${body}\n` : head);
+    } else if (body) {
+      indexes.set(abs, `${body}\n`);
+    }
+  }
+  return indexes;
+}
+
+function finish(root, config, area, changes, now, entry, message) {
+  const dir = areaDir(root, area);
+  const log = path.join(dir, "log.md");
+  changes.write(log, logText(read(log), localDate(now), entry));
+  for (const [abs, text] of renderIndexes(root, config, area)) changes.write(abs, text);
+  return commit(dir, changes, message);
+}
+
+function slugOf(title) {
+  return title
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+function texts(value, what) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error(`${what} must be a list of non-empty strings`);
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+
+function sourcesOf(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error("sources must be a list");
+  return value.map((item) => {
+    const source = typeof item === "string" ? { resource: item } : item;
+    if (!source || typeof source.resource !== "string" || !source.resource.trim()) {
+      throw new Error("each source needs a resource (§5.1)");
+    }
+    return source;
+  });
+}
+
+function line(value, what, required) {
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${what} is required`);
+  return oneLine(value);
+}
+
+/**
+ * @typedef {object} CaptureInput
+ * @property {string} by           who writes this, as an OKF actor (§7)
+ * @property {string} [id]         update this concept; without it a new one is created
+ * @property {string} [type]       Concept, Entity, Project or Investigation (new concepts)
+ * @property {string} [title]
+ * @property {string} [description] one sentence: what a lookup returns
+ * @property {string} [body]       Markdown; replaces the body on update
+ * @property {string[]} [aliases]
+ * @property {string[]} [tags]
+ * @property {(string | { resource: string, id?: string, title?: string })[]} [sources]
+ * @property {string} [resource]
+ * @property {string} [staleAfter] RFC 3339 date or date-time
+ * @property {string} [slug]       file name, when the title has no ASCII letters
+ * @property {string} [area]       "default" or a private area (new concepts)
+ */
+
+/**
+ * Writes a concept as `status: draft` with `generated` set to this change. A
+ * draft stays out of recall until a person verifies it, and a revised concept
+ * returns to draft: its earlier verification is no longer current (§5.3).
+ * @param {CaptureInput} input
+ * @param {{ now?: Date, areas?: string[] }} [options] `areas` bounds where this may write
+ */
+export function capture(root, config, input, { now = new Date(), areas = ["all"] } = {}) {
+  if (!isActor(input.by)) {
+    throw new Error('by must be an actor: "<producer>/<version>" or "<scheme>:<id>" (§7)');
+  }
+  const open = resolveAreas(root, config, areas);
+  const aliases = texts(input.aliases, "aliases");
+  const tags = texts(input.tags, "tags");
+  const sources = sourcesOf(input.sources);
+  if (input.staleAfter !== undefined && Number.isNaN(timestamp(input.staleAfter))) {
+    throw new Error("staleAfter must be an RFC 3339 date or date-time with an offset");
+  }
+  const at = utc(now);
+  const changes = new Changes();
+  let area;
+  let rel;
+  let entry;
+
+  if (input.id) {
+    const file = findConcept(concepts(root, config, { areas: open }), root, input.id);
+    if (!file) throw new Error(`no concept "${input.id}" to update`);
+    area = file.area;
+    rel = file.rel;
+    const title = line(input.title, "title", false);
+    const description = line(input.description, "description", false);
+    clash(root, config, area, [title, ...(aliases ?? [])], file.rel);
+    const pairs = [];
+    if (title) pairs.push(["title", title]);
+    if (description) pairs.push(["description", description]);
+    if (input.resource) pairs.push(["resource", input.resource]);
+    if (tags) pairs.push(["tags", flowList(tags)]);
+    if (aliases) pairs.push([ALIASES_KEY, flowList(aliases)]);
+    pairs.push(["status", "draft"], ["generated", stamp(input.by, at)]);
+    if (input.staleAfter) pairs.push(["stale_after", quoted(input.staleAfter)]);
+    if (sources) pairs.push(["sources", sources]);
+    let text = edit(fs.readFileSync(file.abs, "utf8"), pairs);
+    if (input.body !== undefined) {
+      const body = input.body.trim();
+      text = `---\n${split(text).yaml}---\n${body ? `\n${body}\n` : ""}`;
+    }
+    changes.write(file.abs, text);
+    entry = `**Update**: Revised [${linkText(title ?? file.title)}](${link(area, rel)}), now a draft.`;
+  } else {
+    area = input.area ?? "default";
+    if (!open.includes(area)) {
+      const known = area === "default" || Object.hasOwn(config.areas, area);
+      throw new Error(
+        known ? `area "${area}" is locked or not open to this caller` : `unknown area "${area}"`,
+      );
+    }
+    const type = Object.keys(TYPE_DIRS).find(
+      (name) => name.toLowerCase() === String(input.type ?? "").toLowerCase(),
+    );
+    if (!type) throw new Error(`type must be one of: ${Object.keys(TYPE_DIRS).join(", ")}`);
+    const title = line(input.title, "title", true);
+    const description = line(input.description, "description", true);
+    const slug = input.slug ?? slugOf(title);
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+      throw new Error("the title gives no usable file name; pass slug (a-z, 0-9, -)");
+    }
+    rel = path.posix.join(area === "default" ? "" : area, TYPE_DIRS[type], `${slug}.md`);
+    if (fs.existsSync(path.join(root, rel))) {
+      throw new Error(`${rel.slice(0, -3)} exists; pass its id to update it`);
+    }
+    clash(root, config, area, [title, ...(aliases ?? [])], null);
+    const pairs = [
+      ["type", type],
+      ["title", title],
+      ["description", description],
+    ];
+    if (input.resource) pairs.push(["resource", input.resource]);
+    if (tags?.length) pairs.push(["tags", flowList(tags)]);
+    if (aliases?.length) pairs.push([ALIASES_KEY, flowList(aliases)]);
+    pairs.push(["status", "draft"], ["generated", stamp(input.by, at)]);
+    if (input.staleAfter) pairs.push(["stale_after", quoted(input.staleAfter)]);
+    if (sources?.length) pairs.push(["sources", sources]);
+    changes.write(path.join(root, rel), compose(pairs, input.body));
+    entry = `**Creation**: Added [${linkText(title)}](${link(area, rel)}) as a draft ${type}.`;
+  }
+
+  const id = rel.slice(0, -3);
+  const committed = finish(root, config, area, changes, now, entry, `wiki: capture ${id}`);
+  const file = findConcept(concepts(root, config, { areas: [area] }), root, id);
+  return { ...describe(file, now.getTime()), created: !input.id, committed };
+}
+
+/** A link from an area's log.md to one of its files. */
+function link(area, rel) {
+  return encodeURI(area === "default" ? rel : rel.slice(area.length + 1));
+}
+
+/** Two concepts of one area answering to the same name make lookups ambiguous. */
+function clash(root, config, area, names, selfRel) {
+  const wanted = new Set(names.filter(Boolean).map(normalizeKey));
+  for (const file of concepts(root, config, { areas: [area] })) {
+    if (file.rel === selfRel) continue;
+    const shared = [file.title, ...file.aliases].find((name) => wanted.has(normalizeKey(name)));
+    if (shared)
+      throw new Error(`"${shared}" already names ${file.id}; update that concept instead`);
+  }
+}
+
+/**
+ * Records that a person confirmed a concept: a `verified` event by a `human:`
+ * actor (§5.2) and `status: stable`.
+ * @param {{ now?: Date, by?: string, areas?: string[] }} [options]
+ */
+export function verify(
+  root,
+  config,
+  ref,
+  { now = new Date(), by = config.human, areas = ["all"] } = {},
+) {
+  if (!by.startsWith("human:")) throw new Error("only a human: actor verifies (§5.3)");
+  const open = resolveAreas(root, config, areas);
+  const file = findConcept(concepts(root, config, { areas: open }), root, ref);
+  if (!file) throw new Error(`no concept "${ref}"`);
+  if (file.status.status === "deprecated") throw new Error(`${file.id} is deprecated`);
+  let text = fs.readFileSync(file.abs, "utf8");
+  if (file.status.status !== "stable") text = edit(text, [["status", "stable"]]);
+  text = append(text, "verified", stamp(by, utc(now)));
+  const changes = new Changes();
+  changes.write(file.abs, text);
+  const entry = `**Verification**: [${linkText(file.title)}](${link(file.area, file.rel)}) confirmed by ${by}.`;
+  const committed = finish(root, config, file.area, changes, now, entry, `wiki: verify ${file.id}`);
+  const updated = findConcept(concepts(root, config, { areas: [file.area] }), root, file.id);
+  return { ...describe(updated, now.getTime()), committed };
+}
+
+/** Regenerates index.md files after edits made by hand. Returns the files rewritten. */
+export function reindex(root, config, { areas = ["all"] } = {}) {
+  const written = [];
+  for (const area of resolveAreas(root, config, areas)) {
+    const changes = new Changes();
+    for (const [abs, text] of renderIndexes(root, config, area)) changes.write(abs, text);
+    commit(areaDir(root, area), changes, "wiki: index");
+    written.push(...changes.paths);
+  }
+  return written;
+}

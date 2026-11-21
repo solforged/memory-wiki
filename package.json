@@ -1,0 +1,28 @@
+{
+  "name": "llm-wiki",
+  "version": "0.1.0",
+  "description": "An OKF v0.3 wiki as on-demand memory for agents: wiki CLI, omp extension and skill, Tern plugin",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "wiki": "bin/wiki.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "oxlint src bin omp test"
+  },
+  "omp": {
+    "extensions": [
+      "./omp/extension.ts"
+    ]
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  }
+}

@@ -88,14 +88,44 @@ function recallForPrompt(root, config, prompt, sessionId, cacheDir, now, env) {
   return formatRecall(fresh);
 }
 
-function checkToolGuard(root, config, text, cwd, home) {
-  if (runsVerify(text)) {
+const FILE_EDIT_TOOLS = new Set([
+  "write_file",
+  "edit_file",
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+]);
+const FILE_BODY_KEYS = new Set([
+  "Content",
+  "Target",
+  "Replacement",
+  "content",
+  "old_string",
+  "new_string",
+  "new_source",
+]);
+
+function toolGuardText(toolName, args) {
+  if (!FILE_EDIT_TOOLS.has(toolName) || !args || typeof args !== "object") {
+    return { text: inputText(args), checkCommands: true };
+  }
+  const filtered = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (!FILE_BODY_KEYS.has(key)) filtered[key] = value;
+  }
+  return { text: inputText(filtered), checkCommands: false };
+}
+
+function checkToolGuard(root, config, toolName, args, cwd, home) {
+  const { text, checkCommands } = toolGuardText(toolName, args);
+  if (checkCommands && runsVerify(text)) {
     return "Only the user verifies memory-wiki entries. Give them the id to run: wiki verify <id>";
   }
   if (!fs.existsSync(root)) return null;
   const areas = Object.keys(config.areas);
   const mounted = areas.filter((name) => isMounted(root, name));
-  const ref = privateReference(text, { root, areas, mounted, cwd, home });
+  const ref = privateReference(text, { root, areas, mounted, cwd, home, checkCommands });
   if (!ref) return null;
   return `Private memory-wiki areas are restricted to local models, so this hosted session cannot access ${ref}.`;
 }
@@ -140,9 +170,8 @@ export function handleAgyHook(payload, options = {}) {
   if (event === "PreToolUse") {
     const toolName = payload?.toolCall?.name ?? "";
     const args = payload?.toolCall?.args ?? {};
-    const text = inputText(args);
     const cwd = payload?.cwd || process.cwd();
-    const denied = checkToolGuard(root, config, text, cwd, options.home);
+    const denied = checkToolGuard(root, config, toolName, args, cwd, options.home);
     if (denied) return { decision: "deny", reason: denied };
     if (toolName === "run_command" && isSafeReadOnlyWikiCommand(args?.CommandLine)) {
       return { decision: "allow", reason: "Read-only default-space memory-wiki lookup" };
@@ -191,9 +220,8 @@ export function handleClaudeHook(payload, options = {}) {
   if (event === "PreToolUse") {
     const toolName = payload?.tool_name ?? "";
     const input = payload?.tool_input ?? {};
-    const text = inputText(input);
     const cwd = payload?.cwd || process.cwd();
-    const denied = checkToolGuard(root, config, text, cwd, options.home);
+    const denied = checkToolGuard(root, config, toolName, input, cwd, options.home);
     if (denied) {
       return {
         hookSpecificOutput: {

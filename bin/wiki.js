@@ -3,7 +3,37 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import readline from "node:readline/promises";
 import { parseArgs } from "node:util";
-import * as wiki from "../src/index.js";
+
+// Fast path for harness lifecycle hooks: avoids loading write/area/sync modules
+// on every PreToolUse invocation.
+if (process.argv[2] === "hook" && !process.argv.includes("--help") && !process.argv.includes("-h")) {
+  const target = process.argv[3];
+  if (target !== "agy" && target !== "claude") {
+    process.stderr.write('wiki: hook expects "agy" or "claude"\nRun wiki --help for usage.\n');
+    process.exit(2);
+  }
+  const [{ wikiRoot }, { handleAgyHook, handleClaudeHook }] = await Promise.all([
+    import("../src/config.js"),
+    import("../src/hooks.js"),
+  ]);
+  const raw = fs.readFileSync(0, "utf8").trim();
+  let payload = {};
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      process.stdout.write("{}\n");
+      process.exit(0);
+    }
+  }
+  const root = wikiRoot();
+  const output =
+    target === "agy" ? handleAgyHook(payload, { root }) : handleClaudeHook(payload, { root });
+  process.stdout.write(`${JSON.stringify(output)}\n`);
+  process.exit(0);
+}
+
+const wiki = await import("../src/index.js");
 
 const USAGE = `Usage: wiki <command> [options]
 
@@ -33,7 +63,9 @@ Maintain
   init                 create the wiki
   lint [--strict]      conformance, links, staleness; --strict also fails on warnings
   area [status]        private areas, and whether each is unlocked
-  area create|unlock|lock <name>      also: lock --all, lock --force
+  area create|unlock|lock|restore|sync <name>
+      lock: [--all] [--force] [--sync]   sync: [--remote URL|DIR] [--pull|--push] [--force]
+      restore: [--from HOST|FILE] [--remote URL|DIR]
   hook <agy|claude>    run a harness lifecycle hook (JSON on stdin -> stdout)
   root                 print the wiki's directory
 
@@ -80,6 +112,13 @@ function parse(argv) {
         strict: { type: "boolean" },
         all: { type: "boolean" },
         force: { type: "boolean" },
+        sync: { type: "boolean" },
+        remote: { type: "string" },
+        from: { type: "string" },
+        host: { type: "string" },
+        pull: { type: "boolean" },
+        push: { type: "boolean" },
+        "allow-dirty": { type: "boolean" },
       },
     });
   } catch (error) {
@@ -511,6 +550,17 @@ async function main() {
       }
       if (action === "lock" && flags.all) {
         for (const area of wiki.areaStatus(root, config)) {
+          if (flags.sync && area.mounted) {
+            const synced = await wiki.syncArea(root, config, area.name, {
+              remote: flags.remote,
+              host: flags.host,
+              forcePush: Boolean(flags.force),
+              allowDirty: Boolean(flags["allow-dirty"]),
+            });
+            print(
+              `Synced ${area.name}: ${synced.merged.length} merged, ${synced.pushed ? `uploaded ${synced.host}.bundle.age` : "up to date"}`,
+            );
+          }
           if (wiki.lockArea(root, config, area.name, { force: flags.force }))
             print(`Locked ${area.name}`);
         }
@@ -524,8 +574,58 @@ async function main() {
         const unlocked = await wiki.unlockArea(root, config, name);
         print(unlocked ? `Unlocked ${name}` : `${name} is already unlocked`);
       } else if (action === "lock") {
+        if (flags.sync && wiki.isMounted(root, name)) {
+          const synced = await wiki.syncArea(root, config, name, {
+            remote: flags.remote,
+            host: flags.host,
+            forcePush: Boolean(flags.force),
+            allowDirty: Boolean(flags["allow-dirty"]),
+          });
+          print(
+            `Synced ${name}: ${synced.merged.length} merged, ${synced.pushed ? `uploaded ${synced.host}.bundle.age` : "up to date"}`,
+          );
+        }
         const locked = wiki.lockArea(root, config, name, { force: flags.force });
         print(locked ? `Locked ${name}` : `${name} is already locked`);
+      } else if (action === "sync") {
+        if (flags.pull && flags.push) {
+          throw new UsageError("area sync takes at most one of --pull or --push");
+        }
+        const result = await wiki.syncArea(root, config, name, {
+          remote: flags.remote,
+          host: flags.host,
+          forcePush: Boolean(flags.force),
+          pullOnly: Boolean(flags.pull),
+          pushOnly: Boolean(flags.push),
+          allowDirty: Boolean(flags["allow-dirty"]),
+        });
+        if (flags.json) json(result);
+        else {
+          const parts = [];
+          if (result.merged.length > 0) {
+            parts.push(
+              `merged ${result.merged.map((m) => `${m.peer} (${m.mode})`).join(", ")}`,
+            );
+          } else if (result.pulled.length > 0) {
+            parts.push(`checked ${result.pulled.join(", ")} (already up to date)`);
+          }
+          if (result.pushed) {
+            parts.push(`uploaded ${result.host}.bundle.age (${result.bytes} bytes)`);
+          }
+          print(`Synced ${name}${parts.length > 0 ? `: ${parts.join("; ")}` : ": already up to date"}`);
+        }
+      } else if (action === "restore") {
+        const result = await wiki.restoreArea(root, config, name, {
+          from: flags.from,
+          remote: flags.remote,
+          host: flags.host,
+        });
+        if (flags.json) json(result);
+        else {
+          print(
+            `Restored ${name} from ${result.source} (${result.branch}@${result.head.slice(0, 8)}); it is locked.`,
+          );
+        }
       } else {
         throw new UsageError(`unknown area command "${action}"`);
       }

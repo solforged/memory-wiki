@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CONFIG_FILE, VAULT_DIR } from "./config.js";
+import { CONFIG_FILE, LOCAL_CONFIG_FILE, VAULT_DIR } from "./config.js";
 import { gitIn } from "./git.js";
 import { localDate } from "./okf.js";
 import { ROOT_INDEX } from "./write.js";
@@ -39,7 +39,7 @@ export function init(root, { now = new Date() } = {}) {
     "log.md": `# Update Log\n\n## ${date}\n\n* **Initialization**: Created the wiki.\n`,
     "AGENTS.md": fs.readFileSync(path.join(TEMPLATES, "AGENTS.md"), "utf8"),
     [CONFIG_FILE]: settings(`human:${os.userInfo().username}`),
-    ".gitignore": `/${VAULT_DIR}/\n/personal/\n/work/\n.DS_Store\n`,
+    ".gitignore": `/${VAULT_DIR}/\n/${LOCAL_CONFIG_FILE}\n/personal/\n/work/\n.DS_Store\n`,
   };
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(root, name), text);
   const git = (...args) => {

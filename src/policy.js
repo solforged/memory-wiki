@@ -27,6 +27,9 @@ const VALUE_FLAGS = new Set([
   "--superseded-by",
   "--if-match",
   "--status",
+  "--remote",
+  "--from",
+  "--host",
 ]);
 
 const READ_ONLY_COMMANDS = new Set([
@@ -154,6 +157,7 @@ export function wikiInvocations(text) {
     const positionals = [];
     const areas = [];
     let hasSet = false;
+    let hasSync = false;
     let afterDashDash = false;
     for (let j = 0; j < args.length; j++) {
       const tok = args[j];
@@ -170,6 +174,8 @@ export function wikiInvocations(text) {
           if (areaVal !== undefined) areas.push(areaVal);
         } else if (flag === "--set") {
           hasSet = true;
+        } else if (flag === "--sync") {
+          hasSync = true;
         } else if (eq === -1 && VALUE_FLAGS.has(flag)) {
           j++;
         }
@@ -177,7 +183,7 @@ export function wikiInvocations(text) {
         positionals.push(tok);
       }
     }
-    calls.push({ subcommand: positionals[0] ?? "", positionals, areas, hasSet, raw });
+    calls.push({ subcommand: positionals[0] ?? "", positionals, areas, hasSet, hasSync, raw });
   }
   return calls;
 }
@@ -210,13 +216,23 @@ const TOKEN_BOUNDARY = /(?:^|[\s"'=:(,[\]{}])/;
  * relative paths), the wiki root as a whole while an area is unlocked, a CLI
  * call asking for any non-default `--area`, or asking to unlock/create one.
  * @param {string} text from `inputText`
- * @param {{ root: string, areas: string[], mounted: string[], cwd: string, home?: string }} where
+ * @param {{ root: string, areas: string[], mounted: string[], cwd: string, home?: string, checkCommands?: boolean }} where
  */
-export function privateReference(text, { root, areas, mounted, cwd, home = os.homedir() }) {
+export function privateReference(
+  text,
+  { root, areas, mounted, cwd, home = os.homedir(), checkCommands = true },
+) {
+  const protectedRoots = new Set([...areas, ".vaults", ".memory-wiki.local.yml"]);
+  const protectedReason = (first) => {
+    if (first === ".vaults") return "the encrypted vaults directory";
+    if (first === ".memory-wiki.local.yml") return "the local sync settings file";
+    return `a path into the ${first} area`;
+  };
   const inside = cwd === root || cwd.startsWith(`${root}/`);
   if (inside) {
     const first = path.relative(root, cwd).split(path.sep)[0];
     if (areas.includes(first)) return `the working directory is inside the ${first} area`;
+    if (first === ".vaults") return "the working directory is inside the encrypted vaults directory";
   }
   for (const form of spellings(root, home, cwd)) {
     for (let at = text.indexOf(form); at !== -1; at = text.indexOf(form, at + 1)) {
@@ -239,7 +255,7 @@ export function privateReference(text, { root, areas, mounted, cwd, home = os.ho
         continue;
       }
       const first = normalized.split("/")[0];
-      if (areas.includes(first)) return `a path into the ${first} area`;
+      if (protectedRoots.has(first)) return protectedReason(first);
       if (/[*?[\]{}]/.test(first) && mounted.length > 0) {
         return `a wildcard inside the wiki directory while ${mounted.join(", ")} is unlocked`;
       }
@@ -254,17 +270,23 @@ export function privateReference(text, { root, areas, mounted, cwd, home = os.ho
       );
       if (token.startsWith("/")) continue;
       const first = resolved.split("/")[0];
-      if (areas.includes(first)) return `a path into the ${first} area`;
+      if (protectedRoots.has(first)) return protectedReason(first);
       if ((resolved === "." || /[*?[\]{}]/.test(first)) && mounted.length > 0 && token.includes("..")) {
         return `the whole wiki directory while ${mounted.join(", ")} is unlocked`;
       }
     }
   }
+  if (!checkCommands) return null;
   for (const call of wikiInvocations(text)) {
     const privateArea = call.areas.find((name) => name !== "default");
     if (privateArea) return `wiki --area ${privateArea}`;
-    if (call.subcommand === "area" && (call.positionals[1] === "unlock" || call.positionals[1] === "create")) {
-      return "unlocking a private area";
+    if (call.subcommand === "area") {
+      const action = call.positionals[1] ?? "status";
+      if (action === "unlock" || action === "create") return "unlocking a private area";
+      if (action === "lock" && call.hasSync) return "syncing private areas (wiki area lock --sync)";
+      if (action !== "status" && action !== "lock") {
+        return `managing private areas (wiki area ${action})`;
+      }
     }
   }
   if (/\bwiki\b/.test(text)) {

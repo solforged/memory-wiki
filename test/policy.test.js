@@ -136,6 +136,39 @@ test("which tool inputs reach into a private area, including traversals and mult
     "flags before subcommand",
   );
   assert.equal(reason({ command: "wiki area status" }), null);
+  assert.equal(reason({ command: "wiki area lock work" }), null);
+  assert.equal(
+    reason({ command: "wiki area lock --sync work" }),
+    "syncing private areas (wiki area lock --sync)",
+  );
+  assert.equal(
+    reason({ command: "wiki area sync work" }),
+    "managing private areas (wiki area sync)",
+  );
+  assert.equal(
+    reason({ command: "wiki area restore personal" }),
+    "managing private areas (wiki area restore)",
+  );
+  assert.equal(
+    reason({ command: "wiki area compact personal" }),
+    "managing private areas (wiki area compact)",
+  );
+  assert.equal(
+    reason({ path: `${root}/.vaults/personal.sparsebundle/token` }),
+    "the encrypted vaults directory",
+  );
+  assert.equal(
+    reason({ path: `${root}/.memory-wiki.local.yml` }),
+    "the local sync settings file",
+  );
+  assert.equal(
+    reason({ text: "Documenting wiki area sync personal in README" }, { checkCommands: false }),
+    null,
+  );
+  assert.equal(
+    reason({ path: `${root}/.vaults/work.sparsebundle` }, { checkCommands: false }),
+    "the encrypted vaults directory",
+  );
 });
 
 test("an agent's bash command never verifies or reviews", () => {

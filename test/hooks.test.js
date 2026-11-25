@@ -117,6 +117,57 @@ test("agy hooks inject now.md at SessionStart, recall once per turn with revisio
     ),
     { decision: "ask" },
   );
+  // File edits mentioning CLI commands in body text are allowed, while private targets are denied.
+  assert.deepEqual(
+    handleAgyHook(
+      {
+        hookEventName: "PreToolUse",
+        toolCall: {
+          name: "edit_file",
+          args: {
+            Path: "/Users/ada/src/memory-wiki/README.md",
+            Target: "old",
+            Replacement: "Run wiki area sync work or wiki verify concepts/prr",
+          },
+        },
+      },
+      opts,
+    ),
+    { decision: "ask" },
+  );
+  assert.equal(
+    handleAgyHook(
+      {
+        hookEventName: "PreToolUse",
+        toolCall: {
+          name: "edit_file",
+          args: {
+            Path: `${root}/work/concepts/secret.md`,
+            Target: "old",
+            Replacement: "new",
+          },
+        },
+      },
+      opts,
+    ).decision,
+    "deny",
+  );
+  assert.equal(
+    handleAgyHook(
+      {
+        hookEventName: "PreToolUse",
+        toolCall: {
+          name: "write_file",
+          args: {
+            Path: `${root}/.memory-wiki.local.yml`,
+            Content: "sync: {}",
+          },
+        },
+      },
+      opts,
+    ).decision,
+    "deny",
+  );
 });
 
 test("claude hooks mirror guardrails and prompt recall", (t) => {

@@ -20,8 +20,11 @@ export {
 export {
   CONFIG_FILE,
   LEGACY_CONFIG_FILE,
+  LOCAL_CONFIG_FILE,
   NOW_LIMIT,
   TYPE_DIRS,
+  VAULT_DIR,
+  defaultHost,
   defaultOnly,
   loadConfig,
   wikiRoot,
@@ -38,4 +41,12 @@ export {
   runsVerify,
   wikiInvocations,
 } from "./policy.js";
+export {
+  ageDecryptToFile,
+  ageEncrypt,
+  createSyncRemote,
+  parseWebDavPropfind,
+  restoreArea,
+  syncArea,
+} from "./sync.js";
 export { capture, deprecate, reindex, verify, writeNow } from "./write.js";

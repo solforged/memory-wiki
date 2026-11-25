@@ -33,8 +33,12 @@ export const NOW = new Date("2026-11-21T12:00:00Z");
 export function tempWiki(t, files = {}, { git = false, areas } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "memory-wiki-test-")));
   t.after(() => {
-    const config = loadConfig(root);
-    for (const name of Object.keys(config.areas)) lockArea(root, config, name, { force: true });
+    try {
+      const config = loadConfig(root);
+      for (const name of Object.keys(config.areas)) lockArea(root, config, name, { force: true });
+    } catch {
+      // ignore invalid config written by negative tests
+    }
     fs.rmSync(root, { recursive: true, force: true });
   });
   const settings = { human: "human:tester", ...(areas ? { areas } : {}) };

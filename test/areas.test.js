@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
@@ -11,6 +12,8 @@ import {
   loadConfig,
   lockArea,
   lookup,
+  restoreArea,
+  syncArea,
   unlockArea,
 } from "../src/index.js";
 import { CONFIG_FILE } from "../src/config.js";
@@ -60,6 +63,7 @@ test(
     assert.equal(await unlockArea(root, config, "work"), true);
     assert.equal(await unlockArea(root, config, "work"), false, "unlocking twice is not an error");
     assert.equal(run("git", ["-C", work, "config", "--local", "guard.exempt"]).trim(), "true");
+    assert.match(read(root, "work/.gitattributes"), /log\.md merge=union/);
 
     const made = capture(
       root,
@@ -120,5 +124,116 @@ test(
     fs.writeFileSync(path.join(root, CONFIG_FILE), JSON.stringify({ areas: passphrase("wrong") }));
     await assert.rejects(unlockArea(root, loadConfig(root), "work"), /could not unlock "work"/);
     assert.deepEqual(fs.readdirSync(work), []);
+  },
+);
+
+const hasRealAge =
+  spawnSync("sh", ["-c", "command -v age && command -v age-keygen"], { encoding: "utf8" }).status === 0;
+
+test(
+  "restoreArea bootstraps a second Mac sparsebundle from a real age-encrypted bundle",
+  { skip: process.platform !== "darwin" || !hasRealAge },
+  async (t) => {
+    const keygen = run("age-keygen", []);
+    const identity = keygen
+      .split("\n")
+      .find((line) => line.startsWith("AGE-SECRET-KEY-"))
+      .trim();
+    const recipient = keygen
+      .split("\n")
+      .find((line) => line.includes("public key: age1"))
+      .replace(/.*public key:\s*/, "")
+      .trim();
+
+    const remoteDir = fs.mkdtempSync(path.join(path.dirname(tempWiki(t).root), "memory-wiki-remote-"));
+    t.after(() => fs.rmSync(remoteDir, { recursive: true, force: true }));
+
+    const areaSpec = {
+      work: {
+        size: "20m",
+        passphrase: ["printf", "%s", "vault-pass"],
+        age_recipient: recipient,
+        age_identity: ["printf", "%s", identity],
+        sync: { remote: remoteDir },
+      },
+    };
+
+    const mac1 = tempWiki(t, { "index.md": ROOT_INDEX }, { git: true, areas: areaSpec });
+    await createArea(mac1.root, mac1.config, "work", { now: NOW });
+    await unlockArea(mac1.root, mac1.config, "work");
+    capture(
+      mac1.root,
+      mac1.config,
+      {
+        by: "pi/m",
+        type: "Concept",
+        title: "Vault Entry",
+        description: "Synced across real encrypted sparsebundles.",
+        area: "work",
+      },
+      { now: NOW },
+    );
+    const pdfBytes = Buffer.from("%PDF-1.4\nfake-pdf-body\n");
+    fs.mkdirSync(path.join(mac1.root, "work", "assets"), { recursive: true });
+    fs.writeFileSync(path.join(mac1.root, "work", "assets", "spec.pdf"), pdfBytes);
+    run("git", ["-C", path.join(mac1.root, "work"), "add", "assets/spec.pdf"]);
+    run("git", ["-C", path.join(mac1.root, "work"), "commit", "--quiet", "-m", "Add spec.pdf"]);
+    const expectedHead = run("git", ["-C", path.join(mac1.root, "work"), "rev-parse", "HEAD"]).trim();
+    await syncArea(mac1.root, mac1.config, "work", { host: "hyperion" });
+    lockArea(mac1.root, mac1.config, "work");
+
+    // Second Mac restores into a brand-new sparsebundle without unrelated Git root commits.
+    const mac2 = tempWiki(t, { "index.md": ROOT_INDEX }, { git: true, areas: areaSpec });
+    const restored = await restoreArea(mac2.root, mac2.config, "work", { host: "sigil" });
+    assert.equal(restored.head, expectedHead);
+    assert.deepEqual(
+      areaStatus(mac2.root, mac2.config).map(({ name, exists, mounted }) => ({ name, exists, mounted })),
+      [{ name: "work", exists: true, mounted: false }],
+      "restored area starts locked",
+    );
+
+    await unlockArea(mac2.root, mac2.config, "work");
+    const work2 = path.join(mac2.root, "work");
+    assert.equal(run("git", ["-C", work2, "rev-parse", "HEAD"]).trim(), expectedHead);
+    assert.equal(run("git", ["-C", work2, "config", "--local", "guard.exempt"]).trim(), "true");
+    assert.equal(fs.existsSync(path.join(work2, ".metadata_never_index")), true);
+    assert.deepEqual(fs.readFileSync(path.join(work2, "assets", "spec.pdf")), pdfBytes);
+
+    // Concurrent offline captures on both Macs auto-merge log.md and regenerate index.md cleanly.
+    await unlockArea(mac1.root, mac1.config, "work");
+    capture(
+      mac1.root,
+      mac1.config,
+      {
+        by: "pi/m",
+        type: "Concept",
+        title: "Hyperion Entry",
+        description: "Captured offline on hyperion.",
+        area: "work",
+      },
+      { now: NOW },
+    );
+    capture(
+      mac2.root,
+      mac2.config,
+      {
+        by: "pi/m",
+        type: "Concept",
+        title: "Sigil Entry",
+        description: "Captured offline on sigil.",
+        area: "work",
+      },
+      { now: NOW },
+    );
+    await syncArea(mac1.root, mac1.config, "work", { host: "hyperion" });
+    const merged = await syncArea(mac2.root, mac2.config, "work", { host: "sigil" });
+    assert.equal(merged.merged.length, 1);
+    assert.match(read(mac2.root, "work/concepts/index.md"), /Hyperion Entry/);
+    assert.match(read(mac2.root, "work/concepts/index.md"), /Sigil Entry/);
+    assert.match(read(mac2.root, "work/log.md"), /Hyperion Entry/);
+    assert.match(read(mac2.root, "work/log.md"), /Sigil Entry/);
+
+    lockArea(mac1.root, mac1.config, "work");
+    lockArea(mac2.root, mac2.config, "work");
   },
 );

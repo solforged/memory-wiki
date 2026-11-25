@@ -16,14 +16,11 @@ Pi integrates with `wiki` directly through `pi-mono`'s `memory` extension (`now.
 Needs Node.js 22 or later. Private areas need macOS.
 
 ```sh
-aube install
-ln -s "$PWD/bin/wiki.js" ~/.local/bin/wiki
-mkdir -p ~/.agents/skills
-ln -s "$PWD/skills/memory-wiki" ~/.agents/skills/memory-wiki
-wiki init                      # creates ~/.local/share/memory-wiki
-omp plugin link "$PWD"         # omp extension, in new omp sessions
-tern plugin link "$PWD/tern"
+node scripts/install.js        # installs deps, links wiki CLI, skill, omp, and Tern plugins
+wiki init                      # first machine only; other Macs clone your wiki repo instead
 ```
+
+`scripts/install.js` is idempotent (supports `--dry-run`) and never auto-creates sparse bundles on a new host; instead it reports which private areas are missing so you can restore them.
 
 Pi, omp, and the Antigravity CLI discover `~/.agents/skills/memory-wiki` directly; Claude Code and the Antigravity App read it when `~/.agents/skills/` is bridged into their skill folders. The wiki is `$MEMORY_WIKI_HOME`, else `memory-wiki` under `$XDG_DATA_HOME` (`~/.local/share`).
 
@@ -92,9 +89,44 @@ wiki area lock work            # or: wiki area lock --all
 ```
 
 - Every command — including `lint` and `index` — covers a private area only when it names it (`--area work` or `--area all`).
-- Setting `MEMORY_WIKI_DEFAULT_ONLY=1` disables all private area reads, writes, and unlocks in the CLI itself.
-- Each area has its own Git repository, `index.md` and `log.md` inside the image. The default space records nothing about it, and `wiki lint` reports any link from the default space into an area as an error.
+- Setting `MEMORY_WIKI_DEFAULT_ONLY=1` disables all private area reads, writes, unlocks, restores, and syncs in the CLI itself.
+- Each area has its own Git repository, `index.md`, `log.md`, and `.gitattributes` (`log.md merge=union`) inside the image. The default space records nothing about it, and `wiki lint` reports any link from the default space into an area as an error.
 - The area's repository sets `guard.exempt`, which a git-guard that supports it reads as "skip the term checks, refuse every push".
+
+### Syncing and backing up private areas across Macs
+
+Never sync `.vaults/*.sparsebundle` through live file sync (iCloud, Synology Drive, Syncthing) or copy an image while unlocked. Instead, each Mac keeps its own local sparse bundle and exchanges committed Git history (including binary attachments such as PDFs, SVGs, and PNGs) as per-host `age`-encrypted Git bundles (`<host>.bundle.age`) on a WebDAV server (such as a Synology NAS over Tailscale) or a local directory:
+
+1. Generate an `age` keypair per area (`age-keygen`), store the private `AGE-SECRET-KEY-1...` in a custom `age_identity` field on the area's 1Password item, and add the public recipient and identity command to `.memory-wiki.yml`:
+
+```yaml
+areas:
+  personal:
+    image: .vaults/personal.sparsebundle
+    size: 2g
+    passphrase: [op, read, "op://Private/llm-wiki personal/password"]
+    age_recipient: age1...
+    age_identity: [op, read, "op://Private/llm-wiki personal/age_identity"]
+```
+
+2. Keep machine-local transport settings (such as your NAS WebDAV URL and credential command) in the gitignored `.memory-wiki.local.yml` so internal hostnames never enter your wiki Git repository:
+
+```yaml
+sync:
+  remote: https://dsm.example.ts.net/memory-wiki
+  username: memory-wiki
+  password: [op, read, "op://Private/NAS memory-wiki WebDAV/password"]
+```
+
+3. Sync from an unlocked area, or sync as you lock:
+
+```sh
+wiki area sync personal          # fetch & merge peers, then upload <host>.bundle.age
+wiki area lock --sync personal   # sync first, then lock
+wiki area restore personal       # on a second Mac: create a fresh local image from the newest bundle
+```
+
+Exports encrypt to the public `age1...` recipient (no extra Touch ID prompt) and skip uploading when `HEAD` is unchanged. Peer bundles are decrypted only inside the mounted encrypted volume — never in `/tmp` — and `index.md` merge conflicts regenerate automatically. Back up the NAS share with Btrfs Snapshot Replication + Hyper Backup (or offsite snapshots) for 3-2-1 recovery.
 
 ### Only local models read them
 

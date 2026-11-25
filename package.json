@@ -15,7 +15,8 @@
   },
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
-    "lint": "oxlint src bin omp test"
+    "lint": "oxlint src bin omp scripts test",
+    "install:links": "node scripts/install.js"
   },
   "omp": {
     "extensions": [

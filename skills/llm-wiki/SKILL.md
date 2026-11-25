@@ -46,7 +46,7 @@ wiki capture --by <producer>/<model> --id concepts/sparse-bundle --description '
 - `--description` is one sentence: it is all that a lookup returns. Put detail in the body.
 - Look the name up first, and update the concept it already has instead of adding a second one.
 - Link related concepts in the body with relative Markdown links, such as `[git-guard](../entities/git-guard.md)`.
-- Everything you write is a draft. Only the user verifies: never run `wiki verify`, and never write `verified` or `status: stable` into a file. Tell the user the id so they can run `/wiki verify <id>`.
+- Everything you write is a draft. Only the user verifies: never run `wiki verify`, and never write `verified` or `status: stable` into a file. Tell the user the id so they can verify it with `wiki verify <id>` (or `/wiki verify <id>` in omp).
 - Never record credentials, keys or tokens.
 
 ## Private areas

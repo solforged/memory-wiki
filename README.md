@@ -15,12 +15,14 @@ Needs Node.js 22 or later. Private areas need macOS.
 ```sh
 aube install
 ln -s "$PWD/bin/wiki.js" ~/.local/bin/wiki
+mkdir -p ~/.agents/skills
+ln -s "$PWD/skills/llm-wiki" ~/.agents/skills/llm-wiki
 wiki init                      # creates ~/.local/share/llm-wiki
 omp plugin link "$PWD"         # extension and skill, in new omp sessions
 tern plugin link "$PWD/tern"
 ```
 
-The wiki is `$LLM_WIKI_HOME`, else `llm-wiki` under `$XDG_DATA_HOME` (`~/.local/share`).
+Pi, omp, and the Antigravity CLI discover `~/.agents/skills/llm-wiki` directly; Claude Code and the Antigravity App read it when `~/.agents/skills/` is bridged into their skill folders. The wiki is `$LLM_WIKI_HOME`, else `llm-wiki` under `$XDG_DATA_HOME` (`~/.local/share`).
 
 ## What the wiki holds
 

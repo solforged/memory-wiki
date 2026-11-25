@@ -6,11 +6,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_FILE, VAULT_DIR } from "./config.js";
 import { gitIn } from "./git.js";
+import { localDate } from "./okf.js";
 import { ROOT_INDEX } from "./write.js";
 
 const TEMPLATES = fileURLToPath(new URL("../templates/", import.meta.url));
 
-const settings = (human) => `# llm-wiki settings. Dot-files are outside the OKF bundle.
+const settings = (human) => `# memory-wiki settings. Dot-files are outside the OKF bundle.
 
 # Who "wiki verify" records as the reviewer.
 human: ${human}
@@ -32,7 +33,7 @@ areas:
 export function init(root, { now = new Date() } = {}) {
   if (fs.existsSync(path.join(root, "index.md"))) throw new Error(`${root} already holds a wiki`);
   fs.mkdirSync(root, { recursive: true });
-  const date = now.toISOString().slice(0, 10);
+  const date = localDate(now);
   const files = {
     "index.md": ROOT_INDEX,
     "log.md": `# Update Log\n\n## ${date}\n\n* **Initialization**: Created the wiki.\n`,

@@ -202,10 +202,10 @@ tern.chrome.status(function()
 	if unlockedNames == "" then
 		return {}
 	end
-	return { { text = `wiki: {unlockedNames} unlocked`, tone = "warn", command = "plugin.llm-wiki.lock" } }
+	return { { text = `wiki: {unlockedNames} unlocked`, tone = "warn", command = "plugin.memory-wiki.lock" } }
 end)
 
-local INFO_SIG = '{id: string, path: string, area: "default", type: string, title: string, description: string, aliases: {string}, tags: {string}, status: string, tier: string, stale: boolean | "malformed"}'
+local INFO_SIG = '{id: string, path: string, area: "default", type: string, title: string, description: string, aliases: {string}, tags: {string}, status: string, tier: string, stale: boolean | "malformed", revision: string, superseded_by: string?}'
 local TRUST_DOC = " Entries carry status and tier; treat drafts and unverified entries as unconfirmed."
 
 local function registerRead(name: string, command: string, sig: string, doc: string)
@@ -234,7 +234,7 @@ registerRead("read", "show", "(id: string) -> " .. INFO_SIG:sub(1, -2) .. ", fro
 	"Read the Markdown body and frontmatter of a default-wiki entry by an ID returned by lookup or search.")
 
 tern.carly.context(function()
-	return 'The user has a personal wiki. Before guessing at an unfamiliar name, project, or piece of jargon, call plugins["llm-wiki"].lookup(name).'
+	return 'The user has a personal memory-wiki. Before guessing at an unfamiliar name, project, or piece of jargon, call plugins["memory-wiki"].lookup(name).'
 end)
 
 pollAreas(nil)

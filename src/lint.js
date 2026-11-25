@@ -2,8 +2,8 @@
 // maintainer wants to hear about (stale, broken, ambiguous) as warnings.
 import fs from "node:fs";
 import path from "node:path";
-import { areaOf, scan } from "./bundle.js";
-import { TYPE_DIRS } from "./config.js";
+import { NOW_FILE, areaOf, scan } from "./bundle.js";
+import { NOW_LIMIT, TYPE_DIRS } from "./config.js";
 import { extractLinks, pathFields, resolveTarget } from "./links.js";
 import { normalizeKey } from "./lookup.js";
 import { asList, present, staleness, timestamp } from "./okf.js";
@@ -16,18 +16,19 @@ const PAGES = new Set([
   "LICENSE.md",
   "README.md",
   "SKILL.md",
+  NOW_FILE,
 ]);
 
 /**
  * @typedef {{ level: "error" | "warning" | "info", rel: string, message: string }} Finding
- * @param {{ areas?: string[], now?: number }} [options]
+ * @param {{ areas?: string[], now?: number, env?: NodeJS.ProcessEnv }} [options]
  * @returns {Finding[]} in path order
  */
-export function lint(root, config, { areas = ["all"], now = Date.now() } = {}) {
+export function lint(root, config, { areas = ["default"], now = Date.now(), env = process.env } = {}) {
   /** @type {Finding[]} */
   const findings = [];
   const add = (level, rel, message) => findings.push({ level, rel, message });
-  const { files, problems } = scan(root, config, { areas });
+  const { files, problems } = scan(root, config, { areas, env });
   for (const { rel, problem } of problems) add("warning", rel, problem);
 
   const byRel = new Map(files.map((file) => [file.rel, file]));
@@ -74,8 +75,25 @@ export function lint(root, config, { areas = ["all"], now = Date.now() } = {}) {
       }
     }
     if (file.kind === "page" && file.errors.length === 0) {
-      if (!PAGES.has(path.posix.basename(file.rel))) {
+      const base = path.posix.basename(file.rel);
+      if (!PAGES.has(base)) {
         add("warning", file.rel, "not a concept: no frontmatter type (§3.2)");
+      } else if (base === NOW_FILE) {
+        const bytes = Buffer.byteLength(file.body.trim(), "utf8");
+        const limit = config.nowLimit ?? NOW_LIMIT;
+        if (bytes > limit) {
+          add("warning", file.rel, `now.md is ${bytes} bytes, over its ${limit}-byte limit`);
+        }
+        const stale = staleness(file.fm, now);
+        if (stale === true) {
+          add("warning", file.rel, `stale since ${file.fm.stale_after}: refresh now.md`);
+        } else if (stale === "malformed") {
+          add(
+            "warning",
+            file.rel,
+            `stale_after "${file.fm.stale_after}" is not an RFC 3339 date or date-time with an offset (§5)`,
+          );
+        }
       }
       continue;
     }

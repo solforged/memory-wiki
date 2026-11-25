@@ -1,18 +1,30 @@
-// Changes to the wiki: capture a draft, verify it, keep index.md and log.md
-// current, and record each change as one git commit.
+// Changes to the wiki: capture a draft, deprecate or verify it, update now.md,
+// keep index.md and log.md current, and record each change as one git commit
+// serialized by a per-area lockfile.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { ALIASES_KEY, concepts, describe, findConcept, forget, resolveAreas } from "./bundle.js";
-import { TYPE_DIRS } from "./config.js";
+import {
+  ALIASES_KEY,
+  LEGACY_ALIASES_KEY,
+  NOW_FILE,
+  concepts,
+  describe,
+  fileHash,
+  findConcept,
+  forget,
+  readNow,
+  resolveAreas,
+} from "./bundle.js";
+import { NOW_LIMIT, TYPE_DIRS, defaultOnly } from "./config.js";
 import { append, compose, edit, flowList, quoted, split, stamp } from "./frontmatter.js";
 import { gitIn } from "./git.js";
 import { normalizeKey } from "./lookup.js";
-import { isActor, timestamp } from "./okf.js";
+import { asList, isActor, localDate, timestamp } from "./okf.js";
 
 export const ROOT_INDEX = `---
 okf_version: "0.3"
-title: llm-wiki
+title: memory-wiki
 description: Personal knowledge base for agents and their human. Look names, projects and jargon up here before guessing.
 ---
 `;
@@ -20,10 +32,61 @@ description: Personal knowledge base for agents and their human. Look names, pro
 export const areaDir = (root, area) => (area === "default" ? root : path.join(root, area));
 
 const utc = (now) => now.toISOString().replace(/\.\d{3}Z$/, "Z");
-const localDate = (now) =>
-  [now.getFullYear(), now.getMonth() + 1, now.getDate()]
-    .map((part) => String(part).padStart(2, "0"))
-    .join("-");
+const WAIT_VIEW = new Int32Array(new SharedArrayBuffer(4));
+const sleepSync = (ms) => Atomics.wait(WAIT_VIEW, 0, 0, ms);
+
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+/**
+ * Serializes writes inside one area directory so concurrent subagents or panes
+ * never collide on `.git/index.lock` or roll back each other's log/index edits.
+ */
+function withWriteLock(dir, fn, timeoutMs = 5000) {
+  const lockDir = path.join(dir, ".wiki-write.lock");
+  const pidFile = path.join(lockDir, "pid");
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(pidFile, String(process.pid));
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      let stale = false;
+      try {
+        const owner = Number(fs.readFileSync(pidFile, "utf8").trim());
+        stale = owner > 0 && !isAlive(owner);
+      } catch {
+        try {
+          stale = Date.now() - fs.statSync(lockDir).mtimeMs > 15_000;
+        } catch {
+          continue;
+        }
+      }
+      if (stale) {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`timed out waiting for write lock in ${dir}`);
+      }
+      sleepSync(25);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  }
+}
 
 function read(abs) {
   try {
@@ -108,7 +171,7 @@ const oneLine = (text) => text.replace(/\s+/g, " ").trim();
  * space only: a private area has its own index inside it.
  * @returns {Map<string, string>}
  */
-export function renderIndexes(root, config, area) {
+export function renderIndexes(root, config, area, env = process.env) {
   const base = area === "default" ? "" : area;
   const parentOf = (dir) => (dir.includes("/") ? path.posix.dirname(dir) : "");
   const dirs = new Map();
@@ -117,7 +180,7 @@ export function renderIndexes(root, config, area) {
     return dirs.get(dir);
   };
   node(base);
-  for (const file of concepts(root, config, { areas: [area] })) {
+  for (const file of concepts(root, config, { areas: [area], env })) {
     let dir = parentOf(file.rel);
     node(dir).files.push(file);
     while (dir !== base) {
@@ -164,11 +227,11 @@ export function renderIndexes(root, config, area) {
   return indexes;
 }
 
-function finish(root, config, area, changes, now, entry, message) {
+function finish(root, config, area, changes, now, entry, message, env = process.env) {
   const dir = areaDir(root, area);
   const log = path.join(dir, "log.md");
   changes.write(log, logText(read(log), localDate(now), entry));
-  for (const [abs, text] of renderIndexes(root, config, area)) changes.write(abs, text);
+  for (const [abs, text] of renderIndexes(root, config, area, env)) changes.write(abs, text);
   return commit(dir, changes, message);
 }
 
@@ -202,10 +265,44 @@ function sourcesOf(value) {
   });
 }
 
+function mergeStrings(existing, incoming, keyFn = (item) => item.toLowerCase()) {
+  const seen = new Set();
+  const out = [];
+  for (const item of [...existing, ...incoming]) {
+    const key = keyFn(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function mergeSources(existing, incoming) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of [...existing, ...incoming]) {
+    const source = typeof raw === "string" ? { resource: raw } : raw;
+    if (!source || typeof source.resource !== "string" || !source.resource.trim()) continue;
+    const key = source.resource.trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(source);
+  }
+  return out;
+}
+
 function line(value, what, required) {
   if (value === undefined && !required) return undefined;
   if (typeof value !== "string" || !value.trim()) throw new Error(`${what} is required`);
   return oneLine(value);
+}
+
+function checkRevision(existingRaw, ifMatch, what) {
+  if (!ifMatch) return;
+  const current = fileHash(existingRaw ?? "");
+  if (current !== ifMatch) {
+    throw new Error(`${what} changed since preview; preview again before writing`);
+  }
 }
 
 /**
@@ -216,9 +313,10 @@ function line(value, what, required) {
  * @property {string} [title]
  * @property {string} [description] one sentence: what a lookup returns
  * @property {string} [body]       Markdown; replaces the body on update
- * @property {string[]} [aliases]
- * @property {string[]} [tags]
- * @property {(string | { resource: string, id?: string, title?: string })[]} [sources]
+ * @property {string[]} [aliases]  appended on update unless `replaceLists` is true
+ * @property {string[]} [tags]     appended on update unless `replaceLists` is true
+ * @property {(string | { resource: string, id?: string, title?: string })[]} [sources] appended on update unless `replaceLists` is true
+ * @property {boolean} [replaceLists] replace aliases/tags/sources on update instead of merging
  * @property {string} [resource]
  * @property {string} [staleAfter] RFC 3339 date or date-time
  * @property {string} [slug]       file name, when the title has no ASCII letters
@@ -230,13 +328,20 @@ function line(value, what, required) {
  * draft stays out of recall until a person verifies it, and a revised concept
  * returns to draft: its earlier verification is no longer current (§5.3).
  * @param {CaptureInput} input
- * @param {{ now?: Date, areas?: string[] }} [options] `areas` bounds where this may write
+ * @param {{ now?: Date, areas?: string[], preview?: boolean, ifMatch?: string, env?: NodeJS.ProcessEnv }} [options]
  */
-export function capture(root, config, input, { now = new Date(), areas = ["all"] } = {}) {
+export function capture(
+  root,
+  config,
+  input,
+  { now = new Date(), areas, preview = false, ifMatch, env = process.env } = {},
+) {
   if (!isActor(input.by)) {
     throw new Error('by must be an actor: "<producer>/<version>" or "<scheme>:<id>" (§7)');
   }
-  const open = resolveAreas(root, config, areas);
+  const effectiveAreas =
+    areas ?? (input.id ? (defaultOnly(env) ? ["default"] : ["all"]) : [input.area ?? "default"]);
+  const open = resolveAreas(root, config, effectiveAreas, env);
   const aliases = texts(input.aliases, "aliases");
   const tags = texts(input.tags, "tags");
   const sources = sourcesOf(input.sources);
@@ -244,37 +349,67 @@ export function capture(root, config, input, { now = new Date(), areas = ["all"]
     throw new Error("staleAfter must be an RFC 3339 date or date-time with an offset");
   }
   const at = utc(now);
-  const changes = new Changes();
-  let area;
-  let rel;
-  let entry;
 
-  if (input.id) {
-    const file = findConcept(concepts(root, config, { areas: open }), root, input.id);
-    if (!file) throw new Error(`no concept "${input.id}" to update`);
-    area = file.area;
-    rel = file.rel;
-    const title = line(input.title, "title", false);
-    const description = line(input.description, "description", false);
-    clash(root, config, area, [title, ...(aliases ?? [])], file.rel);
-    const pairs = [];
-    if (title) pairs.push(["title", title]);
-    if (description) pairs.push(["description", description]);
-    if (input.resource) pairs.push(["resource", input.resource]);
-    if (tags) pairs.push(["tags", flowList(tags)]);
-    if (aliases) pairs.push([ALIASES_KEY, flowList(aliases)]);
-    pairs.push(["status", "draft"], ["generated", stamp(input.by, at)]);
-    if (input.staleAfter) pairs.push(["stale_after", quoted(input.staleAfter)]);
-    if (sources) pairs.push(["sources", sources]);
-    let text = edit(fs.readFileSync(file.abs, "utf8"), pairs);
-    if (input.body !== undefined) {
-      const body = input.body.trim();
-      text = `---\n${split(text).yaml}---\n${body ? `\n${body}\n` : ""}`;
+  const plan = () => {
+    if (input.id) {
+      const file = findConcept(concepts(root, config, { areas: open, env }), root, input.id);
+      if (!file) throw new Error(`no concept "${input.id}" to update`);
+      const existingRaw = fs.readFileSync(file.abs, "utf8");
+      checkRevision(existingRaw, ifMatch, file.id);
+      const area = file.area;
+      const rel = file.rel;
+      const title = line(input.title, "title", false);
+      const description = line(input.description, "description", false);
+      const finalAliases =
+        aliases === undefined
+          ? undefined
+          : input.replaceLists
+            ? aliases
+            : mergeStrings(file.aliases, aliases, normalizeKey);
+      const finalTags =
+        tags === undefined
+          ? undefined
+          : input.replaceLists
+            ? tags
+            : mergeStrings(file.tags, tags);
+      const finalSources =
+        sources === undefined
+          ? undefined
+          : input.replaceLists
+            ? sources
+            : mergeSources(asList(file.fm.sources), sources);
+      clash(root, config, area, [title, ...(finalAliases ?? [])], file.rel, env);
+      const pairs = [];
+      if (title) pairs.push(["title", title]);
+      if (description) pairs.push(["description", description]);
+      if (input.resource) pairs.push(["resource", input.resource]);
+      if (finalTags) pairs.push(["tags", flowList(finalTags)]);
+      if (finalAliases) {
+        pairs.push([ALIASES_KEY, flowList(finalAliases)]);
+        if (Object.hasOwn(file.fm, LEGACY_ALIASES_KEY)) pairs.push([LEGACY_ALIASES_KEY, undefined]);
+      }
+      pairs.push(["status", "draft"], ["generated", stamp(input.by, at)]);
+      if (input.staleAfter) pairs.push(["stale_after", quoted(input.staleAfter)]);
+      if (finalSources) pairs.push(["sources", finalSources]);
+      let text = edit(existingRaw, pairs);
+      if (input.body !== undefined) {
+        const body = input.body.trim();
+        text = `---\n${split(text).yaml}---\n${body ? `\n${body}\n` : ""}`;
+      }
+      return {
+        area,
+        rel,
+        abs: file.abs,
+        id: rel.slice(0, -3),
+        created: false,
+        wasStable: file.status.current,
+        before: existingRaw,
+        after: text,
+        revision: fileHash(existingRaw),
+        entry: `**Update**: Revised [${linkText(title ?? file.title)}](${link(area, rel)}), now a draft.`,
+      };
     }
-    changes.write(file.abs, text);
-    entry = `**Update**: Revised [${linkText(title ?? file.title)}](${link(area, rel)}), now a draft.`;
-  } else {
-    area = input.area ?? "default";
+    const area = input.area ?? "default";
     if (!open.includes(area)) {
       const known = area === "default" || Object.hasOwn(config.areas, area);
       throw new Error(
@@ -291,11 +426,13 @@ export function capture(root, config, input, { now = new Date(), areas = ["all"]
     if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
       throw new Error("the title gives no usable file name; pass slug (a-z, 0-9, -)");
     }
-    rel = path.posix.join(area === "default" ? "" : area, TYPE_DIRS[type], `${slug}.md`);
-    if (fs.existsSync(path.join(root, rel))) {
+    const rel = path.posix.join(area === "default" ? "" : area, TYPE_DIRS[type], `${slug}.md`);
+    const abs = path.join(root, rel);
+    if (fs.existsSync(abs)) {
       throw new Error(`${rel.slice(0, -3)} exists; pass its id to update it`);
     }
-    clash(root, config, area, [title, ...(aliases ?? [])], null);
+    checkRevision("", ifMatch, rel.slice(0, -3));
+    clash(root, config, area, [title, ...(aliases ?? [])], null, env);
     const pairs = [
       ["type", type],
       ["title", title],
@@ -307,14 +444,63 @@ export function capture(root, config, input, { now = new Date(), areas = ["all"]
     pairs.push(["status", "draft"], ["generated", stamp(input.by, at)]);
     if (input.staleAfter) pairs.push(["stale_after", quoted(input.staleAfter)]);
     if (sources?.length) pairs.push(["sources", sources]);
-    changes.write(path.join(root, rel), compose(pairs, input.body));
-    entry = `**Creation**: Added [${linkText(title)}](${link(area, rel)}) as a draft ${type}.`;
+    const text = compose(pairs, input.body);
+    return {
+      area,
+      rel,
+      abs,
+      id: rel.slice(0, -3),
+      created: true,
+      wasStable: false,
+      before: "",
+      after: text,
+      revision: fileHash(""),
+      entry: `**Creation**: Added [${linkText(title)}](${link(area, rel)}) as a draft ${type}.`,
+    };
+  };
+
+  if (preview) {
+    const p = plan();
+    return {
+      id: p.id,
+      path: p.abs,
+      area: p.area,
+      created: p.created,
+      wasStable: p.wasStable,
+      before: p.before,
+      after: p.after,
+      revision: p.revision,
+    };
   }
 
-  const id = rel.slice(0, -3);
-  const committed = finish(root, config, area, changes, now, entry, `wiki: capture ${id}`);
-  const file = findConcept(concepts(root, config, { areas: [area] }), root, id);
-  return { ...describe(file, now.getTime()), created: !input.id, committed };
+  const targetArea = input.id
+    ? (findConcept(concepts(root, config, { areas: open, env }), root, input.id)?.area ?? "default")
+    : (input.area ?? "default");
+  if (!open.includes(targetArea)) {
+    const known = targetArea === "default" || Object.hasOwn(config.areas, targetArea);
+    throw new Error(
+      known
+        ? `area "${targetArea}" is locked or not open to this caller`
+        : `unknown area "${targetArea}"`,
+    );
+  }
+  return withWriteLock(areaDir(root, targetArea), () => {
+    const p = plan();
+    const changes = new Changes();
+    changes.write(p.abs, p.after);
+    const committed = finish(
+      root,
+      config,
+      p.area,
+      changes,
+      now,
+      p.entry,
+      `wiki: capture ${p.id}`,
+      env,
+    );
+    const file = findConcept(concepts(root, config, { areas: [p.area], env }), root, p.id);
+    return { ...describe(file, now.getTime()), created: p.created, committed };
+  });
 }
 
 /** A link from an area's log.md to one of its files. */
@@ -323,9 +509,9 @@ function link(area, rel) {
 }
 
 /** Two concepts of one area answering to the same name make lookups ambiguous. */
-function clash(root, config, area, names, selfRel) {
+function clash(root, config, area, names, selfRel, env = process.env) {
   const wanted = new Set(names.filter(Boolean).map(normalizeKey));
-  for (const file of concepts(root, config, { areas: [area] })) {
+  for (const file of concepts(root, config, { areas: [area], env })) {
     if (file.rel === selfRel) continue;
     const shared = [file.title, ...file.aliases].find((name) => wanted.has(normalizeKey(name)));
     if (shared)
@@ -334,40 +520,204 @@ function clash(root, config, area, names, selfRel) {
 }
 
 /**
+ * Retires a concept: sets `status: deprecated` and optional `superseded_by`,
+ * keeps the file for history, updates log/index, and commits.
+ * @param {{ by: string, supersededBy?: string, now?: Date, areas?: string[], preview?: boolean, ifMatch?: string, env?: NodeJS.ProcessEnv }} options
+ */
+export function deprecate(
+  root,
+  config,
+  ref,
+  { by, supersededBy, now = new Date(), areas, preview = false, ifMatch, env = process.env },
+) {
+  if (!isActor(by)) {
+    throw new Error('by must be an actor: "<producer>/<version>" or "<scheme>:<id>" (§7)');
+  }
+  const open = resolveAreas(root, config, areas ?? (defaultOnly(env) ? ["default"] : ["all"]), env);
+  const plan = () => {
+    const file = findConcept(concepts(root, config, { areas: open, env }), root, ref);
+    if (!file) throw new Error(`no concept "${ref}"`);
+    const existingRaw = fs.readFileSync(file.abs, "utf8");
+    checkRevision(existingRaw, ifMatch, file.id);
+    const pairs = [
+      ["status", "deprecated"],
+      ["generated", stamp(by, utc(now))],
+    ];
+    if (supersededBy?.trim()) pairs.push(["superseded_by", supersededBy.trim()]);
+    const after = edit(existingRaw, pairs);
+    const note = supersededBy?.trim() ? ` (superseded by ${supersededBy.trim()})` : "";
+    return {
+      file,
+      before: existingRaw,
+      after,
+      revision: fileHash(existingRaw),
+      entry: `**Deprecation**: Retired [${linkText(file.title)}](${link(file.area, file.rel)})${note}.`,
+    };
+  };
+
+  if (preview) {
+    const p = plan();
+    return {
+      id: p.file.id,
+      path: p.file.abs,
+      area: p.file.area,
+      before: p.before,
+      after: p.after,
+      revision: p.revision,
+    };
+  }
+
+  const probe = findConcept(concepts(root, config, { areas: open, env }), root, ref);
+  if (!probe) throw new Error(`no concept "${ref}"`);
+  return withWriteLock(areaDir(root, probe.area), () => {
+    const p = plan();
+    const changes = new Changes();
+    changes.write(p.file.abs, p.after);
+    const committed = finish(
+      root,
+      config,
+      p.file.area,
+      changes,
+      now,
+      p.entry,
+      `wiki: deprecate ${p.file.id}`,
+      env,
+    );
+    const updated = findConcept(
+      concepts(root, config, { areas: [p.file.area], env }),
+      root,
+      p.file.id,
+    );
+    return { ...describe(updated, now.getTime()), committed };
+  });
+}
+
+/**
+ * Replaces an area's `now.md` (capped at `config.nowLimit` UTF-8 bytes) and
+ * sets its next refresh date (`stale_after`, defaulting to 14 days out).
+ * @param {{ text: string, staleAfter?: string, area?: string, now?: Date, areas?: string[], preview?: boolean, ifMatch?: string, env?: NodeJS.ProcessEnv }} options
+ */
+export function writeNow(
+  root,
+  config,
+  {
+    text,
+    staleAfter,
+    area = "default",
+    now = new Date(),
+    areas,
+    preview = false,
+    ifMatch,
+    env = process.env,
+  },
+) {
+  const open = resolveAreas(root, config, areas ?? [area], env);
+  if (!open.includes(area)) {
+    const known = area === "default" || Object.hasOwn(config.areas, area);
+    throw new Error(
+      known ? `area "${area}" is locked or not open to this caller` : `unknown area "${area}"`,
+    );
+  }
+  const body = String(text ?? "").trim();
+  if (!body) throw new Error("now.md text is required");
+  const limit = config.nowLimit ?? NOW_LIMIT;
+  const bytes = Buffer.byteLength(body, "utf8");
+  if (bytes > limit) {
+    throw new Error(`now.md is ${bytes} bytes, over its ${limit}-byte limit`);
+  }
+  const refresh =
+    staleAfter?.trim() || localDate(new Date(now.getTime() + 14 * 24 * 60 * 60_000));
+  if (Number.isNaN(timestamp(refresh))) {
+    throw new Error("staleAfter must be an RFC 3339 date or date-time with an offset");
+  }
+  const ref = area === "default" ? NOW_FILE : `${area}/${NOW_FILE}`;
+  const abs = path.join(root, ref);
+  const after = `---\nstale_after: "${refresh}"\n---\n\n${body}\n`;
+
+  const plan = () => {
+    const existingRaw = read(abs) ?? "";
+    checkRevision(existingRaw, ifMatch, ref);
+    return { ref, abs, before: existingRaw, after, revision: fileHash(existingRaw) };
+  };
+
+  if (preview) {
+    const p = plan();
+    return { ref: p.ref, path: p.abs, area, before: p.before, after: p.after, revision: p.revision };
+  }
+
+  return withWriteLock(areaDir(root, area), () => {
+    const p = plan();
+    const changes = new Changes();
+    changes.write(p.abs, p.after);
+    const committed = finish(
+      root,
+      config,
+      area,
+      changes,
+      now,
+      `**Context**: Updated [${NOW_FILE}](${NOW_FILE}).`,
+      `wiki: update ${ref}`,
+      env,
+    );
+    const page = readNow(root, config, { areas: [area], now: now.getTime(), env })[0];
+    return { ...page, committed };
+  });
+}
+
+/**
  * Records that a person confirmed a concept: a `verified` event by a `human:`
  * actor (§5.2) and `status: stable`.
- * @param {{ now?: Date, by?: string, areas?: string[] }} [options]
+ * @param {{ now?: Date, by?: string, areas?: string[], env?: NodeJS.ProcessEnv }} [options]
  */
 export function verify(
   root,
   config,
   ref,
-  { now = new Date(), by = config.human, areas = ["all"] } = {},
+  { now = new Date(), by = config.human, areas = ["all"], env = process.env } = {},
 ) {
   if (!by.startsWith("human:")) throw new Error("only a human: actor verifies (§5.3)");
-  const open = resolveAreas(root, config, areas);
-  const file = findConcept(concepts(root, config, { areas: open }), root, ref);
-  if (!file) throw new Error(`no concept "${ref}"`);
-  if (file.status.status === "deprecated") throw new Error(`${file.id} is deprecated`);
-  let text = fs.readFileSync(file.abs, "utf8");
-  if (file.status.status !== "stable") text = edit(text, [["status", "stable"]]);
-  text = append(text, "verified", stamp(by, utc(now)));
-  const changes = new Changes();
-  changes.write(file.abs, text);
-  const entry = `**Verification**: [${linkText(file.title)}](${link(file.area, file.rel)}) confirmed by ${by}.`;
-  const committed = finish(root, config, file.area, changes, now, entry, `wiki: verify ${file.id}`);
-  const updated = findConcept(concepts(root, config, { areas: [file.area] }), root, file.id);
-  return { ...describe(updated, now.getTime()), committed };
+  const open = resolveAreas(root, config, areas, env);
+  const probe = findConcept(concepts(root, config, { areas: open, env }), root, ref);
+  if (!probe) throw new Error(`no concept "${ref}"`);
+  return withWriteLock(areaDir(root, probe.area), () => {
+    const file = findConcept(concepts(root, config, { areas: [probe.area], env }), root, ref);
+    if (!file) throw new Error(`no concept "${ref}"`);
+    if (file.status.status === "deprecated") throw new Error(`${file.id} is deprecated`);
+    let text = fs.readFileSync(file.abs, "utf8");
+    if (file.status.status !== "stable") text = edit(text, [["status", "stable"]]);
+    text = append(text, "verified", stamp(by, utc(now)));
+    const changes = new Changes();
+    changes.write(file.abs, text);
+    const entry = `**Verification**: [${linkText(file.title)}](${link(file.area, file.rel)}) confirmed by ${by}.`;
+    const committed = finish(
+      root,
+      config,
+      file.area,
+      changes,
+      now,
+      entry,
+      `wiki: verify ${file.id}`,
+      env,
+    );
+    const updated = findConcept(
+      concepts(root, config, { areas: [file.area], env }),
+      root,
+      file.id,
+    );
+    return { ...describe(updated, now.getTime()), committed };
+  });
 }
 
 /** Regenerates index.md files after edits made by hand. Returns the files rewritten. */
-export function reindex(root, config, { areas = ["all"] } = {}) {
+export function reindex(root, config, { areas = ["default"], env = process.env } = {}) {
   const written = [];
-  for (const area of resolveAreas(root, config, areas)) {
-    const changes = new Changes();
-    for (const [abs, text] of renderIndexes(root, config, area)) changes.write(abs, text);
-    commit(areaDir(root, area), changes, "wiki: index");
-    written.push(...changes.paths);
+  for (const area of resolveAreas(root, config, areas, env)) {
+    withWriteLock(areaDir(root, area), () => {
+      const changes = new Changes();
+      for (const [abs, text] of renderIndexes(root, config, area, env)) changes.write(abs, text);
+      commit(areaDir(root, area), changes, "wiki: index");
+      written.push(...changes.paths);
+    });
   }
   return written;
 }

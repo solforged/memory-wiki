@@ -5,8 +5,10 @@ import path from "node:path";
 import { parse } from "yaml";
 
 /** Settings file in the bundle root. Dot-files are outside the OKF bundle (§3.2). */
-export const CONFIG_FILE = ".llm-wiki.yml";
+export const CONFIG_FILE = ".memory-wiki.yml";
+export const LEGACY_CONFIG_FILE = ".llm-wiki.yml";
 export const VAULT_DIR = ".vaults";
+export const NOW_LIMIT = 2000;
 
 /** The concept types this producer writes, and the directory each lives in. */
 export const TYPE_DIRS = {
@@ -19,48 +21,64 @@ export const TYPE_DIRS = {
 const AREA_NAME = /^[a-z][a-z0-9-]*$/;
 const RESERVED_AREAS = new Set(["default", "all", ...Object.values(TYPE_DIRS)]);
 
-/** `$LLM_WIKI_HOME`, else `llm-wiki` under the XDG data directory. */
+/** `$MEMORY_WIKI_HOME`, else `memory-wiki` under the XDG data directory. */
 export function wikiRoot(env = process.env) {
-  if (env.LLM_WIKI_HOME) return path.resolve(env.LLM_WIKI_HOME);
-  return path.join(env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "llm-wiki");
+  if (env.MEMORY_WIKI_HOME?.trim()) return path.resolve(env.MEMORY_WIKI_HOME.trim());
+  return path.join(env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "memory-wiki");
 }
 
-/** Model providers that run on this machine, by their omp names. */
+/** True when the environment forbids private areas regardless of CLI flags. */
+export function defaultOnly(env = process.env) {
+  const flag = env.MEMORY_WIKI_DEFAULT_ONLY?.trim().toLowerCase();
+  return flag === "1" || flag === "true";
+}
+
+/** Model providers that run on this machine, by their harness names. */
 const LOCAL_PROVIDERS = ["llama.cpp", "lm-studio", "ollama", "local"];
 
 /**
  * @typedef {{ image: string, size: string, passphrase: string[] }} Area
- * @typedef {{ human: string, areas: Record<string, Area>, localProviders: string[] }} Config
+ * @typedef {{ human: string, areas: Record<string, Area>, localProviders: string[], nowLimit: number }} Config
  */
 
 /**
- * Reads `.llm-wiki.yml`. A root without one has no private areas.
+ * Reads `.memory-wiki.yml` (falling back to `.llm-wiki.yml` for older checkouts).
+ * A root without either has no private areas.
  * @returns {Config}
  */
 export function loadConfig(root) {
   let raw;
-  try {
-    raw = parse(fs.readFileSync(path.join(root, CONFIG_FILE), "utf8"));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw new Error(`${CONFIG_FILE}: ${error.message}`);
+  let source = CONFIG_FILE;
+  for (const candidate of [CONFIG_FILE, LEGACY_CONFIG_FILE]) {
+    try {
+      raw = parse(fs.readFileSync(path.join(root, candidate), "utf8"));
+      source = candidate;
+      break;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw new Error(`${candidate}: ${error.message}`);
+    }
   }
   raw ??= {};
   if (typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error(`${CONFIG_FILE}: expected a mapping`);
+    throw new Error(`${source}: expected a mapping`);
   }
   const human = raw.human ?? `human:${os.userInfo().username}`;
   if (typeof human !== "string" || !/^human:\S+$/.test(human)) {
-    throw new Error(`${CONFIG_FILE}: human must be "human:<id>"`);
+    throw new Error(`${source}: human must be "human:<id>"`);
   }
   const localProviders = raw.local_providers ?? LOCAL_PROVIDERS;
   if (!Array.isArray(localProviders) || localProviders.some((name) => typeof name !== "string")) {
-    throw new Error(`${CONFIG_FILE}: local_providers must be a list of provider names`);
+    throw new Error(`${source}: local_providers must be a list of provider names`);
+  }
+  const nowLimit = raw.now_limit ?? NOW_LIMIT;
+  if (!Number.isInteger(nowLimit) || nowLimit < 100) {
+    throw new Error(`${source}: now_limit must be an integer >= 100`);
   }
   /** @type {Record<string, Area>} */
   const areas = {};
   for (const [name, value] of Object.entries(raw.areas ?? {})) {
     if (!AREA_NAME.test(name) || RESERVED_AREAS.has(name)) {
-      throw new Error(`${CONFIG_FILE}: "${name}" cannot name an area`);
+      throw new Error(`${source}: "${name}" cannot name an area`);
     }
     const passphrase = value?.passphrase;
     if (
@@ -69,7 +87,7 @@ export function loadConfig(root) {
       passphrase.some((arg) => typeof arg !== "string")
     ) {
       throw new Error(
-        `${CONFIG_FILE}: areas.${name}.passphrase must be a command, as a list of strings`,
+        `${source}: areas.${name}.passphrase must be a command, as a list of strings`,
       );
     }
     areas[name] = {
@@ -78,5 +96,5 @@ export function loadConfig(root) {
       passphrase,
     };
   }
-  return { human, areas, localProviders };
+  return { human, areas, localProviders, nowLimit };
 }

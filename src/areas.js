@@ -5,7 +5,9 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { forget, isMounted } from "./bundle.js";
+import { defaultOnly } from "./config.js";
 import { gitIn } from "./git.js";
+import { localDate } from "./okf.js";
 
 const IGNORED = "/.fseventsd/\n/.Spotlight-V100/\n/.TemporaryItems/\n/.Trashes/\n.DS_Store\n";
 
@@ -91,7 +93,10 @@ export function areaStatus(root, config) {
 }
 
 /** Mounts the area. False when it already was. */
-export async function unlockArea(root, config, name) {
+export async function unlockArea(root, config, name, { env = process.env } = {}) {
+  if (defaultOnly(env)) {
+    throw new Error("private areas are disabled in this environment (MEMORY_WIKI_DEFAULT_ONLY)");
+  }
   const area = need(config, name);
   if (isMounted(root, name)) return false;
   if (!fs.existsSync(area.image)) {
@@ -122,7 +127,10 @@ export function lockArea(root, config, name, { force = false } = {}) {
  * guard.exempt: it holds terms that git-guard keeps out of every other
  * repository, and git-guard then refuses to push it.
  */
-export async function createArea(root, config, name, { now = new Date() } = {}) {
+export async function createArea(root, config, name, { now = new Date(), env = process.env } = {}) {
+  if (defaultOnly(env)) {
+    throw new Error("private areas are disabled in this environment (MEMORY_WIKI_DEFAULT_ONLY)");
+  }
   const area = need(config, name);
   if (fs.existsSync(area.image))
     throw new Error(`area "${name}" already has an image: ${area.image}`);
@@ -142,7 +150,7 @@ export async function createArea(root, config, name, { now = new Date() } = {}) 
       "AES-256",
       "-stdinpass",
       "-volname",
-      `llm-wiki-${name}`,
+      `memory-wiki-${name}`,
       area.image,
     ],
     secret,
@@ -150,7 +158,7 @@ export async function createArea(root, config, name, { now = new Date() } = {}) 
   await attach(root, name, area, secret);
   const dir = path.join(root, name);
   try {
-    const date = now.toISOString().slice(0, 10);
+    const date = localDate(now);
     fs.writeFileSync(path.join(dir, ".metadata_never_index"), ""); // keeps Spotlight out
     fs.writeFileSync(path.join(dir, ".gitignore"), IGNORED);
     fs.writeFileSync(

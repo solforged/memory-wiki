@@ -130,7 +130,10 @@ export function edit(text, pairs) {
   const spans = layout(parts.yaml);
   if (spans === null) {
     const doc = parseDocument(parts.yaml, YAML);
-    for (const [key, value] of pairs) doc.set(key, value);
+    for (const [key, value] of pairs) {
+      if (value === undefined) doc.delete(key);
+      else doc.set(key, value);
+    }
     return assemble(doc.toString({ lineWidth: 0 }), parts.body);
   }
   let yaml = parts.yaml;
@@ -138,8 +141,13 @@ export function edit(text, pairs) {
   let added = "";
   for (const [key, value] of pairs) {
     const span = spans.get(key);
-    if (span) replaced.push({ ...span, text: renderPair(key, value) });
-    else added += renderPair(key, value);
+    if (value === undefined) {
+      if (span) replaced.push({ ...span, text: "" });
+    } else if (span) {
+      replaced.push({ ...span, text: renderPair(key, value) });
+    } else {
+      added += renderPair(key, value);
+    }
   }
   for (const { start, end, text: lines } of replaced.sort((a, b) => b.start - a.start)) {
     yaml = yaml.slice(0, start) + lines + yaml.slice(end);

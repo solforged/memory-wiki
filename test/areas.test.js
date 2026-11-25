@@ -21,7 +21,7 @@ const ROOT_INDEX = '---\nokf_version: "0.3"\n---\n';
 
 // Creates, mounts and unmounts a real encrypted disk image: a few seconds.
 test(
-  "a private area is readable only while unlocked",
+  "a private area is readable only while unlocked and respects MEMORY_WIKI_DEFAULT_ONLY",
   { skip: process.platform !== "darwin" },
   async (t) => {
     const { root, config } = tempWiki(
@@ -30,7 +30,7 @@ test(
       { git: true, areas: passphrase("correct horse") },
     );
     const work = path.join(root, "work");
-    const names = (areas) => concepts(root, config, { areas }).map((file) => file.id);
+    const names = (areas, env) => concepts(root, config, { areas, env }).map((file) => file.id);
 
     await createArea(root, config, "work", { now: NOW });
     assert.deepEqual(
@@ -43,13 +43,18 @@ test(
     assert.throws(
       () =>
         capture(root, config, {
-          by: "omp/m",
+          by: "pi/m",
           type: "Concept",
           title: "Codename",
           description: "x",
           area: "work",
         }),
       /area "work" is locked/,
+    );
+
+    await assert.rejects(
+      unlockArea(root, config, "work", { env: { MEMORY_WIKI_DEFAULT_ONLY: "1" } }),
+      /MEMORY_WIKI_DEFAULT_ONLY/,
     );
 
     assert.equal(await unlockArea(root, config, "work"), true);
@@ -60,7 +65,7 @@ test(
       root,
       config,
       {
-        by: "omp/m",
+        by: "pi/m",
         type: "Concept",
         title: "Codename",
         description: "The launch name.",
@@ -86,8 +91,21 @@ test(
 
     assert.deepEqual(names(["default"]), [], "a read that does not name the area skips it");
     assert.deepEqual(names(["all"]), ["work/concepts/codename"]);
+    assert.throws(
+      () => names(["all"], { MEMORY_WIKI_DEFAULT_ONLY: "1" }),
+      /MEMORY_WIKI_DEFAULT_ONLY/,
+    );
     assert.deepEqual(
-      lint(root, config, { now: NOW.getTime() }).filter((finding) => finding.level !== "info"),
+      lint(root, config, { areas: ["default"], now: NOW.getTime() }).filter(
+        (finding) => finding.level !== "info",
+      ),
+      [],
+      "default lint does not scan unlocked private areas",
+    );
+    assert.deepEqual(
+      lint(root, config, { areas: ["all"], now: NOW.getTime() }).filter(
+        (finding) => finding.level !== "info",
+      ),
       [],
     );
 

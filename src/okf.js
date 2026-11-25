@@ -20,6 +20,13 @@ export function asList(value) {
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
 
+/** YYYY-MM-DD in the local timezone, used consistently for log.md and now.md. */
+export function localDate(now = new Date()) {
+  return [now.getFullYear(), now.getMonth() + 1, now.getDate()]
+    .map((part) => String(part).padStart(2, "0"))
+    .join("-");
+}
+
 /**
  * §5: an RFC 3339 date-time with an offset, or a full-date meaning the start
  * of that day in UTC. Milliseconds since the epoch, NaN for any other form.

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { inputText, isLocalModel, privateReference, runsVerify } from "../src/policy.js";
+import {
+  inputText,
+  isLocalModel,
+  isSafeReadOnlyWikiCommand,
+  privateReference,
+  runsVerify,
+} from "../src/policy.js";
 
 const PROVIDERS = ["llama.cpp", "lm-studio", "ollama", "local"];
 
@@ -38,24 +44,38 @@ test("a model is local only on a listed provider at a loopback address", () => {
   assert.equal(local(undefined), false);
 });
 
-test("which tool inputs reach into a private area", () => {
+test("which tool inputs reach into a private area, including traversals and multiple flags", () => {
   const home = "/Users/ada";
-  const root = `${home}/.local/share/llm-wiki`;
+  const root = `${home}/.local/share/memory-wiki`;
   const where = { root, areas: ["personal", "work"], mounted: [], cwd: `${home}/src/app`, home };
   const reason = (input, over = {}) => privateReference(inputText(input), { ...where, ...over });
 
   assert.equal(reason({ path: `${root}/work/concepts/codename.md` }), "a path into the work area");
   assert.equal(
-    reason({ command: "cat ~/.local/share/llm-wiki/personal/log.md" }),
+    reason({ command: "cat ~/.local/share/memory-wiki/personal/log.md" }),
     "a path into the personal area",
   );
   assert.equal(
-    reason({ command: 'rg secret "$HOME/.local/share/llm-wiki/work"' }),
+    reason({ command: 'rg secret "$HOME/.local/share/memory-wiki/work"' }),
     "a path into the work area",
   );
   assert.equal(
-    reason({ command: "ls ${XDG_DATA_HOME}/llm-wiki/work/" }),
+    reason({ command: "ls ${XDG_DATA_HOME}/memory-wiki/work/" }),
     "a path into the work area",
+  );
+  assert.equal(
+    reason({ command: "cat $MEMORY_WIKI_HOME/concepts/../work/codename.md" }),
+    "a path into the work area",
+    "dot-dot traversal into a private area",
+  );
+  assert.equal(
+    reason({ command: `cat ${root}/./personal/log.md` }),
+    "a path into the personal area",
+  );
+  assert.equal(
+    reason({ command: "cat .local/share/memory-wiki/work/log.md" }, { cwd: home }),
+    "a path into the work area",
+    "relative path from an ancestor cwd",
   );
   assert.equal(
     reason({ paths: [`${root}/concepts/a.md`, `${root}/work`] }),
@@ -84,6 +104,10 @@ test("which tool inputs reach into a private area", () => {
     reason({ path: `${root}/` }, { mounted: ["work"] }),
     "the whole wiki directory while work is unlocked",
   );
+  assert.equal(
+    reason({ command: `ls ${root}/wo*` }, { mounted: ["work"] }),
+    "a wildcard inside the wiki directory while work is unlocked",
+  );
   assert.equal(reason({ path: `${root}/index.md` }, { mounted: ["work"] }), null);
 
   assert.equal(reason({ command: "cat work/log.md" }), null, "a relative path elsewhere");
@@ -98,14 +122,40 @@ test("which tool inputs reach into a private area", () => {
   );
 
   assert.equal(reason({ command: "wiki lookup nightjar --area work" }), "wiki --area work");
+  assert.equal(
+    reason({ command: "wiki lookup nightjar --area default --area work" }),
+    "wiki --area work",
+    "second --area flag must still be caught",
+  );
   assert.equal(reason({ command: 'wiki search x --area="all"' }), "wiki --area all");
   assert.equal(reason({ command: "wiki lookup nightjar --area default" }), null);
   assert.equal(reason({ command: "wiki area unlock work" }), "unlocking a private area");
+  assert.equal(
+    reason({ command: "wiki --json area unlock work" }),
+    "unlocking a private area",
+    "flags before subcommand",
+  );
   assert.equal(reason({ command: "wiki area status" }), null);
 });
 
-test("an agent's bash command never verifies", () => {
+test("an agent's bash command never verifies or reviews", () => {
   assert.equal(runsVerify("wiki verify concepts/a"), true);
+  assert.equal(runsVerify("wiki --json verify concepts/a"), true);
+  assert.equal(runsVerify("~/.local/bin/wiki review"), true);
   assert.equal(runsVerify("cd x && wiki   verify concepts/a"), true);
   assert.equal(runsVerify("wiki lookup verify"), false);
+});
+
+test("isSafeReadOnlyWikiCommand accepts only single read-only default-space calls", () => {
+  assert.equal(isSafeReadOnlyWikiCommand("wiki lookup 'Sparse bundle'"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki search macos --type Concept --json"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki show concepts/sparse-bundle"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki now"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki recent --limit 5"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki now --set"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki capture --title x --description y"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki lookup x --area work"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki lookup x && echo hi"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki lookup $(whoami)"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki verify concepts/a"), false);
 });

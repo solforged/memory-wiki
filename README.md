@@ -1,12 +1,15 @@
-# llm-wiki
+# memory-wiki
 
-A personal wiki that agents use as on-demand memory. The wiki is an [Open Knowledge Format](https://github.com/open-knowledge-format/open-knowledge-format/blob/main/SPEC.md) v0.3 bundle: a directory of Markdown files with YAML frontmatter, in its own Git repository. This repository holds what reads and writes it:
+A personal wiki that agents use as long-term memory. The wiki is an [Open Knowledge Format](https://github.com/open-knowledge-format/open-knowledge-format/blob/main/SPEC.md) v0.3 bundle: a directory of Markdown files with YAML frontmatter, in its own Git repository. This repository holds what reads and writes it:
 
 | Part | Path | Does |
 | --- | --- | --- |
-| Library and `wiki` CLI | `src/`, `bin/wiki.js` | Look up, search, capture, verify, lint, and manage private areas |
-| omp extension and skill | `omp/extension.ts`, `skills/llm-wiki/` | `wiki` and `wiki_capture` tools, `/wiki`, recall of entries a prompt names |
+| Library, `wiki` CLI, and harness hooks | `src/`, `bin/wiki.js` | Look up, search, capture, deprecate, review/verify, `now.md`, lint, private areas, and `agy`/`claude` lifecycle hooks |
+| Agent Skill | `skills/memory-wiki/` | Shared skill for Antigravity, Pi, Claude Code, and omp |
+| omp extension | `omp/extension.ts` | `wiki` and `wiki_capture` tools, `/wiki`, prompt recall, and local-model guards |
 | Tern plugin | `tern/` | Picker with preview, lock and unlock commands, lookups for Carly |
+
+Pi integrates with `wiki` directly through `pi-mono`'s `memory` extension (`now.md` in the cached system prompt, prompt recall, `memory` tool with confirmed previews, `/memory`, and private-area guards).
 
 ## Install
 
@@ -16,13 +19,40 @@ Needs Node.js 22 or later. Private areas need macOS.
 aube install
 ln -s "$PWD/bin/wiki.js" ~/.local/bin/wiki
 mkdir -p ~/.agents/skills
-ln -s "$PWD/skills/llm-wiki" ~/.agents/skills/llm-wiki
-wiki init                      # creates ~/.local/share/llm-wiki
-omp plugin link "$PWD"         # extension and skill, in new omp sessions
+ln -s "$PWD/skills/memory-wiki" ~/.agents/skills/memory-wiki
+wiki init                      # creates ~/.local/share/memory-wiki
+omp plugin link "$PWD"         # omp extension, in new omp sessions
 tern plugin link "$PWD/tern"
 ```
 
-Pi, omp, and the Antigravity CLI discover `~/.agents/skills/llm-wiki` directly; Claude Code and the Antigravity App read it when `~/.agents/skills/` is bridged into their skill folders. The wiki is `$LLM_WIKI_HOME`, else `llm-wiki` under `$XDG_DATA_HOME` (`~/.local/share`).
+Pi, omp, and the Antigravity CLI discover `~/.agents/skills/memory-wiki` directly; Claude Code and the Antigravity App read it when `~/.agents/skills/` is bridged into their skill folders. The wiki is `$MEMORY_WIKI_HOME`, else `memory-wiki` under `$XDG_DATA_HOME` (`~/.local/share`).
+
+### Antigravity (`agy`) hooks
+
+Add a `memory-wiki` entry to `~/.gemini/config/hooks.json` so Antigravity loads `now.md` at `SessionStart`, runs deduplicated prompt recall on step 1 of each user turn (`PreInvocation`), auto-approves read-only `wiki` commands, and hard-blocks `wiki verify` and private-area access (`PreToolUse`):
+
+```json
+{
+  "memory-wiki": {
+    "SessionStart": [
+      { "type": "command", "command": "~/.local/bin/wiki hook agy", "timeout": 5 }
+    ],
+    "PreInvocation": [
+      { "type": "command", "command": "~/.local/bin/wiki hook agy", "timeout": 5 }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "~/.local/bin/wiki hook agy", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code supports the same guardrails and recall with `wiki hook claude` on `SessionStart`, `UserPromptSubmit`, and `PreToolUse`.
 
 ## What the wiki holds
 
@@ -35,23 +65,23 @@ A concept is one file. `wiki capture` writes four types, each to its own directo
 | `Project` | `projects/` | Something being built or run |
 | `Investigation` | `investigations/` | A question, what was tried and found, what is open |
 
-Files of any other `type` are read like these. `description` is the one sentence a lookup returns, and `x-llm-wiki-aliases` lists other names the concept answers to. `wiki --help` lists every command.
+An optional `now.md` at the bundle root (capped at 2,000 bytes) holds the small always-on working context (stack and active focus) injected at session start. Files of any other `type` are read like these. `description` is the one sentence a lookup returns, and `x-memory-wiki-aliases` (plus legacy `x-llm-wiki-aliases`) lists other names the concept answers to. `wiki --help` lists every command.
 
 ## Drafts and verification
 
-Whatever an agent writes is `status: draft`, with `generated` naming the model. A draft is found by `wiki lookup` and `wiki search`, marked as a draft, and is never recalled into a prompt. You promote it with `wiki verify <id>` in a terminal, or `/wiki verify <id>` in omp. That records a `verified` event under your `human:` actor and sets `status: stable`.
+Whatever an agent writes is `status: draft`, with `generated` naming the actor. A draft is found by `wiki lookup` and `wiki search`, marked as a draft, and is never recalled into a prompt. Promote drafts with `wiki verify <id>`, batch-review all pending drafts with `wiki review`, or use `/memory verify <id>` in Pi / `/wiki verify <id>` in omp. That records a `verified` event under your `human:` actor and sets `status: stable`.
 
-When an agent revises a verified concept it returns to draft. Its earlier verification stays in the file as history and no longer counts, as OKF §5.3 requires.
+When an agent revises a verified concept it returns to draft. Its earlier verification stays in the file as history and no longer counts, as OKF §5.3 requires. To retire a concept without deleting history, use `wiki deprecate <id> --superseded-by <path>`.
 
-Every change is one Git commit in the wiki's repository, plus a `log.md` entry and regenerated `index.md` files. If Git refuses the commit, for example through a hook, the change is undone.
+Every change is serialized with a lockfile and recorded as one Git commit in the wiki's repository, plus a `log.md` entry and regenerated `index.md` files. If Git refuses the commit, for example through a hook, the change is undone.
 
-These commits are not signed, whatever `commit.gpgSign` says: they are made unattended, and a signature would say you wrote them. They use the wiki repository's Git identity, or `llm-wiki <llm-wiki@localhost>` where it has none. Your Git hooks run on them as on any commit.
+These commits are not signed, whatever `commit.gpgSign` says: they are made unattended, and a signature would say you wrote them. They use the wiki repository's Git identity, or `memory-wiki <memory-wiki@localhost>` where it has none. Your Git hooks run on them as on any commit.
 
 ## Private areas
 
-`.llm-wiki.yml` in the wiki names the private areas, `personal` and `work` by default. Each is an AES-256 encrypted sparse bundle under `.vaults/`, mounted at `<wiki>/<name>` while unlocked. Locked, the mountpoint is an empty directory: no file names and no text are on disk outside the image.
+`.memory-wiki.yml` in the wiki names the private areas, `personal` and `work` by default. Each is an AES-256 encrypted sparse bundle under `.vaults/`, mounted at `<wiki>/<name>` while unlocked. Locked, the mountpoint is an empty directory: no file names and no text are on disk outside the image.
 
-Each area's `passphrase` setting is a command that prints its passphrase. By default that is `op read` on an item in the 1Password `Private` vault, so each unlock asks for your approval. Create the item, then the area:
+Each area's `passphrase` setting is a command that prints its passphrase. By default that is `op read` on an existing item in the 1Password `Private` vault (`llm-wiki personal` / `llm-wiki work`), so each unlock asks for your approval:
 
 ```sh
 op item create --category password --vault Private --title 'llm-wiki work' \
@@ -61,28 +91,23 @@ wiki area unlock work
 wiki area lock work            # or: wiki area lock --all
 ```
 
-- A read covers a private area only when it names it: `wiki lookup nightjar --area work`, or `--area all`.
+- Every command — including `lint` and `index` — covers a private area only when it names it (`--area work` or `--area all`).
+- Setting `MEMORY_WIKI_DEFAULT_ONLY=1` disables all private area reads, writes, and unlocks in the CLI itself.
 - Each area has its own Git repository, `index.md` and `log.md` inside the image. The default space records nothing about it, and `wiki lint` reports any link from the default space into an area as an error.
 - The area's repository sets `guard.exempt`, which a git-guard that supports it reads as "skip the term checks, refuse every push".
 
 ### Only local models read them
 
-In omp, private areas are open only to a model that runs on this machine: one whose provider is listed in `local_providers` (default `llama.cpp`, `lm-studio`, `ollama`, `local`) and that answers on a loopback address. For any other model the extension:
+Across harnesses, private areas are open only to a model that runs on this machine (a provider listed in `local_providers` answering on loopback, with every configured auxiliary role also local in `omp`):
 
-- refuses `wiki` and `wiki_capture` calls that name a private area;
-- blocks tool calls whose input reaches into one: a path into the area, the whole wiki directory while an area is unlocked, `wiki --area`, or `wiki area unlock`;
-- refuses `/wiki unlock` unless the session's model and the `default`, `smol`, `slow`, `task` and `plan` roles are all local;
-- once a session holds private text, stops prompts to a hosted model, and replaces the context of any request that still goes to one;
-- blocks subagents that would run on a hosted model from such a session.
-
-An area that omp unlocked is locked again when the session ends, or after 30 minutes without use.
+- **Antigravity (`agy`) & Claude Code**: `PreToolUse` hooks block paths into private areas (including `..` traversals and ancestor-cwd relative paths), the wiki root while an area is unlocked, `wiki --area`, `wiki area unlock`, and `wiki verify`/`review`.
+- **Pi & omp**: enforce the same `tool_call` guards, refuse private reads/writes on hosted models, track session taint, and withhold context if a tainted session switches to a hosted model.
 
 These are guardrails for cooperative agents, not a sandbox:
 
-- While an area is unlocked, every process running as you can read it. That includes other agents and Carly in Tern, which has file access without an approval step. Keep unlock windows short.
-- A command that builds a private path at run time is not recognized.
-- omp makes some requests on its own with other model roles, such as compaction and titles. The role check at `/wiki unlock` is what covers those. Use a dedicated omp profile whose roles are all local for private work.
-- What a local session reads from a private area is written to that session's transcript in plaintext. Put the profile's session directory inside the unlocked area (`omp --session-dir`), or run it with `--no-session`.
+- While an area is unlocked, every process running as you can read it. Keep unlock windows short.
+- A command that builds a private path dynamically at run time is not recognized.
+- Use a dedicated all-local profile (`omp --profile private --offline --no-session` or `--session-dir` inside the unlocked area) for private work so transcripts and auxiliary roles stay local.
 
 The Tern plugin shows private entries in its picker while their area is unlocked. Its Carly functions read the default space only.
 

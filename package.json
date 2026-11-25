@@ -1,7 +1,7 @@
 {
-  "name": "llm-wiki",
+  "name": "memory-wiki",
   "version": "0.1.0",
-  "description": "An OKF v0.3 wiki as on-demand memory for agents: wiki CLI, omp extension and skill, Tern plugin",
+  "description": "An OKF v0.3 wiki as on-demand memory for agents: wiki CLI, harness hooks, omp extension, skill, and Tern plugin",
   "private": true,
   "type": "module",
   "bin": {

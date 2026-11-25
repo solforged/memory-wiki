@@ -1,7 +1,7 @@
 schema = 1
-id = "llm-wiki"
-name = "Wiki"
+id = "memory-wiki"
+name = "Memory Wiki"
 version = "0.1.0"
-description = "Browse your personal wiki in Tern and look up its public entries with Carly."
+description = "Browse your personal memory-wiki in Tern and look up its public entries with Carly."
 icon = "note"
 window = "window.luau"

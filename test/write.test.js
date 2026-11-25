@@ -2,7 +2,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { capture, concepts, lint, recall, reindex, verify } from "../src/index.js";
+import {
+  capture,
+  concepts,
+  deprecate,
+  lint,
+  readNow,
+  recall,
+  reindex,
+  verify,
+  writeNow,
+} from "../src/index.js";
 import { append, edit, parse, stamp } from "../src/frontmatter.js";
 import { NOW, concept, read, run, tempWiki, write } from "./helpers.js";
 
@@ -26,13 +36,13 @@ Body text.
 test("an edit changes only the lines of the keys it sets (§4)", () => {
   const edited = edit(HAND_WRITTEN, [
     ["status", "draft"],
-    ["generated", stamp("omp/model-1", "2026-11-21T12:00:00Z")],
+    ["generated", stamp("pi/model-1", "2026-11-21T12:00:00Z")],
   ]);
   const expected = HAND_WRITTEN.replace("status: stable", "status: draft").replace(
     "---\n\nBody",
     "---\n\nBody".replace(
       "---",
-      'generated: { by: "omp/model-1", at: "2026-11-21T12:00:00Z" }\n---',
+      'generated: { by: "pi/model-1", at: "2026-11-21T12:00:00Z" }\n---',
     ),
   );
   assert.equal(edited, expected);
@@ -69,7 +79,7 @@ test("capture writes a draft, the indexes, the log, and one commit", (t) => {
     root,
     config,
     {
-      by: "omp/model-1",
+      by: "pi/model-1",
       type: "concept",
       title: "Sparse bundle",
       description: "A disk image kept\nas band files.",
@@ -103,9 +113,9 @@ type: Concept
 title: Sparse bundle
 description: A disk image kept as band files.
 tags: [macos]
-x-llm-wiki-aliases: [sparsebundle]
+x-memory-wiki-aliases: [sparsebundle]
 status: draft
-generated: { by: "omp/model-1", at: "2026-11-21T12:00:00Z" }
+generated: { by: "pi/model-1", at: "2026-11-21T12:00:00Z" }
 sources:
   - resource: https://example.com/hdiutil
 ---
@@ -126,11 +136,11 @@ Made with hdiutil.
   );
   assert.match(
     read(root, "log.md"),
-    /^# Update Log\n\n## 2026-11-21\n\n\* \*\*Creation\*\*: Added \[Sparse bundle\]\(concepts\/sparse-bundle.md\)/,
+    /^# Update Log\n\n## 2026-11-21\n\n\* \*\*Creation\*\*: Added \[Sparse bundle\]\(concepts\/sparse-bundle\.md\)/,
   );
   assert.equal(
     run("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).trim(),
-    "?? .llm-wiki.yml",
+    "?? .memory-wiki.yml",
   );
   assert.deepEqual(
     lint(root, config, { now: NOW.getTime() }).filter((finding) => finding.level !== "info"),
@@ -138,10 +148,117 @@ Made with hdiutil.
   );
 });
 
+test("updating a concept merges aliases, tags and sources by default, and honors preview/ifMatch", (t) => {
+  const { root, config } = tempWiki(t, {}, { git: true });
+  const created = capture(
+    root,
+    config,
+    {
+      by: "pi/model-1",
+      type: "Concept",
+      title: "Sparse bundle",
+      description: "A disk image.",
+      aliases: ["sparsebundle"],
+      tags: ["macos"],
+      sources: ["https://example.com/one"],
+    },
+    { now: NOW },
+  );
+
+  const preview = capture(
+    root,
+    config,
+    {
+      by: "pi/model-2",
+      id: created.id,
+      aliases: ["sb"],
+      tags: ["disk"],
+      sources: ["https://example.com/two"],
+    },
+    { now: NOW, preview: true },
+  );
+  assert.equal(preview.created, false);
+  assert.match(preview.after, /x-memory-wiki-aliases: \[sparsebundle, sb\]/);
+  assert.match(preview.after, /tags: \[macos, disk\]/);
+  assert.match(preview.after, /one[\s\S]*two/);
+
+  const updated = capture(
+    root,
+    config,
+    {
+      by: "pi/model-2",
+      id: created.id,
+      aliases: ["sb"],
+      tags: ["disk"],
+      sources: ["https://example.com/two"],
+    },
+    { now: NOW, ifMatch: preview.revision },
+  );
+  assert.deepEqual(updated.aliases, ["sparsebundle", "sb"]);
+  assert.deepEqual(updated.tags, ["macos", "disk"]);
+
+  assert.throws(
+    () =>
+      capture(
+        root,
+        config,
+        { by: "pi/model-2", id: created.id, description: "Conflict." },
+        { now: NOW, ifMatch: preview.revision },
+      ),
+    /changed since preview/,
+  );
+
+  const replaced = capture(
+    root,
+    config,
+    {
+      by: "pi/model-2",
+      id: created.id,
+      aliases: ["only-this"],
+      replaceLists: true,
+    },
+    { now: NOW },
+  );
+  assert.deepEqual(replaced.aliases, ["only-this"]);
+});
+
+test("deprecate retires a concept with superseded_by and writeNow manages now.md", (t) => {
+  const { root, config } = tempWiki(t, {}, { git: true });
+  const { id } = capture(
+    root,
+    config,
+    { by: "pi/m", type: "Concept", title: "Legacy", description: "Old name." },
+    { now: NOW },
+  );
+  const dep = deprecate(root, config, id, {
+    by: "pi/m",
+    supersededBy: "modern.md",
+    now: NOW,
+  });
+  assert.equal(dep.status, "deprecated");
+  assert.equal(dep.superseded_by, "modern.md");
+  assert.match(read(root, "log.md"), /\*\*Deprecation\*\*/);
+
+  const plan = writeNow(root, config, { text: "## Focus\n\n* Memory wiki.", now: NOW, preview: true });
+  assert.equal(plan.before, "");
+  assert.match(plan.after, /stale_after: "2026-12-05"/);
+  const saved = writeNow(root, config, {
+    text: "## Focus\n\n* Memory wiki.",
+    now: NOW,
+    ifMatch: plan.revision,
+  });
+  assert.equal(saved.committed, true);
+  assert.equal(readNow(root, config, { now: NOW.getTime() })[0].text, "## Focus\n\n* Memory wiki.");
+  assert.throws(
+    () => writeNow(root, config, { text: "x".repeat(2500), now: NOW }),
+    /over its 2000-byte limit/,
+  );
+});
+
 test("verify makes a draft recallable; revising it withdraws that", (t) => {
   const { root, config } = tempWiki(t);
   const input = {
-    by: "omp/model-1",
+    by: "pi/model-1",
     type: "Concept",
     title: "Sparse bundle",
     description: "A disk image.",
@@ -159,7 +276,7 @@ test("verify makes a draft recallable; revising it withdraws that", (t) => {
   const revised = capture(
     root,
     config,
-    { by: "omp/model-2", id, description: "A disk image kept as band files." },
+    { by: "pi/model-2", id, description: "A disk image kept as band files." },
     { now: new Date(NOW.getTime() + 120_000) },
   );
   assert.deepEqual([revised.status, revised.tier, revised.created], ["draft", "unverified", false]);
@@ -206,13 +323,13 @@ test("a change is recorded where git has no author identity", (t) => {
   capture(
     root,
     config,
-    { by: "omp/m", type: "Entity", title: "Kept", description: "Stays." },
+    { by: "pi/m", type: "Entity", title: "Kept", description: "Stays." },
     { now: NOW },
   );
 
   assert.equal(
     run("git", ["-C", root, "log", "--format=%an <%ae>"]),
-    "llm-wiki <llm-wiki@localhost>\n",
+    "memory-wiki <memory-wiki@localhost>\n",
   );
 });
 
@@ -224,7 +341,7 @@ test("a change is recorded without the signature git is set to make", (t) => {
   capture(
     root,
     config,
-    { by: "omp/m", type: "Entity", title: "Kept", description: "Stays." },
+    { by: "pi/m", type: "Entity", title: "Kept", description: "Stays." },
     { now: NOW },
   );
 
@@ -236,7 +353,7 @@ test("a commit that git refuses leaves no trace of the change", (t) => {
   capture(
     root,
     config,
-    { by: "omp/m", type: "Entity", title: "Kept", description: "Stays." },
+    { by: "pi/m", type: "Entity", title: "Kept", description: "Stays." },
     { now: NOW },
   );
   const before = { index: read(root, "index.md"), log: read(root, "log.md") };
@@ -248,7 +365,7 @@ test("a commit that git refuses leaves no trace of the change", (t) => {
       capture(
         root,
         config,
-        { by: "omp/m", type: "Entity", title: "Refused", description: "Goes." },
+        { by: "pi/m", type: "Entity", title: "Refused", description: "Goes." },
         { now: NOW },
       ),
     /git refused the change, so nothing was kept:\nlisted terms found/,

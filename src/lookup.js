@@ -1,6 +1,7 @@
 // Finding concepts by name (the glossary), by the names a text mentions
 // (recall), and by full text (search).
 import path from "node:path";
+import { staleness } from "./okf.js";
 
 /** Case, punctuation and spacing do not distinguish names. `+` and `#` do. */
 export function normalizeKey(text) {
@@ -10,6 +11,8 @@ export function normalizeKey(text) {
     .replace(/[^\p{L}\p{N}+#]+/gu, " ")
     .trim();
 }
+
+const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 function distance(a, b, max) {
   if (Math.abs(a.length - b.length) > max) return max + 1;
@@ -66,17 +69,31 @@ export function lookup(files, term, limit = 5) {
 
 function verbatim(text, name) {
   if (!/[\p{Lu}\p{N}]/u.test(name)) return false;
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(text);
+  const escaped = escapeRe(name.trim()).replace(/\s+/g, "\\s+");
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "u").test(text);
+}
+
+/** Whether `nowText` already defines `title` as a heading or bold bullet item. */
+function explainedInNow(nowText, title) {
+  if (!nowText || !title.trim()) return false;
+  return new RegExp(
+    `(?:^|\\n)(?:#{1,4}\\s+|\\*\\*|[-*]\\s+\\*\\*)${escapeRe(title.trim())}(?:\\*\\*|[:\\s—–-])`,
+    "i",
+  ).test(nowText);
 }
 
 /**
  * Current concepts whose title or alias appears in `text` as whole words, the
- * longest name winning where names overlap. A name shorter than three
- * characters ("CI") counts only when the text has it verbatim, capitals
- * included. Only `status: stable` concepts are recalled (§5.4).
+ * longest name winning where names overlap. Names shorter than three characters
+ * ("CI") and all-uppercase acronyms ("PRR", "MAP", "SET") match only when the
+ * text carries them verbatim, capitals included. Only `status: stable` concepts
+ * are recalled (§5.4).
+ *
+ * @param {number | { limit?: number, nowText?: string }} [options]
  */
-export function recall(files, text, limit = 8) {
+export function recall(files, text, options = 8) {
+  const limit = typeof options === "number" ? options : (options.limit ?? 8);
+  const nowText = typeof options === "number" ? "" : (options.nowText ?? "");
   const table = new Map();
   let longest = 1;
   for (const file of files) {
@@ -95,11 +112,14 @@ export function recall(files, text, limit = 8) {
     let taken = 1;
     for (let count = Math.min(longest, words.length - at); count >= 1; count--) {
       const key = words.slice(at, at + count).join(" ");
-      const named = (table.get(key) ?? []).filter(
-        (entry) => key.length >= 3 || verbatim(text, entry.name),
-      );
+      const named = (table.get(key) ?? []).filter((entry) => {
+        const needsCase = key.length < 3 || !/\p{Ll}/u.test(entry.name);
+        return !needsCase || verbatim(text, entry.name);
+      });
       if (named.length === 0) continue;
-      for (const entry of named) hits.set(entry.file.rel, entry.file);
+      for (const entry of named) {
+        if (!explainedInNow(nowText, entry.file.title)) hits.set(entry.file.rel, entry.file);
+      }
       taken = count;
       break;
     }
@@ -119,54 +139,88 @@ export function formatRecall(infos) {
   return `Wiki entries for names in this prompt:\n${lines.join("\n")}`;
 }
 
-function count(haystack, needle) {
+function tokens(text) {
+  const norm = normalizeKey(text);
+  return norm ? norm.split(" ") : [];
+}
+
+function tokenCount(words, target) {
   let total = 0;
-  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
-    total++;
-  }
+  for (const word of words) if (word === target) total++;
   return total;
 }
 
+function substringMatch(words, target) {
+  return target.length >= 3 && words.some((word) => word.includes(target));
+}
+
 /**
- * Full-text search. Every query word is looked for in the title, aliases,
- * description, tags and body; concepts matching more words rank first, then
- * those matching in weightier fields.
- * @param {{ type?: string, tag?: string, limit?: number }} [options]
+ * Full-text search. Whole-word matches rank highest; substring matches only
+ * apply to query words of at least 3 characters (so "pi" or "op" never match
+ * "pipe" or "copy"). Deprecated entries sort after active ones.
+ *
+ * @param {{ type?: string, tag?: string | string[], tags?: string[], status?: string, stale?: boolean, limit?: number, now?: number }} [options]
  * @returns {{ file: import("./bundle.js").WikiFile, score: number, snippet: string }[]}
  */
-export function search(files, query, { type, tag, limit = 10 } = {}) {
-  const words = [...new Set(normalizeKey(query).split(" ").filter(Boolean))];
+export function search(
+  files,
+  query,
+  { type, tag, tags, status, stale, limit = 10, now = Date.now() } = {},
+) {
+  const words = [...new Set(tokens(query))];
+  const wantedTags = [
+    ...(Array.isArray(tags) ? tags : []),
+    ...(Array.isArray(tag) ? tag : tag ? [tag] : []),
+  ].map((item) => item.toLowerCase());
   const results = [];
   for (const file of files) {
     if (type && file.type.toLowerCase() !== type.toLowerCase()) continue;
-    if (tag && !file.tags.some((item) => item.toLowerCase() === tag.toLowerCase())) continue;
-    const title = normalizeKey(file.title);
-    const aliases = file.aliases.map(normalizeKey).join("  ");
-    const description = normalizeKey(file.description);
-    const tags = file.tags.map(normalizeKey).join("  ");
-    const body = normalizeKey(file.body);
+    if (status && file.status.status.toLowerCase() !== status.toLowerCase()) continue;
+    if (stale && !staleness(file.fm, now)) continue;
+    if (wantedTags.length > 0) {
+      const fileTags = new Set(file.tags.map((item) => item.toLowerCase()));
+      if (wantedTags.some((wanted) => !fileTags.has(wanted))) continue;
+    }
+    const titleWords = tokens(file.title);
+    const aliasWords = file.aliases.flatMap(tokens);
+    const descWords = tokens(file.description);
+    const tagWords = file.tags.flatMap(tokens);
+    const bodyWords = tokens(file.body);
     let matched = 0;
     let score = 0;
     for (const word of words) {
-      const weight =
-        (title.includes(word) ? 8 : 0) +
-        (aliases.includes(word) ? 6 : 0) +
-        (description.includes(word) ? 4 : 0) +
-        (tags.includes(word) ? 3 : 0) +
-        Math.min(count(body, word), 5);
+      const titleScore = tokenCount(titleWords, word) > 0 ? 8 : substringMatch(titleWords, word) ? 3 : 0;
+      const aliasScore = tokenCount(aliasWords, word) > 0 ? 6 : substringMatch(aliasWords, word) ? 2 : 0;
+      const descScore = tokenCount(descWords, word) > 0 ? 4 : substringMatch(descWords, word) ? 1 : 0;
+      const tagScore = tokenCount(tagWords, word) > 0 ? 3 : substringMatch(tagWords, word) ? 1 : 0;
+      const bodyExact = Math.min(tokenCount(bodyWords, word), 5);
+      const bodyScore = bodyExact > 0 ? bodyExact : substringMatch(bodyWords, word) ? 1 : 0;
+      const weight = titleScore + aliasScore + descScore + tagScore + bodyScore;
       if (weight > 0) matched++;
       score += weight;
     }
     if (matched === 0 && words.length > 0) continue;
-    const line = file.body
-      .split("\n")
-      .find((text) => words.some((word) => normalizeKey(text).includes(word)));
-    const snippet = (line ?? file.description).trim().slice(0, 200);
+    const bodyLines = file.body.split("\n");
+    const exactLine = bodyLines.find((text) => {
+      const lineWords = tokens(text);
+      return words.some((word) => tokenCount(lineWords, word) > 0);
+    });
+    const fuzzyLine =
+      exactLine ??
+      bodyLines.find((text) => {
+        const lineWords = tokens(text);
+        return words.some((word) => substringMatch(lineWords, word));
+      });
+    const snippet = (fuzzyLine ?? file.description).trim().slice(0, 200);
     results.push({ file, matched, score, snippet });
   }
   results.sort(
     (a, b) =>
-      b.matched - a.matched || b.score - a.score || a.file.title.localeCompare(b.file.title),
+      b.matched - a.matched ||
+      (a.file.status.status === "deprecated" ? 1 : 0) -
+        (b.file.status.status === "deprecated" ? 1 : 0) ||
+      b.score - a.score ||
+      a.file.title.localeCompare(b.file.title),
   );
   return results.slice(0, limit).map(({ file, score, snippet }) => ({ file, score, snippet }));
 }

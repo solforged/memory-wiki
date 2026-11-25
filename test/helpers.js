@@ -4,12 +4,23 @@ import os from "node:os";
 import path from "node:path";
 import { CONFIG_FILE, loadConfig, lockArea } from "../src/index.js";
 
-// Commits made by the tests must not depend on, or run, the user's Git setup.
+// Commits and CLI invocations made by tests must not depend on the host Git or harness env.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_NOSYSTEM = "1";
 for (const role of ["AUTHOR", "COMMITTER"]) {
   process.env[`GIT_${role}_NAME`] = "Test";
   process.env[`GIT_${role}_EMAIL`] = "test@example.invalid";
+}
+for (const key of [
+  "MEMORY_WIKI_HOME",
+  "MEMORY_WIKI_ACTOR",
+  "MEMORY_WIKI_DEFAULT_ONLY",
+  "ANTIGRAVITY_AGENT",
+  "CLAUDECODE",
+  "PI_CODING_AGENT_DIR",
+  "OMP_PROFILE",
+]) {
+  delete process.env[key];
 }
 
 export const NOW = new Date("2026-11-21T12:00:00Z");
@@ -20,7 +31,7 @@ export const NOW = new Date("2026-11-21T12:00:00Z");
  * is removed: removing it first would delete what a mounted image holds.
  */
 export function tempWiki(t, files = {}, { git = false, areas } = {}) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "llm-wiki-test-")));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "memory-wiki-test-")));
   t.after(() => {
     const config = loadConfig(root);
     for (const name of Object.keys(config.areas)) lockArea(root, config, name, { force: true });

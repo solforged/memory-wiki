@@ -13,5 +13,5 @@ export function gitIn(dir) {
   const args = ["-C", dir, "-c", "commit.gpgsign=false"];
   const email = spawnSync("git", ["-C", dir, "config", "user.email"], { encoding: "utf8" });
   if (email.status === 0 && email.stdout.trim()) return args;
-  return [...args, "-c", "user.name=llm-wiki", "-c", "user.email=llm-wiki@localhost"];
+  return [...args, "-c", "user.name=memory-wiki", "-c", "user.email=memory-wiki@localhost"];
 }

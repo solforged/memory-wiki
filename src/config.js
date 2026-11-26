@@ -24,6 +24,8 @@ const AREA_NAME = /^[a-z][a-z0-9-]*$/;
 const HOST_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
 const AGE_RECIPIENT = /^age1[0-9a-z]+$/;
 const RESERVED_AREAS = new Set(["default", "all", ...Object.values(TYPE_DIRS)]);
+const TIME_HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const WINDOW_RANGE = /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/;
 
 /** `$MEMORY_WIKI_HOME`, else `memory-wiki` under the XDG data directory. */
 export function wikiRoot(env = process.env) {
@@ -47,10 +49,24 @@ export function defaultHost(env = process.env) {
 /** Model providers that run on this machine, by their harness names. */
 const LOCAL_PROVIDERS = ["llama.cpp", "lm-studio", "ollama", "local"];
 
+/** Defaults for unattended off-hours wiki dreaming. */
+export const DEFAULT_DREAM = {
+  model: "openai/gpt-6.1-terra",
+  thinking: "medium",
+  window: "02:00-06:00",
+  slots: ["03:15", "05:00"],
+  excludePaths: [],
+  repoRoots: ["~/src"],
+  maxWrites: 8,
+  maxInputChars: 48_000,
+  minTurns: 3,
+};
+
 /**
  * @typedef {{ remote: string | null, username: string | string[] | null, password: string[] | null, host: string | null }} SyncConfig
+ * @typedef {{ model: string, thinking: string | null, window: string, slots: string[], excludePaths: string[], repoRoots: string[], maxWrites: number, maxInputChars: number, minTurns: number }} DreamConfig
  * @typedef {{ image: string, size: string, passphrase: string[], ageRecipients: string[], ageIdentity: string[] | null, sync: SyncConfig }} Area
- * @typedef {{ human: string, areas: Record<string, Area>, localProviders: string[], nowLimit: number, sync: SyncConfig }} Config
+ * @typedef {{ human: string, areas: Record<string, Area>, localProviders: string[], nowLimit: number, sync: SyncConfig, dream: DreamConfig }} Config
  */
 
 function isMapping(value) {
@@ -87,6 +103,15 @@ function mergeRaw(base, local) {
       throw new Error(`${LOCAL_CONFIG_FILE}: sync must be a mapping`);
     }
     merged.sync = { ...base.sync, ...local.sync };
+  }
+  if (base.dream !== undefined || local.dream !== undefined) {
+    if (base.dream !== undefined && !isMapping(base.dream)) {
+      throw new Error(`${CONFIG_FILE}: dream must be a mapping`);
+    }
+    if (local.dream !== undefined && !isMapping(local.dream)) {
+      throw new Error(`${LOCAL_CONFIG_FILE}: dream must be a mapping`);
+    }
+    merged.dream = { ...base.dream, ...local.dream };
   }
   if (base.areas !== undefined || local.areas !== undefined) {
     if (base.areas !== undefined && !isMapping(base.areas)) {
@@ -138,6 +163,14 @@ function commandList(value, what, required) {
   return [...value];
 }
 
+function stringList(value, what, fallback) {
+  if (value === undefined || value === null) return [...fallback];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error(`${what} must be a list of non-empty strings`);
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+
 function parseRecipients(value, source, name) {
   const raw = value.age_recipients ?? value.age_recipient;
   if (raw === undefined || raw === null) return [];
@@ -185,6 +218,54 @@ function parseSync(raw, label, inherited = null) {
   return { remote, username, password, host };
 }
 
+function parseDream(raw, label) {
+  const out = {
+    ...DEFAULT_DREAM,
+    slots: [...DEFAULT_DREAM.slots],
+    excludePaths: [...DEFAULT_DREAM.excludePaths],
+    repoRoots: [...DEFAULT_DREAM.repoRoots],
+  };
+  if (raw === undefined || raw === null) return out;
+  if (!isMapping(raw)) throw new Error(`${label} must be a mapping`);
+  if (raw.model !== undefined && raw.model !== null) {
+    if (typeof raw.model !== "string" || !raw.model.trim()) {
+      throw new Error(`${label}.model must be a non-empty string`);
+    }
+    out.model = raw.model.trim();
+  }
+  if (raw.thinking !== undefined) {
+    if (raw.thinking === null || raw.thinking === "") out.thinking = null;
+    else if (typeof raw.thinking === "string") out.thinking = raw.thinking.trim();
+    else throw new Error(`${label}.thinking must be a string or null`);
+  }
+  if (raw.window !== undefined && raw.window !== null) {
+    if (typeof raw.window !== "string" || !WINDOW_RANGE.test(raw.window.trim())) {
+      throw new Error(`${label}.window must be "HH:MM-HH:MM" in 24-hour local time`);
+    }
+    out.window = raw.window.trim();
+  }
+  if (raw.slots !== undefined && raw.slots !== null) {
+    const slots = stringList(raw.slots, `${label}.slots`, DEFAULT_DREAM.slots);
+    if (!slots.length || slots.some((s) => !TIME_HHMM.test(s))) {
+      throw new Error(`${label}.slots must be a non-empty list of "HH:MM" times`);
+    }
+    out.slots = slots;
+  }
+  if (raw.exclude_paths !== undefined) {
+    out.excludePaths = stringList(raw.exclude_paths, `${label}.exclude_paths`, []);
+  }
+  if (raw.repo_roots !== undefined) {
+    out.repoRoots = stringList(raw.repo_roots, `${label}.repo_roots`, DEFAULT_DREAM.repoRoots);
+  }
+  if (raw.max_writes !== undefined && raw.max_writes !== null) {
+    if (!Number.isInteger(raw.max_writes) || raw.max_writes < 1) {
+      throw new Error(`${label}.max_writes must be a positive integer`);
+    }
+    out.maxWrites = raw.max_writes;
+  }
+  return out;
+}
+
 /**
  * Reads `.memory-wiki.yml` (falling back to `.llm-wiki.yml` for older checkouts)
  * and merges an optional gitignored `.memory-wiki.local.yml` overlay.
@@ -218,6 +299,7 @@ export function loadConfig(root) {
     throw new Error(`${source}: now_limit must be an integer >= 100`);
   }
   const sync = parseSync(raw.sync, `${source}: sync`);
+  const dream = parseDream(raw.dream, `${source}: dream`);
 
   /** @type {Record<string, Area>} */
   const areas = {};
@@ -240,5 +322,5 @@ export function loadConfig(root) {
       sync: parseSync(value.sync, `${source}: areas.${name}.sync`, sync),
     };
   }
-  return { human, areas, localProviders, nowLimit, sync };
+  return { human, areas, localProviders, nowLimit, sync, dream };
 }

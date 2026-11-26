@@ -185,6 +185,11 @@ test("isSafeReadOnlyWikiCommand accepts only single read-only default-space call
   assert.equal(isSafeReadOnlyWikiCommand("wiki show concepts/sparse-bundle"), true);
   assert.equal(isSafeReadOnlyWikiCommand("wiki now"), true);
   assert.equal(isSafeReadOnlyWikiCommand("wiki recent --limit 5"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki dream status"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki dream schedule status"), true);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki dream --now"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki dream undo"), false);
+  assert.equal(isSafeReadOnlyWikiCommand("wiki dream status --area work"), false);
   assert.equal(isSafeReadOnlyWikiCommand("wiki now --set"), false);
   assert.equal(isSafeReadOnlyWikiCommand("wiki capture --title x --description y"), false);
   assert.equal(isSafeReadOnlyWikiCommand("wiki lookup x --area work"), false);

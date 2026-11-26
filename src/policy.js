@@ -30,6 +30,9 @@ const VALUE_FLAGS = new Set([
   "--remote",
   "--from",
   "--host",
+  "--days",
+  "--model",
+  "--thinking",
 ]);
 
 const READ_ONLY_COMMANDS = new Set([
@@ -316,8 +319,16 @@ export function isSafeReadOnlyWikiCommand(command) {
   const calls = wikiInvocations(command);
   if (calls.length !== 1) return false;
   const [call] = calls;
+  if (call.areas.some((area) => area !== "default")) return false;
+  if (call.subcommand === "dream") {
+    return (
+      (call.positionals[1] === "status" && call.positionals.length === 2) ||
+      (call.positionals[1] === "schedule" &&
+        call.positionals[2] === "status" &&
+        call.positionals.length === 3)
+    );
+  }
   if (!READ_ONLY_COMMANDS.has(call.subcommand)) return false;
   if (call.subcommand === "now" && call.hasSet) return false;
-  if (call.areas.some((area) => area !== "default")) return false;
   return true;
 }

@@ -143,6 +143,20 @@ These are guardrails for cooperative agents, not a sandbox:
 
 The Tern plugin shows private entries in its picker while their area is unlocked. Its Carly functions read the default space only.
 
+## Overnight dreaming (`wiki dream`)
+
+`wiki dream` runs a single-pass off-hours consolidation over the default space (`MEMORY_WIKI_DEFAULT_ONLY=1`): it incrementally harvests non-tainted Pi, omp, and Antigravity transcripts, checks local `~/src/*` source drift and `wiki lint`, exits at zero cost on quiet nights, calls `pi --print --no-session --no-tools --no-extensions` (default `openai/gpt-6.1-terra`), and applies validated draft writes, `now.md` refreshes (when missing or stale), and atomic commits.
+
+```sh
+wiki dream --dry-run --days 7   # preview consolidation over the past week without writing
+wiki dream --now                # run immediately outside the 02:00–06:00 AC-power window
+wiki dream status               # last run digest and launchd schedule state
+wiki dream undo                 # git-revert the most recent dream batch
+wiki dream schedule install     # install macOS launchd agent (03:15 & 05:00 local)
+```
+
+Override defaults per host in `.memory-wiki.local.yml` (`dream.model`, `dream.thinking`, `dream.window`, `dream.slots`, `dream.exclude_paths`, `dream.repo_roots`, `dream.max_writes`).
+
 ## Develop
 
 ```sh

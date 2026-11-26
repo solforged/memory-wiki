@@ -19,6 +19,7 @@ export {
 } from "./bundle.js";
 export {
   CONFIG_FILE,
+  DEFAULT_DREAM,
   LEGACY_CONFIG_FILE,
   LOCAL_CONFIG_FILE,
   NOW_LIMIT,
@@ -29,6 +30,29 @@ export {
   loadConfig,
   wikiRoot,
 } from "./config.js";
+export {
+  DREAM_MARKER,
+  LAUNCH_AGENT_LABEL,
+  buildDreamContext,
+  buildDreamPrompts,
+  checkAcPower,
+  dreamActor,
+  dreamCacheDir,
+  dreamStatus,
+  extractJsonObject,
+  formatDreamDigest,
+  harvestTranscripts,
+  inOffHoursWindow,
+  installLaunchAgent,
+  launchAgentStatus,
+  loadDreamState,
+  renderLaunchAgentPlist,
+  runDream,
+  saveDreamState,
+  undoDream,
+  uninstallLaunchAgent,
+  validateDreamPlan,
+} from "./dream/index.js";
 export { handleAgyHook, handleClaudeHook, hookCacheDir } from "./hooks.js";
 export { init } from "./init.js";
 export { lint } from "./lint.js";

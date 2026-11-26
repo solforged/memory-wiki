@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import readline from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 // Fast path for harness lifecycle hooks: avoids loading write/area/sync modules
@@ -62,6 +63,10 @@ Write
 Maintain
   init                 create the wiki
   lint [--strict]      conformance, links, staleness; --strict also fails on warnings
+  dream [run|status|undo|schedule]
+                       off-hours default-space consolidation from local agent transcripts
+      run:      [--now] [--dry-run] [--force] [--days N] [--model ID] [--thinking LVL]
+      schedule: [status|install|uninstall]  (macOS launchd LaunchAgent)
   area [status]        private areas, and whether each is unlocked
   area create|unlock|lock|restore|sync <name>
       lock: [--all] [--force] [--sync]   sync: [--remote URL|DIR] [--pull|--push] [--force]
@@ -119,6 +124,11 @@ function parse(argv) {
         pull: { type: "boolean" },
         push: { type: "boolean" },
         "allow-dirty": { type: "boolean" },
+        now: { type: "boolean" },
+        "dry-run": { type: "boolean" },
+        days: { type: "string" },
+        model: { type: "string" },
+        thinking: { type: "string" },
       },
     });
   } catch (error) {
@@ -534,6 +544,83 @@ async function main() {
         print(`${total("error")} errors, ${total("warning")} warnings, ${total("info")} notes`);
       }
       return total("error") > 0 || (flags.strict && total("warning") > 0) ? 1 : 0;
+    }
+    case "dream": {
+      if (areas.some((area) => area !== "default")) {
+        throw new UsageError("dream operates on the default space only (never private areas)");
+      }
+      const [sub = "run", subArg] = rest;
+      if (sub === "status") {
+        const info = wiki.dreamStatus(root, config);
+        if (flags.json) json(info);
+        else {
+          const sched = info.schedule.loaded ? "loaded" : info.schedule.installed ? "installed (not loaded)" : "not installed";
+          const lines = [
+            `Schedule: ${sched} (${info.config.window}, slots ${info.config.slots.join(", ")})`,
+            `Model:    ${info.config.model}${info.config.thinking ? ` (thinking: ${info.config.thinking})` : ""}`,
+            `Last run: ${info.lastRunAt ?? "never"}`,
+          ];
+          if (info.lastDigest) lines.push("", info.lastDigest.trimEnd());
+          print(lines.join("\n"));
+        }
+        return 0;
+      }
+      if (sub === "undo") {
+        const undone = wiki.undoDream(root, config);
+        if (flags.json) json(undone);
+        else print(`Reverted ${undone.runId} (${undone.reverted.length} commits): ${undone.reverted.map((s) => s.slice(0, 8)).join(", ")}`);
+        return 0;
+      }
+      if (sub === "schedule") {
+        const action = subArg ?? "status";
+        if (action === "status") {
+          const st = wiki.launchAgentStatus();
+          if (flags.json) json({ ...st, window: config.dream.window, slots: config.dream.slots });
+          else print(`${st.label}: ${st.loaded ? "loaded" : st.installed ? "installed" : "not installed"} (${config.dream.window}, slots ${config.dream.slots.join(", ")})`);
+          return 0;
+        }
+        if (action === "install") {
+          const res = wiki.installLaunchAgent({
+            wikiBin: fileURLToPath(import.meta.url),
+            slots: config.dream.slots,
+            cacheDir: wiki.dreamCacheDir(),
+            wikiHome: process.env.MEMORY_WIKI_HOME?.trim() || null,
+          });
+          if (flags.json) json(res);
+          else print(`Installed ${res.label} at ${res.plistPath} (slots: ${res.slots.join(", ")}, log: ${res.logPath})`);
+          return 0;
+        }
+        if (action === "uninstall") {
+          const res = wiki.uninstallLaunchAgent();
+          if (flags.json) json(res);
+          else print(res.removed ? `Uninstalled ${res.label}` : `${res.label} was not installed`);
+          return 0;
+        }
+        throw new UsageError(`unknown dream schedule action "${action}"`);
+      }
+      if (sub !== "run") throw new UsageError(`unknown dream action "${sub}"`);
+      let days = null;
+      if (flags.days !== undefined) {
+        days = Number(flags.days);
+        if (!Number.isFinite(days) || days <= 0) throw new UsageError("--days takes a positive number");
+      }
+      const result = await wiki.runDream(root, config, {
+        bypassGuards: Boolean(flags.now),
+        force: Boolean(flags.force),
+        dryRun: Boolean(flags["dry-run"]),
+        days,
+        model: flags.model ?? null,
+        thinking: flags.thinking === undefined ? undefined : flags.thinking === "none" ? null : flags.thinking,
+      });
+      if (flags.json) json(result);
+      else if (result.status === "skipped" || result.status === "noop") print(`dream ${result.status}: ${result.reason}`);
+      else {
+        print(result.digest.trimEnd());
+        if (flags["dry-run"] && result.applied.length > 0) {
+          for (const a of result.applied) print(`\n=== ${a.kind.toUpperCase()} ${a.id} ===\n${a.preview?.after?.trimEnd() ?? ""}`);
+        }
+      }
+      return 0;
     }
     case "area": {
       const [action = "status", name] = rest;

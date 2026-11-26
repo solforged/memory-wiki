@@ -9,7 +9,7 @@ A personal wiki that agents use as long-term memory. The wiki is an [Open Knowle
 | omp extension | `omp/extension.ts` | `wiki` and `wiki_capture` tools, `/wiki`, prompt recall, and local-model guards |
 | Tern plugin | `tern/` | Picker with preview, lock and unlock commands, lookups for Carly |
 
-Pi integrates with `wiki` directly through `pi-mono`'s `memory` extension (`now.md` in the cached system prompt, prompt recall, `memory` tool with confirmed previews, `/memory`, and private-area guards).
+Pi integrates with `wiki` directly through `pi-mono`'s `memory` extension (`now.md` in the cached system prompt, prompt recall, `memory` tool with unconfirmed draft writes, `/memory`, and private-area guards).
 
 ## Install
 
@@ -66,7 +66,7 @@ An optional `now.md` at the bundle root (capped at 2,000 bytes) holds the small 
 
 ## Drafts and verification
 
-Whatever an agent writes is `status: draft`, with `generated` naming the actor. A draft is found by `wiki lookup` and `wiki search`, marked as a draft, and is never recalled into a prompt. Promote drafts with `wiki verify <id>`, batch-review all pending drafts with `wiki review`, or use `/memory verify <id>` in Pi / `/wiki verify <id>` in omp. That records a `verified` event under your `human:` actor and sets `status: stable`.
+Whatever an agent writes is `status: draft`, with `generated` naming the actor. A draft is found by `wiki lookup` and `wiki search` and recalled into prompts, always marked as a draft. Agents write without asking; each write is its own commit in the wiki's Git repository, so you amend one by editing the file (then `wiki index`), reverting its commit, or deprecating it. Promote drafts with `wiki verify <id>`, batch-review all pending drafts with `wiki review`, or use `/memory verify <id>` in Pi / `/wiki verify <id>` in omp. That records a `verified` event under your `human:` actor and sets `status: stable`.
 
 When an agent revises a verified concept it returns to draft. Its earlier verification stays in the file as history and no longer counts, as OKF §5.3 requires. To retire a concept without deleting history, use `wiki deprecate <id> --superseded-by <path>`.
 

@@ -474,13 +474,6 @@ export default function memoryWiki(pi: ExtensionAPI) {
         },
         { areas, preview: true },
       );
-      if (preview.wasStable) {
-        const ok = await ctx.ui.confirm(
-          `Revise verified entry ${preview.id} back to draft?`,
-          `This will return ${preview.id} to draft until you run /wiki verify ${preview.id}.`,
-        );
-        if (!ok) return { content: [{ type: "text", text: "Cancelled; nothing was written." }] };
-      }
       const result = wiki.capture(
         root,
         settings,
@@ -500,7 +493,7 @@ export default function memoryWiki(pi: ExtensionAPI) {
         { areas, ifMatch: preview.revision },
       );
       if (result.area !== "default") touchPrivate();
-      const text = `${result.created ? "Created" : "Updated"} ${result.id} as a draft. It is not recalled until the user runs /wiki verify ${result.id}.`;
+      const text = `${result.created ? "Created" : "Updated"} ${result.id} as a draft.`;
       return {
         content: [{ type: "text", text }],
         details: { id: result.id, private: result.area !== "default" },

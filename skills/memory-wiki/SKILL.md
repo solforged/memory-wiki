@@ -32,11 +32,11 @@ Every result carries a status, a trust tier, and a stale mark when its review da
 - `draft`: written but not confirmed by the user. `deprecated`: kept for history; follow `superseded_by`.
 - `unverified`, `machine-confirmed`, `human-reviewed`: who confirmed the current text.
 
-Say so when an answer rests on a draft, unverified or stale concept. When the wiki and the repository or the user disagree, the wiki is the stale one: follow them and offer to update it.
+Say so when an answer rests on a draft, unverified or stale concept. When the wiki and the repository or the user disagree, the wiki is the stale one: follow them and update it.
 
 ## Write
 
-Record something when the user asks you to remember it, or offer to record corrections rather than writing unasked. Use `memory` (in Pi) or `wiki_capture` (in omp) when you have one; otherwise:
+Record something when the user asks you to remember it, and record corrections and new vocabulary without asking first; the user amends the wiki by hand when they disagree. Use `memory` (in Pi) or `wiki_capture` (in omp) when you have one; otherwise:
 
 ```sh
 wiki capture --type Concept --title 'Sparse bundle' \
@@ -60,7 +60,7 @@ EOF
 - Look the name up first, and update the concept it already has instead of adding a second one.
 - On update (`--id`), `--alias`, `--tag`, and `--source` **append** to existing lists by default (pass `--replace-lists` only when intentionally replacing them). `--body` / `--body-file` replaces the body.
 - Link related concepts in the body with relative Markdown links, such as `[git-guard](../entities/git-guard.md)`.
-- Everything you write is a draft. Only the user verifies: never run `wiki verify` or `wiki review`, and never write `verified` or `status: stable` into a file. Tell the user the id so they can verify it with `wiki verify <id>` (or `/memory verify <id>` in Pi, `/wiki verify <id>` in omp).
+- Everything you write is a draft, and drafts are recalled like verified entries but marked `draft`. Only the user verifies: never run `wiki verify` or `wiki review`, and never write `verified` or `status: stable` into a file.
 - Never record credentials, keys or tokens.
 
 ## Private areas

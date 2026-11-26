@@ -66,7 +66,7 @@ function formatNowStart(pages) {
   }
   lines.push(
     "More of the memory-wiki is available on demand via `wiki lookup <name>`, `wiki search <words>`, `wiki show <id>`, and `wiki recent`.",
-    "When the user corrects a term or a fact about their stack or current work, offer to record it with `wiki capture` or `wiki now --set`; never write unasked.",
+    "When the user corrects a term or a fact about their stack or current work, record it with `wiki capture` or `wiki now --set` without asking first; the user amends the wiki by hand if they disagree.",
   );
   return lines.join("\n").trim();
 }

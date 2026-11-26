@@ -42,7 +42,7 @@ Read
   search [words]       full-text search  [--type T] [--tag TAG]... [--status S] [--stale] [--limit N]
   show <id>            one concept: status, trust tier, staleness and its text
   list                 concepts          [--type T] [--tag TAG]... [--status S] [--stale] [--limit N]
-  recall [text]        stable concepts whose names a text mentions (stdin without text)
+  recall [text]        stable and draft concepts whose names a text mentions (stdin without text)
   recent               newest log.md entries [--limit N]
   now                  show current context (now.md); --set replaces it from stdin or --body
   status               entry counts, drafts, now.md, and private area states

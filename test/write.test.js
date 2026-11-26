@@ -255,7 +255,7 @@ test("deprecate retires a concept with superseded_by and writeNow manages now.md
   );
 });
 
-test("verify makes a draft recallable; revising it withdraws that", (t) => {
+test("a draft is recalled as a draft, verify makes it stable, and revising it returns it to draft", (t) => {
   const { root, config } = tempWiki(t);
   const input = {
     by: "pi/model-1",
@@ -265,13 +265,13 @@ test("verify makes a draft recallable; revising it withdraws that", (t) => {
   };
   const { id } = capture(root, config, input, { now: NOW });
   const recalled = () =>
-    recall(concepts(root, config), "about the sparse bundle").map((file) => file.id);
-  assert.deepEqual(recalled(), []);
+    recall(concepts(root, config), "about the sparse bundle").map((file) => [file.id, file.status.status]);
+  assert.deepEqual(recalled(), [[id, "draft"]]);
 
   const later = new Date(NOW.getTime() + 60_000);
   const verified = verify(root, config, id, { now: later });
   assert.deepEqual([verified.status, verified.tier], ["stable", "human-reviewed"]);
-  assert.deepEqual(recalled(), [id]);
+  assert.deepEqual(recalled(), [[id, "stable"]]);
 
   const revised = capture(
     root,
@@ -280,7 +280,7 @@ test("verify makes a draft recallable; revising it withdraws that", (t) => {
     { now: new Date(NOW.getTime() + 120_000) },
   );
   assert.deepEqual([revised.status, revised.tier, revised.created], ["draft", "unverified", false]);
-  assert.deepEqual(recalled(), []);
+  assert.deepEqual(recalled(), [[id, "draft"]]);
   assert.match(
     read(root, `${id}.md`),
     /verified:\n {2}- \{ by: "human:tester", at: "2026-11-21T12:01:00Z" \}/,

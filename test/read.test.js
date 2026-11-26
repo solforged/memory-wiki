@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   concepts,
   describe,
+  formatRecall,
   formatSummary,
   lint,
   lookup,
@@ -147,7 +148,7 @@ test("lookup matches titles and both current and legacy aliases", (t) => {
   assert.equal(near.candidates[0].id, "concepts/sparse-bundle", "a typo still finds the name");
 });
 
-test("recall returns stable concepts, respects acronym case, and skips entries explained in now.md", (t) => {
+test("recall returns stable and draft concepts, respects acronym case, and skips entries explained in now.md", (t) => {
   const { root, config } = tempWiki(t, {
     ...GLOSSARY,
     "concepts/bundle.md": concept("type: Concept\ntitle: Bundle"),
@@ -156,7 +157,8 @@ test("recall returns stable concepts, respects acronym case, and skips entries e
   const ids = (text, opts) => recall(files, text, opts).map((file) => file.id);
   assert.deepEqual(ids("Is a sparse bundle encrypted?"), ["concepts/sparse-bundle"]);
   assert.deepEqual(ids("ship the bundle"), ["concepts/bundle"]);
-  assert.deepEqual(ids("does git-guard run here"), [], "drafts are not recalled");
+  assert.deepEqual(ids("does git-guard run here"), ["entities/git-guard"], "drafts are recalled");
+  assert.match(formatRecall(recall(files, "git-guard").map((file) => describe(file))), /git-guard \(Entity, unverified, draft\)/);
   assert.deepEqual(ids("what is a band file"), [], "deprecated concepts are not recalled");
   assert.deepEqual(ids("the CI is red"), ["concepts/ci"]);
   assert.deepEqual(ids("ci sono due file"), [], "a two-letter name needs its capitals");

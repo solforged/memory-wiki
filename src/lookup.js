@@ -86,8 +86,8 @@ function explainedInNow(nowText, title) {
  * Current concepts whose title or alias appears in `text` as whole words, the
  * longest name winning where names overlap. Names shorter than three characters
  * ("CI") and all-uppercase acronyms ("PRR", "MAP", "SET") match only when the
- * text carries them verbatim, capitals included. Only `status: stable` concepts
- * are recalled (§5.4).
+ * text carries them verbatim, capitals included. Stable and draft concepts are
+ * recalled, drafts marked as such; deprecated ones are not.
  *
  * @param {number | { limit?: number, nowText?: string }} [options]
  */
@@ -97,7 +97,7 @@ export function recall(files, text, options = 8) {
   const table = new Map();
   let longest = 1;
   for (const file of files) {
-    if (!file.status.current) continue;
+    if (!file.status.current && file.status.status !== "draft") continue;
     for (const name of [file.title, ...file.aliases]) {
       const key = normalizeKey(name);
       if (!key) continue;
@@ -132,6 +132,7 @@ export function recall(files, text, options = 8) {
 export function formatRecall(infos) {
   const lines = infos.map((info) => {
     const marks = [info.type, info.tier];
+    if (info.status === "draft") marks.push("draft");
     if (info.stale) marks.push("stale: check before relying on it");
     const text = info.description || "(no description)";
     return `- ${info.title} (${marks.join(", ")}): ${text} [${info.id}]`;
